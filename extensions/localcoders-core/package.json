@@ -1,0 +1,302 @@
+{
+  "name": "localcoders-core",
+  "displayName": "LocalCoders Multi-Agent AI",
+  "description": "Local-First Multi-Agent AI Coding IDE based on Code - OSS and Ollama",
+  "version": "1.0.0",
+  "publisher": "localcoders",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Programming Languages",
+    "Linters",
+    "Snippets"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "themes": [
+      {
+        "label": "LocalCoders Dark Modern",
+        "uiTheme": "vs-dark",
+        "path": "./themes/localcoders-dark.json"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "localcoders-activitybar",
+          "title": "LocalCoders",
+          "icon": "resources/icon.svg"
+        },
+        {
+          "id": "localcoders-agents-activitybar",
+          "title": "Agent Team",
+          "icon": "resources/icon.svg"
+        }
+      ],
+      "secondarySidebar": [
+        {
+          "id": "localcoders-auxiliary",
+          "title": "LocalCoders AI",
+          "icon": "resources/icon.svg"
+        }
+      ],
+      "panel": [
+        {
+          "id": "localcoders-panel",
+          "title": "LocalCoders Execution",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "localcoders-activitybar": [
+        {
+          "type": "webview",
+          "id": "localcoders.navigationView",
+          "name": "Sessions & Navigation"
+        },
+        {
+          "id": "localcoders.taskMonitorView",
+          "name": "Task Monitor"
+        },
+        {
+          "id": "localcoders.projectMemoryView",
+          "name": "Project Rules & Memory"
+        }
+      ],
+      "localcoders-agents-activitybar": [
+        {
+          "id": "localcoders.agentTeamView",
+          "name": "Agent Team"
+        },
+        {
+          "id": "localcoders.modelManagerView",
+          "name": "Model Manager"
+        },
+        {
+          "id": "localcoders.criticReviewsView",
+          "name": "Critic Audits"
+        }
+      ],
+      "localcoders-auxiliary": [
+        {
+          "type": "webview",
+          "id": "localcoders.chatView",
+          "name": "Agent Conversation"
+        },
+        {
+          "type": "webview",
+          "id": "localcoders.changesView",
+          "name": "Changes & Review"
+        }
+      ],
+      "localcoders-panel": [
+        {
+          "type": "webview",
+          "id": "localcoders.criticFindingsPanel",
+          "name": "Critic Audit Findings"
+        },
+        {
+          "type": "webview",
+          "id": "localcoders.agentMonitorPanel",
+          "name": "Agent Monitor & Logs"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "localcoders.toggleWorkbenchMode",
+        "title": "LocalCoders: Toggle Agents / IDE View",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.activateAgentView",
+        "title": "LocalCoders: Switch to Agents View",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.activateIDEView",
+        "title": "LocalCoders: Switch to IDE View",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.openChat",
+        "title": "LocalCoders: Open AI Chat",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.openChanges",
+        "title": "LocalCoders: Open Changes Panel",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.newSession",
+        "title": "LocalCoders: New Coding Session",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.openSetupWizard",
+        "title": "LocalCoders: Setup Wizard",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.newTask",
+        "title": "LocalCoders: New Task",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.selectMainAgent",
+        "title": "LocalCoders: Select Main Agent",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.manageAgents",
+        "title": "LocalCoders: Manage Agents",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.manageModels",
+        "title": "LocalCoders: Manage Models",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.enableCritic",
+        "title": "LocalCoders: Toggle Critic Agent",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.reviewCurrentFile",
+        "title": "LocalCoders: Review Current File with Critic",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.reviewGitChanges",
+        "title": "LocalCoders: Review Git Changes with Critic",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.explainSelection",
+        "title": "LocalCoders: Explain Selected Code",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.refactorSelection",
+        "title": "LocalCoders: Refactor Selected Code",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.generateTests",
+        "title": "LocalCoders: Generate Tests for Selection",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.stopAllAgents",
+        "title": "LocalCoders: Stop All Agents",
+        "category": "LocalCoders"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "localcoders.explainSelection",
+          "group": "7_localcoders@1",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "localcoders.refactorSelection",
+          "group": "7_localcoders@2",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "localcoders.generateTests",
+          "group": "7_localcoders@3",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "localcoders.reviewCurrentFile",
+          "group": "7_localcoders@4"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "localcoders.newSession",
+          "when": "view == localcoders.navigationView",
+          "group": "navigation"
+        },
+        {
+          "command": "localcoders.openChanges",
+          "when": "view == localcoders.chatView",
+          "group": "navigation"
+        },
+        {
+          "command": "localcoders.openSetupWizard",
+          "when": "view == localcoders.chatView",
+          "group": "navigation"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "localcoders.toggleWorkbenchMode",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a"
+      }
+    ],
+    "configuration": {
+      "title": "LocalCoders",
+      "properties": {
+        "localcoders.ollamaHost": {
+          "type": "string",
+          "default": "http://127.0.0.1:11434",
+          "description": "URL endpoint for local Ollama service"
+        },
+        "localcoders.mainAgentModel": {
+          "type": "string",
+          "default": "",
+          "description": "Selected model for the mandatory Main Agent"
+        },
+        "localcoders.criticEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable independent Critic Agent code reviews"
+        },
+        "localcoders.criticModel": {
+          "type": "string",
+          "default": "",
+          "description": "Selected model for the Critic Agent"
+        },
+        "localcoders.criticStrictness": {
+          "type": "string",
+          "enum": ["lenient", "moderate", "strict", "paranoid"],
+          "default": "strict",
+          "description": "Review strictness of the Critic Agent"
+        },
+        "localcoders.requireApprovalForEdits": {
+          "type": "boolean",
+          "default": true,
+          "description": "Require user approval before applying agent file modifications"
+        },
+        "localcoders.maxConcurrentSubagents": {
+          "type": "number",
+          "default": 3,
+          "description": "Maximum number of subagents running concurrently"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.3"
+  }
+}

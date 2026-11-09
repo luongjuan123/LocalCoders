@@ -1,0 +1,18 @@
+[Desktop Entry]
+Name=LocalCoders
+Comment=Open-Source, Multi-Agent AI Coding IDE Based on VS Code Ecosystem
+GenericName=AI Code Editor
+Exec=/home/juan/Work Space/LocalCoders/bin/localcoders %F
+Icon=/home/juan/Work Space/LocalCoders/branding/localcoders-logo.svg
+Type=Application
+StartupNotify=true
+StartupWMClass=LocalCoders
+Categories=Development;IDE;TextEditor;
+MimeType=text/plain;inode/directory;
+Keywords=vscode;code;ide;ai;multi-agent;ollama;developer;editor;
+Actions=new-empty-window;
+
+[Desktop Action new-empty-window]
+Name=New Empty Window
+Exec=/home/juan/Work Space/LocalCoders/bin/localcoders --new-window %F
+Icon=/home/juan/Work Space/LocalCoders/branding/localcoders-logo.svg

@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Production builds
+dist/
+dist-electron/
+
+# Environment and logs
+*.log
+.DS_Store
+
+# Temporary local storage
+.localcoders/*.sqlite*
+
+# Upstream submodule/clone
+vscode-src/

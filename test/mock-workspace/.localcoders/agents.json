@@ -1,0 +1,35 @@
+{
+  "mainAgent": {
+    "id": "main",
+    "name": "Lead Main Agent",
+    "role": "Lead Architect",
+    "model": "qwen3.8:27b",
+    "systemPrompt": "Coordinates project",
+    "enabled": true,
+    "maxConcurrency": 1,
+    "temperature": 0.2,
+    "contextWindow": 32768
+  },
+  "subagents": [],
+  "criticConfig": {
+    "enabled": true,
+    "model": "deepseek-r1:8b",
+    "strictness": "paranoid",
+    "categories": [
+      "Logical correctness",
+      "Security vulnerabilities",
+      "Authentication and authorization",
+      "SQL injection",
+      "XSS and input validation",
+      "Race conditions",
+      "Memory leaks",
+      "Performance bottlenecks",
+      "Architectural weaknesses",
+      "Error handling and edge cases",
+      "Test coverage",
+      "Requirement violations"
+    ],
+    "trigger": "on_diff",
+    "reviewMode": "changed_files"
+  }
+}

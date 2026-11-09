@@ -1,0 +1,211 @@
+import * as fs from 'fs/promises';
+import * as fsSync from 'fs';
+import * as path from 'path';
+import { ToolExecutionContext, ToolResult } from './types';
+
+function assertWithinWorkspace(workspaceRoot: string, targetPath: string): string {
+  const resolved = path.resolve(workspaceRoot, targetPath);
+  const rel = path.relative(workspaceRoot, resolved);
+  if (rel.startsWith('..') && !path.isAbsolute(rel)) {
+    throw new Error(`Security Violation: Path '${targetPath}' is outside the workspace root '${workspaceRoot}'`);
+  }
+  return resolved;
+}
+
+export async function readFileTool(args: { path: string }, ctx: ToolExecutionContext): Promise<ToolResult> {
+  try {
+    const fullPath = assertWithinWorkspace(ctx.workspaceRoot, args.path);
+    const content = await fs.readFile(fullPath, 'utf-8');
+    return {
+      success: true,
+      output: {
+        path: path.relative(ctx.workspaceRoot, fullPath),
+        content,
+        lines: content.split('\n').length,
+      },
+    };
+  } catch (err: any) {
+    return { success: false, error: err.message };
+  }
+}
+
+export async function writeFileTool(args: { path: string; content: string }, ctx: ToolExecutionContext): Promise<ToolResult> {
+  try {
+    const fullPath = assertWithinWorkspace(ctx.workspaceRoot, args.path);
+    const relPath = path.relative(ctx.workspaceRoot, fullPath);
+
+    let original = '';
+    const exists = fsSync.existsSync(fullPath);
+    if (exists) {
+      original = await fs.readFile(fullPath, 'utf-8');
+    }
+
+    // If approval is required, request approval first
+    if (ctx.requireApproval) {
+      const approved = await ctx.requestApproval({
+        id: `appr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        toolCallId: `call_${Date.now()}`,
+        agentId: ctx.agentId,
+        agentName: ctx.agentName,
+        tool: 'write_file',
+        args,
+        description: exists ? `Modify existing file '${relPath}'` : `Create new file '${relPath}'`,
+        isDestructive: false,
+        filePath: relPath,
+      });
+
+      if (!approved) {
+        return { success: false, error: 'User rejected the file write operation.' };
+      }
+    }
+
+    const parentDir = path.dirname(fullPath);
+    await fs.mkdir(parentDir, { recursive: true });
+    await fs.writeFile(fullPath, args.content, 'utf-8');
+
+    return {
+      success: true,
+      output: {
+        path: relPath,
+        action: exists ? 'modified' : 'created',
+        bytesWritten: Buffer.byteLength(args.content, 'utf-8'),
+      },
+    };
+  } catch (err: any) {
+    return { success: false, error: err.message };
+  }
+}
+
+export async function editFileTool(
+  args: { path: string; target: string; replacement: string },
+  ctx: ToolExecutionContext
+): Promise<ToolResult> {
+  try {
+    const fullPath = assertWithinWorkspace(ctx.workspaceRoot, args.path);
+    const relPath = path.relative(ctx.workspaceRoot, fullPath);
+
+    if (!fsSync.existsSync(fullPath)) {
+      return { success: false, error: `File not found: '${relPath}'` };
+    }
+
+    const original = await fs.readFile(fullPath, 'utf-8');
+    if (!original.includes(args.target)) {
+      return {
+        success: false,
+        error: `Target string was not found in '${relPath}'. Please check exact indentation and whitespace.`,
+      };
+    }
+
+    const modified = original.replace(args.target, args.replacement);
+
+    if (ctx.requireApproval) {
+      const approved = await ctx.requestApproval({
+        id: `appr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        toolCallId: `call_${Date.now()}`,
+        agentId: ctx.agentId,
+        agentName: ctx.agentName,
+        tool: 'edit_file',
+        args,
+        description: `Apply targeted edit to '${relPath}'`,
+        isDestructive: false,
+        filePath: relPath,
+      });
+
+      if (!approved) {
+        return { success: false, error: 'User rejected targeted edit.' };
+      }
+    }
+
+    await fs.writeFile(fullPath, modified, 'utf-8');
+    return { success: true, output: { path: relPath, edited: true } };
+  } catch (err: any) {
+    return { success: false, error: err.message };
+  }
+}
+
+export async function deleteFileTool(args: { path: string }, ctx: ToolExecutionContext): Promise<ToolResult> {
+  try {
+    const fullPath = assertWithinWorkspace(ctx.workspaceRoot, args.path);
+    const relPath = path.relative(ctx.workspaceRoot, fullPath);
+
+    // Deleting files is always a destructive action -> always requires approval
+    const approved = await ctx.requestApproval({
+      id: `appr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+      toolCallId: `call_${Date.now()}`,
+      agentId: ctx.agentId,
+      agentName: ctx.agentName,
+      tool: 'delete_file',
+      args,
+      description: `DELETE file or directory '${relPath}'`,
+      isDestructive: true,
+      filePath: relPath,
+    });
+
+    if (!approved) {
+      return { success: false, error: 'User rejected deletion of file.' };
+    }
+
+    const stat = await fs.stat(fullPath);
+    if (stat.isDirectory()) {
+      await fs.rm(fullPath, { recursive: true, force: true });
+    } else {
+      await fs.unlink(fullPath);
+    }
+
+    return { success: true, output: { path: relPath, deleted: true } };
+  } catch (err: any) {
+    return { success: false, error: err.message };
+  }
+}
+
+export async function listDirectoryTool(
+  args: { path?: string; maxDepth?: number },
+  ctx: ToolExecutionContext
+): Promise<ToolResult> {
+  try {
+    const targetPath = args.path ? assertWithinWorkspace(ctx.workspaceRoot, args.path) : ctx.workspaceRoot;
+    const maxDepth = args.maxDepth || 3;
+
+    async function scan(dir: string, depth: number): Promise<any[]> {
+      if (depth > maxDepth) return [];
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      const items: any[] = [];
+
+      for (const entry of entries) {
+        if (
+          entry.name === '.git' ||
+          entry.name === 'node_modules' ||
+          entry.name === 'dist' ||
+          entry.name === '.localcoders' ||
+          entry.name === '.cache'
+        ) {
+          continue;
+        }
+
+        const full = path.join(dir, entry.name);
+        const rel = path.relative(ctx.workspaceRoot, full);
+
+        if (entry.isDirectory()) {
+          items.push({
+            name: entry.name,
+            path: rel,
+            type: 'directory',
+            children: depth < maxDepth ? await scan(full, depth + 1) : [],
+          });
+        } else {
+          items.push({
+            name: entry.name,
+            path: rel,
+            type: 'file',
+          });
+        }
+      }
+      return items;
+    }
+
+    const tree = await scan(targetPath, 1);
+    return { success: true, output: { root: path.relative(ctx.workspaceRoot, targetPath) || '.', tree } };
+  } catch (err: any) {
+    return { success: false, error: err.message };
+  }
+}

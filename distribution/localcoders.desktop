@@ -1,0 +1,20 @@
+[Desktop Entry]
+Version=1.0
+Name=LocalCoders
+GenericName=AI Coding IDE
+Comment=Local-First Multi-Agent AI Coding IDE based on VS Code & Ollama
+Exec="/home/juan/Work Space/LocalCoders/bin/localcoders" %F
+Icon=/home/juan/Work Space/LocalCoders/branding/localcoders-icon.png
+Terminal=false
+Type=Application
+StartupNotify=true
+StartupWMClass=LocalCoders
+Categories=Development;IDE;TextEditor;
+MimeType=text/plain;inode/directory;
+Keywords=vscode;code;ide;ai;multi-agent;ollama;developer;editor;
+Actions=new-empty-window;
+
+[Desktop Action new-empty-window]
+Name=New Empty Window
+Exec="/home/juan/Work Space/LocalCoders/bin/localcoders" --new-window %F
+Icon=/home/juan/Work Space/LocalCoders/branding/localcoders-icon.png

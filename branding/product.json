@@ -1,0 +1,47 @@
+{
+  "nameShort": "LocalCoders",
+  "nameLong": "LocalCoders IDE",
+  "applicationName": "localcoders",
+  "dataFolderName": ".localcoders",
+  "sharedDataFolderName": ".localcoders-shared",
+  "win32MutexName": "localcoderside",
+  "licenseName": "MIT",
+  "licenseUrl": "https://github.com/localcoders/localcoders/blob/main/LICENSE",
+  "serverLicenseUrl": "https://github.com/localcoders/localcoders/blob/main/LICENSE",
+  "serverGreeting": [
+    "Welcome to LocalCoders Server — Local-First Multi-Agent AI IDE"
+  ],
+  "serverApplicationName": "localcoders-server",
+  "serverDataFolderName": ".localcoders-server",
+  "win32DirName": "LocalCoders",
+  "win32NameVersion": "LocalCoders",
+  "win32RegValueName": "LocalCoders",
+  "win32AppUserModelId": "LocalCoders.IDE",
+  "win32ShellNameShort": "LocalCoders",
+  "darwinBundleIdentifier": "dev.localcoders.ide",
+  "reportIssueUrl": "https://github.com/localcoders/localcoders/issues",
+  "urlProtocol": "localcoders",
+  "extensionsGallery": {
+    "serviceUrl": "https://open-vsx.org/vscode/gallery",
+    "itemUrl": "https://open-vsx.org/vscode/item",
+    "resourceUrlTemplate": "https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}",
+    "controlUrl": "https://open-vsx.org/vscode/control"
+  },
+  "linkProtectionTrustedDomains": [
+    "https://open-vsx.org",
+    "https://github.com",
+    "http://localhost:11434",
+    "http://127.0.0.1:11434"
+  ],
+  "configurationDefaults": {
+    "window.title": "${dirty}${activeEditorShort}${separator}${rootName}${separator}LocalCoders",
+    "workbench.colorTheme": "Default Dark Modern",
+    "editor.minimap.enabled": true,
+    "editor.fontSize": 14,
+    "editor.fontFamily": "'JetBrains Mono', 'Fira Code', Menlo, Monaco, 'Courier New', monospace",
+    "terminal.integrated.fontSize": 13,
+    "localcoders.ollamaHost": "http://127.0.0.1:11434",
+    "localcoders.autoTriggerCritic": true,
+    "localcoders.requireApprovalForEdits": true
+  }
+}

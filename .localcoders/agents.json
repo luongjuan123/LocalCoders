@@ -1,0 +1,69 @@
+{
+  "mainAgent": {
+    "id": "main",
+    "name": "Main Agent",
+    "role": "Lead Architect",
+    "model": "qwen3.8:27b",
+    "systemPrompt": "Coordinates project, analyzes codebase architecture, designs multi-agent task execution plans, and supervises subagents.",
+    "enabled": true,
+    "maxConcurrency": 1,
+    "temperature": 0.2,
+    "contextWindow": 32768
+  },
+  "subagents": [
+    {
+      "id": "frontend-dev",
+      "name": "Frontend Specialist",
+      "role": "Frontend Developer",
+      "model": "qwen3.8:27b",
+      "systemPrompt": "Expert Frontend Developer specializing in accessible, performant UI components, layouts, and client state.",
+      "enabled": true,
+      "maxConcurrency": 1,
+      "temperature": 0.2,
+      "contextWindow": 32768
+    },
+    {
+      "id": "backend-dev",
+      "name": "Backend Specialist",
+      "role": "Backend Developer",
+      "model": "qwen3.8:27b",
+      "systemPrompt": "Senior Backend Developer specializing in scalable server architectures, data models, and API endpoints.",
+      "enabled": true,
+      "maxConcurrency": 1,
+      "temperature": 0.2,
+      "contextWindow": 32768
+    },
+    {
+      "id": "test-engineer",
+      "name": "QA Specialist",
+      "role": "Test Engineer",
+      "model": "qwen3.8:27b",
+      "systemPrompt": "Senior Test Engineer specializing in unit test suites, edge case validation, and boundary conditions.",
+      "enabled": true,
+      "maxConcurrency": 1,
+      "temperature": 0.1,
+      "contextWindow": 32768
+    }
+  ],
+  "criticConfig": {
+    "enabled": true,
+    "model": "qwen3.8:27b",
+    "strictness": "strict",
+    "categories": [
+      "Logical correctness",
+      "Security vulnerabilities",
+      "Authentication and authorization",
+      "SQL injection",
+      "XSS and input validation",
+      "Race conditions",
+      "Memory leaks",
+      "Performance bottlenecks",
+      "Architectural weaknesses",
+      "Error handling and edge cases",
+      "Test coverage",
+      "Requirement violations"
+    ],
+    "trigger": "on_diff",
+    "reviewMode": "changed_files"
+  }
+}

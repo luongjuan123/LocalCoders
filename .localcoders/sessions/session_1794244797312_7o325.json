@@ -1,0 +1,17 @@
+{
+  "id": "session_1794244797312_7o325",
+  "title": "New Section",
+  "userGoal": "New Section",
+  "status": "idle",
+  "createdAt": 1794244797312,
+  "updatedAt": 1794244797312,
+  "workspaceRoot": "/home/juan/Work Space/LocalCoders",
+  "model": "qwen3.8:27b",
+  "participatingAgents": [
+    "main"
+  ],
+  "messages": [],
+  "plan": [],
+  "executionGroups": [],
+  "archived": false
+}

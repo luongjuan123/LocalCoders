@@ -3,7 +3,7 @@ import * as fsSync from 'fs';
 import * as path from 'path';
 import { ToolExecutionContext, ToolResult } from './types';
 
-function assertWithinWorkspace(workspaceRoot: string, targetPath: string): string {
+export function assertWithinWorkspace(workspaceRoot: string, targetPath: string): string {
   const resolved = path.resolve(workspaceRoot, targetPath);
   const rel = path.relative(workspaceRoot, resolved);
   if (rel.startsWith('..') && !path.isAbsolute(rel)) {
@@ -15,6 +15,9 @@ function assertWithinWorkspace(workspaceRoot: string, targetPath: string): strin
 export async function readFileTool(args: { path: string }, ctx: ToolExecutionContext): Promise<ToolResult> {
   try {
     const fullPath = assertWithinWorkspace(ctx.workspaceRoot, args.path);
+    if (!fsSync.existsSync(fullPath)) {
+      return { success: false, error: `File not found: '${args.path}'` };
+    }
     const content = await fs.readFile(fullPath, 'utf-8');
     return {
       success: true,
@@ -22,6 +25,41 @@ export async function readFileTool(args: { path: string }, ctx: ToolExecutionCon
         path: path.relative(ctx.workspaceRoot, fullPath),
         content,
         lines: content.split('\n').length,
+        sizeBytes: Buffer.byteLength(content, 'utf-8'),
+      },
+    };
+  } catch (err: any) {
+    return { success: false, error: err.message };
+  }
+}
+
+export async function readLinesTool(
+  args: { path: string; startLine: number; endLine?: number },
+  ctx: ToolExecutionContext
+): Promise<ToolResult> {
+  try {
+    const fullPath = assertWithinWorkspace(ctx.workspaceRoot, args.path);
+    if (!fsSync.existsSync(fullPath)) {
+      return { success: false, error: `File not found: '${args.path}'` };
+    }
+    const raw = await fs.readFile(fullPath, 'utf-8');
+    const allLines = raw.split('\n');
+    const start = Math.max(1, args.startLine);
+    const end = args.endLine ? Math.min(allLines.length, args.endLine) : Math.min(allLines.length, start + 100);
+
+    const slice = allLines.slice(start - 1, end).map((line, idx) => ({
+      line: start + idx,
+      text: line,
+    }));
+
+    return {
+      success: true,
+      output: {
+        path: path.relative(ctx.workspaceRoot, fullPath),
+        startLine: start,
+        endLine: end,
+        totalLines: allLines.length,
+        lines: slice,
       },
     };
   } catch (err: any) {
@@ -40,7 +78,6 @@ export async function writeFileTool(args: { path: string; content: string }, ctx
       original = await fs.readFile(fullPath, 'utf-8');
     }
 
-    // If approval is required, request approval first
     if (ctx.requireApproval) {
       const approved = await ctx.requestApproval({
         id: `appr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
@@ -123,12 +160,56 @@ export async function editFileTool(
   }
 }
 
+export async function renameFileTool(
+  args: { oldPath: string; newPath: string },
+  ctx: ToolExecutionContext
+): Promise<ToolResult> {
+  try {
+    const oldFull = assertWithinWorkspace(ctx.workspaceRoot, args.oldPath);
+    const newFull = assertWithinWorkspace(ctx.workspaceRoot, args.newPath);
+
+    if (!fsSync.existsSync(oldFull)) {
+      return { success: false, error: `Source path does not exist: '${args.oldPath}'` };
+    }
+
+    if (ctx.requireApproval) {
+      const approved = await ctx.requestApproval({
+        id: `appr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        toolCallId: `call_${Date.now()}`,
+        agentId: ctx.agentId,
+        agentName: ctx.agentName,
+        tool: 'rename_file',
+        args,
+        description: `Rename/move '${args.oldPath}' to '${args.newPath}'`,
+        isDestructive: false,
+        filePath: args.newPath,
+      });
+      if (!approved) {
+        return { success: false, error: 'User rejected rename operation.' };
+      }
+    }
+
+    await fs.mkdir(path.dirname(newFull), { recursive: true });
+    await fs.rename(oldFull, newFull);
+
+    return {
+      success: true,
+      output: {
+        oldPath: path.relative(ctx.workspaceRoot, oldFull),
+        newPath: path.relative(ctx.workspaceRoot, newFull),
+        renamed: true,
+      },
+    };
+  } catch (err: any) {
+    return { success: false, error: err.message };
+  }
+}
+
 export async function deleteFileTool(args: { path: string }, ctx: ToolExecutionContext): Promise<ToolResult> {
   try {
     const fullPath = assertWithinWorkspace(ctx.workspaceRoot, args.path);
     const relPath = path.relative(ctx.workspaceRoot, fullPath);
 
-    // Deleting files is always a destructive action -> always requires approval
     const approved = await ctx.requestApproval({
       id: `appr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
       toolCallId: `call_${Date.now()}`,
@@ -158,6 +239,29 @@ export async function deleteFileTool(args: { path: string }, ctx: ToolExecutionC
   }
 }
 
+export async function getMetadataTool(args: { path: string }, ctx: ToolExecutionContext): Promise<ToolResult> {
+  try {
+    const fullPath = assertWithinWorkspace(ctx.workspaceRoot, args.path);
+    if (!fsSync.existsSync(fullPath)) {
+      return { success: false, error: `Path does not exist: '${args.path}'` };
+    }
+    const stat = await fs.stat(fullPath);
+    return {
+      success: true,
+      output: {
+        path: path.relative(ctx.workspaceRoot, fullPath),
+        isDirectory: stat.isDirectory(),
+        isFile: stat.isFile(),
+        sizeBytes: stat.size,
+        modified: stat.mtime.toISOString(),
+        created: stat.birthtime.toISOString(),
+      },
+    };
+  } catch (err: any) {
+    return { success: false, error: err.message };
+  }
+}
+
 export async function listDirectoryTool(
   args: { path?: string; maxDepth?: number },
   ctx: ToolExecutionContext
@@ -177,7 +281,8 @@ export async function listDirectoryTool(
           entry.name === 'node_modules' ||
           entry.name === 'dist' ||
           entry.name === '.localcoders' ||
-          entry.name === '.cache'
+          entry.name === '.cache' ||
+          entry.name.startsWith('.build')
         ) {
           continue;
         }
@@ -205,6 +310,45 @@ export async function listDirectoryTool(
 
     const tree = await scan(targetPath, 1);
     return { success: true, output: { root: path.relative(ctx.workspaceRoot, targetPath) || '.', tree } };
+  } catch (err: any) {
+    return { success: false, error: err.message };
+  }
+}
+
+export async function getProjectStructureTool(args: {}, ctx: ToolExecutionContext): Promise<ToolResult> {
+  try {
+    const keyFiles = [
+      'package.json',
+      'tsconfig.json',
+      'pyproject.toml',
+      'requirements.txt',
+      'Cargo.toml',
+      'go.mod',
+      'Dockerfile',
+      'docker-compose.yml',
+      'Makefile',
+      'README.md',
+    ];
+
+    const discoveredConfigs: Record<string, boolean> = {};
+    for (const kf of keyFiles) {
+      discoveredConfigs[kf] = fsSync.existsSync(path.join(ctx.workspaceRoot, kf));
+    }
+
+    // Top level directories
+    const topEntries = await fs.readdir(ctx.workspaceRoot, { withFileTypes: true });
+    const topDirs = topEntries
+      .filter((e) => e.isDirectory() && !e.name.startsWith('.') && e.name !== 'node_modules')
+      .map((e) => e.name);
+
+    return {
+      success: true,
+      output: {
+        workspaceName: path.basename(ctx.workspaceRoot),
+        discoveredConfigs,
+        topLevelDirectories: topDirs,
+      },
+    };
   } catch (err: any) {
     return { success: false, error: err.message };
   }

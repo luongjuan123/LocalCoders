@@ -41,7 +41,17 @@ export class AgentRegistry {
       {
         role: 'Frontend Developer',
         defaultPrompt:
-          'You are an expert Frontend Developer. You specialize in building accessible, highly responsive, performant user interfaces, components, styling, and clientside state management. You write clean, modular, and maintainable TypeScript/JavaScript and CSS.',
+          'You are an expert Frontend Developer. You specialize in building accessible, highly responsive, performant user interfaces, components, styling, and clientside state management. You strictly adhere to the UI/UX Pro Max design intelligence (.agents/skills/ui-ux-pro-max/SKILL.md and design-system/localcoders/MASTER.md), using vector SVGs instead of emojis, OLED dark theme tokens, and smooth 150-250ms transitions.',
+      },
+      {
+        role: 'UI/UX Designer',
+        defaultPrompt:
+          'You are a Lead UI/UX Designer and Design Systems Architect. You master visual hierarchy, Dark Mode developer tool aesthetics, spacing variables, typography scales (JetBrains Mono / IBM Plex Sans), and WCAG AAA/AA accessibility compliance. You query the UI/UX Pro Max design engine for all UI component specifications.',
+      },
+      {
+        role: 'Component Specialist',
+        defaultPrompt:
+          'You are a Frontend Component Specialist. You build modular, pixel-perfect, accessible UI controls (popovers, segmented bars, modals, search inputs, status badges) with precision SVG vector icons and zero emoji decorators.',
       },
       {
         role: 'Backend Developer',

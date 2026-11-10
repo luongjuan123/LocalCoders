@@ -1,4 +1,20 @@
+import { exec } from 'child_process';
 import { ChatMessage, OllamaModel, OllamaPullProgress } from './types';
+
+// Ensure long-running LLM streams (especially local models generating on CPU/GPU)
+// are never terminated by Node.js undici default 300-second timeouts.
+try {
+  const { Agent, setGlobalDispatcher } = require('undici');
+  setGlobalDispatcher(
+    new Agent({
+      bodyTimeout: 0,
+      headersTimeout: 0,
+      connectTimeout: 60_000,
+    })
+  );
+} catch {
+  // Undici unavailable or global dispatcher already set
+}
 
 export interface OllamaChatChunk {
   content: string;
@@ -154,7 +170,7 @@ export class OllamaClient {
   ): Promise<void> {
     const options: Record<string, any> = {};
     if (params.temperature !== undefined) options.temperature = params.temperature;
-    if (params.contextWindow !== undefined) options.num_ctx = params.contextWindow;
+    options.num_ctx = params.contextWindow || 32768;
 
     const payload: Record<string, any> = {
       model: params.model,
@@ -242,15 +258,22 @@ export class OllamaClient {
    */
   async unloadModel(modelName: string): Promise<boolean> {
     try {
+      // 1. Unload via HTTP generate API with keep_alive: 0
       const response = await fetch(`${this.host}/api/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: modelName, keep_alive: 0 }),
         signal: AbortSignal.timeout(4000),
       });
+
+      // 2. Also invoke CLI 'ollama stop' for guaranteed process termination
+      exec(`ollama stop "${modelName}"`, () => {});
+
       return response.ok;
     } catch (err: any) {
       console.warn(`[OllamaClient] Failed to unload model '${modelName}':`, err.message);
+      // CLI fallback
+      exec(`ollama stop "${modelName}"`, () => {});
       return false;
     }
   }

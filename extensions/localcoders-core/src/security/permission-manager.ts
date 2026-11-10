@@ -1,16 +1,17 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { ToolDefinition, PermissionLevel, ToolAuditEvent } from '../tools/types';
-import { ToolApprovalRequest } from '../agents/types';
+import { ToolDefinition, ToolAuditEvent } from '../tools/types';
+import { PermissionMode } from '../sessions/session-manager';
 
-export type SecurityMode = 'ask_every_time' | 'supervised' | 'autonomous' | 'restricted';
+export type SecurityMode = 'ask' | 'smart' | 'bypass' | 'ask_every_time' | 'supervised' | 'autonomous' | 'restricted';
 
 export class PermissionManager {
   private mode: SecurityMode = 'supervised';
   private sessionApprovals: Set<string> = new Set(); // toolName or toolName:sessionId
   private auditLog: ToolAuditEvent[] = [];
   private readonly maxAuditLogSize = 1000;
-  private readonly auditLogPath: string;
+  private auditLogPath: string;
+  private workspaceRoot: string;
 
   // Patterns for redacting sensitive secrets
   private readonly secretPatterns: RegExp[] = [
@@ -23,8 +24,26 @@ export class PermissionManager {
     /-----BEGIN (?:RSA |EC )?PRIVATE KEY-----[\s\S]+?-----END (?:RSA |EC )?PRIVATE KEY-----/g,
   ];
 
-  constructor(private readonly workspaceRoot: string) {
+  // Commands or patterns strictly prohibited even under Bypass Permissions mode (hard safety boundaries)
+  private readonly dangerousPatterns: RegExp[] = [
+    /rm\s+-rf\s+(\/|~|\$HOME|\.\.)/i,
+    /mkfs(\.[a-z0-9]+)?\s+/i,
+    /dd\s+if=.*of=\/dev\/(sd[a-z]|nvme)/i,
+    /:(){ :\|:& };:/, // Fork bomb
+    /DROP\s+(DATABASE|SCHEMA)\s+/i,
+    />\s*\/dev\/(sd[a-z]|nvme)/i,
+    /chmod\s+-R\s+777\s+\//i,
+  ];
+
+  constructor(workspaceRoot: string) {
+    this.workspaceRoot = workspaceRoot;
     this.auditLogPath = path.join(workspaceRoot, '.localcoders', 'audit.log');
+    this.ensureAuditDir();
+  }
+
+  public setWorkspace(root: string): void {
+    this.workspaceRoot = root;
+    this.auditLogPath = path.join(root, '.localcoders', 'audit.log');
     this.ensureAuditDir();
   }
 
@@ -32,24 +51,27 @@ export class PermissionManager {
     return this.mode;
   }
 
-  public setMode(mode: SecurityMode): void {
-    this.mode = mode;
+  public setMode(mode: SecurityMode | PermissionMode): void {
+    this.mode = mode as SecurityMode;
   }
 
-  public isApprovalRequired(tool: ToolDefinition, sessionId?: string): boolean {
-    // 1. Restricted mode: everything other than read is blocked/requires approval
-    if (this.mode === 'restricted') {
-      return tool.permissionLevel !== 'read';
-    }
+  public isApprovalRequired(tool: ToolDefinition, sessionId?: string, rawCommandOrArgs?: any): boolean {
+    const activeMode = this.getNormalizedMode();
 
-    // 2. Ask Every Time mode: everything requires approval except harmless meta-reads
-    if (this.mode === 'ask_every_time') {
+    // 1. Ask Before Actions / Ask Every Time mode:
+    if (activeMode === 'ask') {
+      if (this.mode === 'ask_every_time' || this.mode === 'restricted') return true;
+      if (tool.permissionLevel === 'read') return false; // Harmless file reads don't prompt in ask mode
       return true;
     }
 
-    // 3. Check session or tool approvals granted by user
+    // 2. Hard safety boundaries check (always enforced across all modes including Bypass Permissions)
+    if (this.isStrictlyProhibited(rawCommandOrArgs)) {
+      return true; // Must pause for explicit critical confirmation
+    }
+
+    // 3. User granted explicit approval for this tool or session
     if (this.sessionApprovals.has(tool.name)) {
-      // Destructive tools always require confirmation
       if (tool.permissionLevel === 'destructive') return true;
       return false;
     }
@@ -58,15 +80,32 @@ export class PermissionManager {
       return false;
     }
 
-    // 4. Autonomous mode: only destructive actions require approval
-    if (this.mode === 'autonomous') {
+    // 4. Bypass Permissions mode:
+    // Auto-approve all tool calls unless organizational policy requires approval or destructive
+    if (activeMode === 'bypass') {
       return tool.permissionLevel === 'destructive';
     }
 
-    // 5. Supervised mode (default):
-    // Read: allowed
-    // Write / Execute / Network / Destructive: require approval
-    return tool.permissionLevel !== 'read';
+    // 5. Smart Approval mode (default):
+    // - Read / search / safe inspections: auto-approved
+    // - Write / execute / network / destructive: require approval according to policy
+    if (tool.permissionLevel === 'read') {
+      return false;
+    }
+
+    return true;
+  }
+
+  public isStrictlyProhibited(payload?: any): boolean {
+    if (!payload) return false;
+    const str = typeof payload === 'string' ? payload : JSON.stringify(payload);
+    return this.dangerousPatterns.some((pattern) => pattern.test(str));
+  }
+
+  public getNormalizedMode(): 'ask' | 'smart' | 'bypass' {
+    if (this.mode === 'ask' || this.mode === 'ask_every_time' || this.mode === 'restricted') return 'ask';
+    if (this.mode === 'bypass' || this.mode === 'autonomous') return 'bypass';
+    return 'smart';
   }
 
   public grantSessionApproval(toolName: string, sessionId?: string): void {
@@ -120,17 +159,18 @@ export class PermissionManager {
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
-    } catch {
-      // ignore
+    } catch (e) {
+      console.error('[PermissionManager] Failed to create audit log dir:', e);
     }
   }
 
   private persistEvent(event: ToolAuditEvent): void {
     try {
+      this.ensureAuditDir();
       const line = JSON.stringify(event) + '\n';
       fs.appendFileSync(this.auditLogPath, line, 'utf-8');
-    } catch {
-      // ignore write errors in sandbox
+    } catch (e) {
+      console.error('[PermissionManager] Failed to persist audit event:', e);
     }
   }
 }

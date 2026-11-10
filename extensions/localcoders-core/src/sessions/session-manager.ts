@@ -2,6 +2,25 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import { AgentMessage, TaskPlanItem, CriticReport } from '../agents/types';
+import { ReasoningEffort } from '../models/model-provider-registry';
+
+export type ExecutionMode = 'code' | 'smart' | 'ask' | 'plan';
+export type PermissionMode = 'ask' | 'smart' | 'bypass';
+
+export interface AgentSessionConfig {
+  providerId: string; // 'ollama' | 'openai' | 'anthropic' | 'gemini' | 'custom'
+  modelId: string; // e.g. "ollama/qwen3.8:27b", "anthropic/claude-3-7-sonnet"
+  modelName?: string;
+  reasoningEffort: ReasoningEffort;
+  fastMode: boolean;
+  executionMode: ExecutionMode;
+  permissionMode: PermissionMode;
+  enabledMcpServers?: string[];
+  enabledSkills?: string[];
+  activeRules?: string[];
+  attachedFiles?: string[];
+  projectContext?: string[];
+}
 
 export interface ExecutionGroup {
   id: string;
@@ -24,6 +43,7 @@ export interface SessionData {
   updatedAt: number;
   workspaceRoot: string;
   model: string;
+  config: AgentSessionConfig;
   participatingAgents: string[];
   messages: AgentMessage[];
   plan: TaskPlanItem[];
@@ -80,6 +100,20 @@ export class SessionManager {
           const filePath = path.join(this.storageDir, file);
           const raw = fs.readFileSync(filePath, 'utf-8');
           const session = JSON.parse(raw) as SessionData;
+
+          // Backfill config if legacy session
+          if (!session.config) {
+            session.config = {
+              providerId: 'ollama',
+              modelId: session.model || 'qwen3.8:27b',
+              reasoningEffort: 'medium',
+              fastMode: false,
+              executionMode: 'code',
+              permissionMode: 'smart',
+              attachedFiles: [],
+              projectContext: [],
+            };
+          }
           this.sessions.set(session.id, session);
         } catch (e) {
           console.error(`[SessionManager] Failed to read session ${file}:`, e);
@@ -112,9 +146,29 @@ export class SessionManager {
     return this.sessions.get(id);
   }
 
-  public createSession(goal: string, model: string): SessionData {
+  public createSession(
+    goal: string,
+    model: string = 'qwen3.8:27b',
+    initialConfig?: Partial<AgentSessionConfig>
+  ): SessionData {
     const id = `session_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const title = goal.length > 36 ? goal.substring(0, 36).trim() + '...' : goal || 'New Session';
+
+    const config: AgentSessionConfig = {
+      providerId: initialConfig?.providerId || (model.includes('/') ? model.split('/')[0] : 'ollama'),
+      modelId: initialConfig?.modelId || model,
+      modelName: initialConfig?.modelName || model,
+      reasoningEffort: initialConfig?.reasoningEffort || 'medium',
+      fastMode: initialConfig?.fastMode ?? false,
+      executionMode: initialConfig?.executionMode || 'code',
+      permissionMode: initialConfig?.permissionMode || 'smart',
+      enabledMcpServers: initialConfig?.enabledMcpServers || [],
+      enabledSkills: initialConfig?.enabledSkills || [],
+      activeRules: initialConfig?.activeRules || [],
+      attachedFiles: initialConfig?.attachedFiles || [],
+      projectContext: initialConfig?.projectContext || [],
+    };
+
     const newSession: SessionData = {
       id,
       title,
@@ -123,7 +177,8 @@ export class SessionManager {
       createdAt: Date.now(),
       updatedAt: Date.now(),
       workspaceRoot: this.workspaceRoot,
-      model,
+      model: config.modelId,
+      config,
       participatingAgents: ['main'],
       messages: [],
       plan: [],
@@ -191,9 +246,63 @@ export class SessionManager {
     const session = this.getActiveSession();
     if (!session) return;
     updater(session);
+    if (session.messages && session.messages.length > 1) {
+      const seen = new Set<string>();
+      const deduped: AgentMessage[] = [];
+      for (const m of session.messages) {
+        if (!m.id) {
+          deduped.push(m);
+          continue;
+        }
+        if (!seen.has(m.id)) {
+          seen.add(m.id);
+          deduped.push(m);
+        }
+      }
+      session.messages = deduped;
+    }
     session.updatedAt = Date.now();
     this.saveSession(session);
     this._onDidChangeSessions.fire();
+  }
+
+  public updateActiveConfig(updater: (config: AgentSessionConfig) => void): SessionData | undefined {
+    const session = this.getActiveSession();
+    if (!session) return undefined;
+    if (!session.config) {
+      session.config = {
+        providerId: 'ollama',
+        modelId: session.model || 'qwen3.8:27b',
+        reasoningEffort: 'medium',
+        fastMode: false,
+        executionMode: 'code',
+        permissionMode: 'smart',
+        attachedFiles: [],
+        projectContext: [],
+      };
+    }
+    updater(session.config);
+    session.model = session.config.modelId;
+    session.updatedAt = Date.now();
+    this.saveSession(session);
+    this._onDidChangeSessions.fire();
+    return session;
+  }
+
+  public attachFileToActiveSession(filePath: string): void {
+    this.updateActiveConfig((cfg) => {
+      if (!cfg.attachedFiles) cfg.attachedFiles = [];
+      if (!cfg.attachedFiles.includes(filePath)) {
+        cfg.attachedFiles.push(filePath);
+      }
+    });
+  }
+
+  public removeAttachmentFromActiveSession(filePath: string): void {
+    this.updateActiveConfig((cfg) => {
+      if (!cfg.attachedFiles) return;
+      cfg.attachedFiles = cfg.attachedFiles.filter((f) => f !== filePath);
+    });
   }
 
   private saveSession(session: SessionData) {

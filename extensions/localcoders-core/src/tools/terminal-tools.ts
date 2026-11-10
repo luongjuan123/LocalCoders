@@ -1,3 +1,5 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { ToolExecutionContext, ToolResult } from './types';
@@ -9,15 +11,19 @@ export async function runCommandTool(
   args: { command: string; timeoutMs?: number },
   ctx: ToolExecutionContext
 ): Promise<ToolResult> {
+  const rawCmd = args.command || (args as any).cmd || (args as any).script || (args as any).input || (args as any).commandLine || '';
+  if (!rawCmd) {
+    return { success: false, error: 'runCommandTool: Missing required argument "command"' };
+  }
   const timeout = args.timeoutMs || 45000;
 
   if (ctx.requireApproval) {
     const isDestructive =
-      args.command.includes('rm -rf') ||
-      args.command.includes('mkfs') ||
-      args.command.includes('dd if=') ||
-      args.command.includes('shutdown') ||
-      args.command.includes('reboot');
+      rawCmd.includes('rm -rf') ||
+      rawCmd.includes('mkfs') ||
+      rawCmd.includes('dd if=') ||
+      rawCmd.includes('shutdown') ||
+      rawCmd.includes('reboot');
 
     const approved = await ctx.requestApproval({
       id: `appr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
@@ -25,8 +31,8 @@ export async function runCommandTool(
       agentId: ctx.agentId,
       agentName: ctx.agentName,
       tool: 'run_command',
-      args,
-      description: `Execute terminal command: \`${args.command}\``,
+      args: { ...args, command: rawCmd },
+      description: `Execute terminal command: \`${rawCmd}\``,
       isDestructive,
     });
 
@@ -36,7 +42,7 @@ export async function runCommandTool(
   }
 
   try {
-    const { stdout, stderr } = await execAsync(args.command, {
+    const { stdout, stderr } = await execAsync(rawCmd, {
       cwd: ctx.workspaceRoot,
       timeout,
       maxBuffer: 4 * 1024 * 1024,
@@ -45,7 +51,7 @@ export async function runCommandTool(
     return {
       success: true,
       output: {
-        command: args.command,
+        command: rawCmd,
         stdout: stdout.trim(),
         stderr: stderr.trim(),
         exitCode: 0,
@@ -56,7 +62,7 @@ export async function runCommandTool(
       success: false,
       error: err.message,
       output: {
-        command: args.command,
+        command: rawCmd,
         stdout: err.stdout ? err.stdout.trim() : '',
         stderr: err.stderr ? err.stderr.trim() : '',
         exitCode: err.code || 1,
@@ -197,7 +203,27 @@ export async function listPortsTool(
 }
 
 export async function runTestsTool(args: { testPath?: string }, ctx: ToolExecutionContext): Promise<ToolResult> {
-  const cmd = args.testPath ? `npm test -- "${args.testPath}"` : 'npm test';
+  const ws = ctx.workspaceRoot;
+  const hasPkgJson = fs.existsSync(path.join(ws, 'package.json'));
+  const hasPyFiles = fs.readdirSync(ws).some((f) => f.endsWith('.py') || f === 'requirements.txt' || f === 'pyproject.toml');
+
+  let cmd: string;
+  if (args.testPath) {
+    if (args.testPath.endsWith('.py')) {
+      cmd = `python3 -m unittest "${args.testPath}"`;
+    } else if (hasPkgJson) {
+      cmd = `npm test -- "${args.testPath}"`;
+    } else {
+      cmd = `python3 -m unittest "${args.testPath}"`;
+    }
+  } else if (hasPkgJson) {
+    cmd = 'npm test';
+  } else if (hasPyFiles) {
+    cmd = 'python3 -m unittest discover -s . -p "*test*.py"';
+  } else {
+    cmd = 'npm test';
+  }
+
   return runCommandTool({ command: cmd }, ctx);
 }
 

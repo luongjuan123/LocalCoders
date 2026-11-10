@@ -26,13 +26,26 @@ export interface ChangesSummary {
 export class ChangesManager {
   private _onDidChangeChanges = new vscode.EventEmitter<ChangesSummary>();
   public readonly onDidChangeChanges = this._onDidChangeChanges.event;
+  private watcher: vscode.FileSystemWatcher | null = null;
 
   constructor(private workspaceRoot: string) {
-    // Watch workspace filesystem changes to refresh diffs
-    const watcher = vscode.workspace.createFileSystemWatcher('**/*');
-    watcher.onDidChange(() => this.refresh());
-    watcher.onDidCreate(() => this.refresh());
-    watcher.onDidDelete(() => this.refresh());
+    this.setupWatcher();
+  }
+
+  private setupWatcher() {
+    if (this.watcher) {
+      this.watcher.dispose();
+    }
+    this.watcher = vscode.workspace.createFileSystemWatcher('**/*');
+    this.watcher.onDidChange(() => this.refresh());
+    this.watcher.onDidCreate(() => this.refresh());
+    this.watcher.onDidDelete(() => this.refresh());
+  }
+
+  public setWorkspace(root: string) {
+    this.workspaceRoot = root;
+    this.setupWatcher();
+    this.refresh();
   }
 
   private async runGit(cmd: string): Promise<string> {
@@ -78,7 +91,22 @@ export class ChangesManager {
       if (!line || line.length < 3) continue;
       const indexStatus = line[0];
       const workTreeStatus = line[1];
-      const relPath = line.substring(3).trim();
+      const relPath = line.substring(3).trim().replace(/^"|"$/g, '');
+      if (
+        relPath.startsWith('.localcoders/') ||
+        relPath.startsWith('.localcoders\\') ||
+        relPath === '.localcoders' ||
+        relPath.endsWith('audit.log') ||
+        relPath.startsWith('.git/') ||
+        relPath.startsWith('__pycache__/') ||
+        relPath.startsWith('__pycache__\\') ||
+        relPath.includes('/__pycache__/') ||
+        relPath.endsWith('.pyc') ||
+        relPath.startsWith('.pytest_cache/') ||
+        relPath.startsWith('node_modules/')
+      ) {
+        continue;
+      }
 
       let statusType: 'M' | 'A' | 'D' | 'R' | '?' = 'M';
       if (indexStatus === 'A' || workTreeStatus === '?' || (indexStatus === '?' && workTreeStatus === '?')) {
@@ -121,6 +149,21 @@ export class ChangesManager {
       totalRemoved,
       files,
     };
+  }
+
+  public async getFileDiff(relPath: string): Promise<string> {
+    const diff = await this.runGit(`diff HEAD -- "${relPath}"`);
+    if (diff) return diff;
+    const fullPath = path.join(this.workspaceRoot, relPath);
+    if (fs.existsSync(fullPath)) {
+      try {
+        const content = fs.readFileSync(fullPath, 'utf8');
+        return content.split('\n').map((line) => `+${line}`).join('\n');
+      } catch {
+        return '';
+      }
+    }
+    return '';
   }
 
   public async refresh() {

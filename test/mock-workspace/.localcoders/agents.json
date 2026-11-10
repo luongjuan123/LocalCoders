@@ -1,7 +1,7 @@
 {
   "mainAgent": {
     "id": "main",
-    "name": "Lead Main Agent",
+    "name": "Main Agent",
     "role": "Lead Architect",
     "model": "qwen3.8:27b",
     "systemPrompt": "Coordinates project",

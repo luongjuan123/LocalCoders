@@ -8,6 +8,7 @@ import { FileLockManager } from './file-lock';
 import { MainAgent } from './main-agent';
 import { Subagent } from './subagent';
 import { CriticAgent } from './critic-agent';
+import { AgentSessionConfig } from '../sessions/session-manager';
 import {
   AgentActivityEvent,
   AgentMessage,
@@ -128,11 +129,33 @@ export class AgentOrchestrator {
     }
   }
 
-  // Submit and start a new coding task
-  async submitTask(userPrompt: string): Promise<AgentTask> {
+  private isInformationalQuery(prompt: string): boolean {
+    const lower = prompt.trim().toLowerCase();
+    const actionWords = ['write', 'create', 'fix', 'implement', 'add', 'modify', 'change', 'refactor', 'delete', 'remove', 'run', 'test', 'install', 'build'];
+    const hasAction = actionWords.some((w) => lower.includes(w));
+    if (hasAction) return false;
+
+    const questionWords = ['what', 'why', 'how', 'explain', 'where', 'list', 'is there', 'can you describe', 'tell me', 'which'];
+    return questionWords.some((qw) => lower.startsWith(qw));
+  }
+
+  // Submit and start a new coding task with full execution mode & permission enforcement
+  async submitTask(
+    userPrompt: string,
+    sessionConfig?: AgentSessionConfig,
+    conversationContext?: Array<{ role: string; content: string }>
+  ): Promise<AgentTask> {
     const mainConfig = this.registry.getMainAgent();
     if (!mainConfig) {
       throw new Error('Mandatory Main Agent has not been configured! Please configure a Main Agent in LocalCoders setup.');
+    }
+
+    // Apply session-specific model if configured
+    if (sessionConfig?.modelId) {
+      const cleanModel = sessionConfig.modelId.includes('/')
+        ? sessionConfig.modelId.split('/')[1]
+        : sessionConfig.modelId;
+      mainConfig.model = cleanModel;
     }
 
     const taskId = `task_${Date.now()}`;
@@ -159,7 +182,43 @@ export class AgentOrchestrator {
       taskId,
     });
 
+    // Injected Context (Attached Files / Rules / Prior Conversation)
+    let effectivePrompt = userPrompt;
+    if (sessionConfig?.attachedFiles && sessionConfig.attachedFiles.length > 0) {
+      effectivePrompt = `ATTACHED CONTEXT FILES:\n${sessionConfig.attachedFiles.map((f) => `- ${f}`).join('\n')}\n\nUSER PROMPT:\n${userPrompt}`;
+    }
+
+    if (conversationContext && conversationContext.length > 1) {
+      const recentContext = conversationContext
+        .slice(-4)
+        .map((m) => `[${m.role.toUpperCase()}]: ${m.content.slice(0, 600)}`)
+        .join('\n\n');
+      effectivePrompt = `RECENT CONVERSATION HISTORY:\n${recentContext}\n\nLATEST USER INSTRUCTION:\n${effectivePrompt}`;
+    }
+
     const approvalHandler = async (req: ToolApprovalRequest): Promise<boolean> => {
+      // 1. Bypass Permissions mode: auto-approve unless dangerous
+      if (sessionConfig?.permissionMode === 'bypass') {
+        const isDangerous = req.tool === 'database_execute' && req.isDestructive;
+        if (!isDangerous) {
+          return true;
+        }
+      }
+
+      // 2. Query PermissionManager if configured
+      const pm = this.toolManager.getPermissionManager();
+      if (pm) {
+        const toolDef = this.toolManager.getToolDefinitions().find((t) => t.name === req.tool);
+        if (toolDef && !pm.isApprovalRequired(toolDef, taskId, req.args)) {
+          return true;
+        }
+      }
+
+      // 3. Fallback when running without UI approval listeners (e.g. testing/headless)
+      if (this.onApprovalListeners.length === 0) {
+        return !req.isDestructive;
+      }
+
       this.emitApproval(req);
       return new Promise<boolean>((resolve) => {
         this.pendingApprovals.set(req.id, resolve);
@@ -175,8 +234,15 @@ export class AgentOrchestrator {
     // Build Critic Agent if enabled
     const criticConf = this.registry.getCriticConfig();
     let criticAgent: CriticAgent | null = null;
-    if (criticConf.enabled && criticConf.model) {
-      criticAgent = new CriticAgent(this.ollama, criticConf, this.memoryManager, this.toolManager, this.workspaceRoot);
+    if (criticConf.enabled) {
+      const criticModel = criticConf.model || mainConfig.model;
+      criticAgent = new CriticAgent(
+        this.ollama,
+        { ...criticConf, model: criticModel },
+        this.memoryManager,
+        this.toolManager,
+        this.workspaceRoot
+      );
     }
 
     // Build Main Agent
@@ -190,10 +256,69 @@ export class AgentOrchestrator {
     );
 
     try {
+      const mode = sessionConfig?.executionMode || 'code';
+
+      // 1. ASK MODE: Answer questions without making code modifications
+      if (mode === 'ask' || (mode === 'smart' && this.isInformationalQuery(userPrompt))) {
+        this.emitActivity(mainConfig.id, mainConfig.name, 'working', 'Analyzing codebase and formulating answer...');
+        const answer = await mainAgent.answerQuestion(effectivePrompt, this.abortController.signal, {
+          reasoningEffort: sessionConfig?.reasoningEffort,
+          fastMode: sessionConfig?.fastMode,
+        });
+
+        this.currentTask.status = 'completed';
+        this.emitMessage({
+          id: `msg_ans_${Date.now()}`,
+          senderId: mainConfig.id,
+          senderName: mainConfig.name,
+          senderRole: 'assistant',
+          content: answer,
+          timestamp: Date.now(),
+          taskId,
+        });
+        this.emitActivity(mainConfig.id, mainConfig.name, 'completed', 'Analysis complete.');
+        return this.currentTask;
+      }
+
+      // 2. PLAN MODE: Formulate plan without modifying files
+      if (mode === 'plan') {
+        this.emitActivity(mainConfig.id, mainConfig.name, 'planning', 'Formulating architectural plan before implementation...');
+        const plan = await mainAgent.createPlan(effectivePrompt, subagents, (act) => {
+          this.emitActivity(mainConfig.id, mainConfig.name, 'planning', act);
+        });
+
+        this.currentTask.plan = plan;
+        this.emitPlan(plan);
+
+        const planMsgContent =
+          `### Implementation Plan (Drafted in Plan Mode)\n` +
+          plan
+            .map(
+              (p, i) =>
+                `${i + 1}. **${p.title}** (${p.assignedTo === 'main' ? 'Main Agent' : p.assignedTo}): ${p.description}`
+            )
+            .join('\n') +
+          `\n\n*Review the plan above. To execute code modifications, switch to **Code Mode** or approve tasks.*`;
+
+        this.emitMessage({
+          id: `msg_plan_${Date.now()}`,
+          senderId: mainConfig.id,
+          senderName: mainConfig.name,
+          senderRole: 'assistant',
+          content: planMsgContent,
+          timestamp: Date.now(),
+          taskId,
+        });
+
+        this.currentTask.status = 'completed';
+        this.emitActivity(mainConfig.id, mainConfig.name, 'completed', 'Plan formulated.');
+        return this.currentTask;
+      }
+
+      // 3. CODE / SMART MODE: Full autonomous execution
       this.emitActivity(mainConfig.id, mainConfig.name, 'planning', 'Formulating implementation plan...');
 
-      // 1. Plan
-      const plan = await mainAgent.createPlan(userPrompt, subagents, (act) => {
+      const plan = await mainAgent.createPlan(effectivePrompt, subagents, (act) => {
         this.emitActivity(mainConfig.id, mainConfig.name, 'planning', act);
       });
 
@@ -201,7 +326,14 @@ export class AgentOrchestrator {
       this.emitPlan(plan);
 
       // Assistant Plan Message
-      const planMsgContent = `### Implementation Plan\n` + plan.map((p, i) => `${i + 1}. **${p.title}** (${p.assignedTo === 'main' ? 'Main Agent' : p.assignedTo}): ${p.description}`).join('\n');
+      const planMsgContent =
+        `### Implementation Plan\n` +
+        plan
+          .map(
+            (p, i) =>
+              `${i + 1}. **${p.title}** (${p.assignedTo === 'main' ? 'Main Agent' : p.assignedTo}): ${p.description}`
+          )
+          .join('\n');
       this.emitMessage({
         id: `msg_plan_${Date.now()}`,
         senderId: mainConfig.id,
@@ -212,12 +344,12 @@ export class AgentOrchestrator {
         taskId,
       });
 
-      // 2. Execute
+      // Execute Plan
       this.emitActivity(mainConfig.id, mainConfig.name, 'working', 'Executing plan across agent team...');
 
       const execResult = await mainAgent.executePlan(
         plan,
-        userPrompt,
+        effectivePrompt,
         subagents,
         criticAgent,
         (act) => {

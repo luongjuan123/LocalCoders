@@ -3,6 +3,7 @@ import { AgentConfig, TaskPlanItem } from './types';
 import { ToolManager } from '../tools/tool-manager';
 import { ToolExecutionContext } from '../tools/types';
 import { FileLockManager } from './file-lock';
+import { parseToolCallsFromContent, parseCodeBlocksFromContent } from './main-agent';
 
 export class Subagent {
   public config: AgentConfig;
@@ -54,25 +55,41 @@ export class Subagent {
       requestApproval,
     };
 
-    const tools = this.toolManager.getOllamaTools();
+    const taskContext = {
+      affectedFiles: task.affectedFiles,
+      prompt: `${task.title} ${task.description} ${projectContext}`,
+    };
+    const tools = this.toolManager.getOllamaTools(this.config.role, taskContext);
 
     const systemPrompt = `You are ${this.config.name}, a specialized ${this.config.role} agent in LocalCoders.
 ${this.config.systemPrompt}
 
-You have access to tools to read, edit, write, search files and run commands.
-Perform your delegated task thoroughly and accurately.
-When you edit files or write code, ensure it is production quality, clean, and bug-free.
+CRITICAL EXECUTION MANDATE:
+- You are an autonomous software agent. Talking about code or describing an implementation does NOT complete the task.
+- YOU MUST EXECUTE TOOLS:
+  * write_file(path, content): Create or overwrite source files in the workspace.
+  * edit_file(path, target, replacement): Modify existing files with targeted changes.
+  * run_command(command): Run shell commands, tests, package managers, and builds.
+  * read_file(path): Inspect file contents.
+  * list_directory(path): Inspect directory structures.
+- Whenever you implement a feature, module, or test, YOU MUST CALL write_file TO SAVE THE CODE TO DISK.
+- Always write complete, production-ready, clean code with zero placeholders or omissions.
 
 PROJECT CONTEXT:
 ${projectContext}
 `;
+
+    const targetFilePrompt = task.affectedFiles.length > 0
+      ? `You MUST immediately write/update the required code for: ${task.affectedFiles.join(', ')} using write_file. Do not waste turns reading directory listings when files must be written.`
+      : `Please execute this task using your tools (write_file, edit_file, run_command) now.`;
 
     const userPrompt = `DELEGATED TASK:
 Title: ${task.title}
 Description: ${task.description}
 Expected Affected Files: ${task.affectedFiles.join(', ') || 'Determined by agent'}
 
-Please execute this task using your tools as needed. Once completed, provide a summary of the work done.`;
+MANDATORY ACTION:
+${targetFilePrompt}`;
 
     const messages: any[] = [
       { role: 'system', content: systemPrompt },
@@ -82,6 +99,12 @@ Please execute this task using your tools as needed. Once completed, provide a s
     let turns = 0;
     const maxTurns = 10;
     let finalSummary = '';
+    const filesWritten: string[] = [];
+    let toolsExecutedCount = 0;
+
+    const isImplementationTask =
+      task.affectedFiles.length > 0 ||
+      /\b(implement|create|write|build|add|code|fix|develop|test|setup)\b/i.test(task.title + ' ' + task.description);
 
     try {
       while (turns < maxTurns) {
@@ -94,59 +117,142 @@ Please execute this task using your tools as needed. Once completed, provide a s
         let assistantThinking = '';
         let toolCalls: any = undefined;
 
+        let genTokens = 0;
+        let lastGenUpdate = Date.now();
+
         await this.ollama.chatStream(
           {
             model: this.config.model,
             messages,
             tools,
             temperature: this.config.temperature || 0.2,
+            contextWindow: this.config.contextWindow || 32768,
           },
           (chunk) => {
             assistantContent += chunk.content;
+            genTokens++;
             if (chunk.thinking) assistantThinking += chunk.thinking;
             if (chunk.toolCalls) toolCalls = chunk.toolCalls;
+
+            const now = Date.now();
+            if (now - lastGenUpdate > 2500) {
+              lastGenUpdate = now;
+              if (chunk.thinking) {
+                const thinkSnippet = chunk.thinking.trim().slice(-60).replace(/[\r\n]+/g, ' ');
+                onActivity(`[${this.config.name}] Thinking: ${thinkSnippet}...`);
+              } else {
+                onActivity(`[${this.config.name}] Generating implementation (${genTokens} tokens)...`);
+              }
+            }
           },
           abortSignal
         );
+
+        // 1. Check for native tool calls
+        let activeCalls: Array<{ name: string; args: any }> = [];
+        if (toolCalls && Array.isArray(toolCalls) && toolCalls.length > 0) {
+          for (const tc of toolCalls) {
+            const fn = tc.function || tc;
+            let args = {};
+            try {
+              args = typeof fn.arguments === 'string' ? JSON.parse(fn.arguments) : fn.arguments || {};
+            } catch {}
+            activeCalls.push({ name: fn.name, args });
+          }
+        }
+
+        // 2. Check for embedded text tool calls (<tool_call>... or ```json {"tool": ...} ```)
+        if (activeCalls.length === 0) {
+          activeCalls = parseToolCallsFromContent(assistantContent);
+        }
+
+        // 3. Fallback: Parse code blocks with filenames and automatically persist them via write_file
+        if (activeCalls.length === 0) {
+          const extractedFiles = parseCodeBlocksFromContent(assistantContent, task.affectedFiles);
+          if (extractedFiles.length > 0) {
+            for (const ef of extractedFiles) {
+              onActivity(`[${this.config.name}] Writing extracted code to '${ef.path}'...`);
+              const writeRes = await this.toolManager.executeTool(
+                'write_file',
+                { path: ef.path, content: ef.content },
+                toolCtx
+              );
+              if (writeRes.success) {
+                filesWritten.push(ef.path);
+                toolsExecutedCount++;
+              }
+            }
+          }
+        }
 
         messages.push({
           role: 'assistant',
           content: assistantContent,
           thinking: assistantThinking || undefined,
-          tool_calls: toolCalls,
+          tool_calls: toolCalls && toolCalls.length > 0 ? toolCalls : undefined,
         });
 
-        if (!toolCalls || !Array.isArray(toolCalls) || toolCalls.length === 0) {
-          finalSummary = assistantContent;
-          break;
-        }
+        // 4. Execute tool calls
+        if (activeCalls.length > 0) {
+          for (const call of activeCalls) {
+            toolsExecutedCount++;
+            onActivity(`[${this.config.name}] ${call.name}(${JSON.stringify(call.args).slice(0, 50)}...)`);
 
-        // Execute tool calls
-        for (const tc of (toolCalls as any[])) {
-          const fn = tc.function || tc;
-          const toolName = fn.name;
-          let toolArgs: any = {};
-          try {
-            toolArgs = typeof fn.arguments === 'string' ? JSON.parse(fn.arguments) : fn.arguments || {};
-          } catch {
-            toolArgs = {};
+            const result = await this.toolManager.executeTool(call.name, call.args, toolCtx);
+            if (result.success && (call.name === 'write_file' || call.name === 'create_file')) {
+              const p = call.args.path || call.args.filePath;
+              if (p) filesWritten.push(p);
+            }
+
+            const resStr = JSON.stringify(result);
+            const boundedStr = resStr.length > 3000 ? resStr.slice(0, 3000) + '... [truncated]' : resStr;
+
+            if (toolCalls && toolCalls.length > 0) {
+              messages.push({
+                role: 'tool',
+                tool_name: call.name,
+                content: boundedStr,
+              });
+            } else {
+              messages.push({
+                role: 'user',
+                content: `[Tool Result for ${call.name}]: ${boundedStr}\nContinue implementing the task. Use 'write_file' to create or update required source files and test files.`,
+              });
+            }
           }
 
-          onActivity(`Calling tool: ${toolName}(${JSON.stringify(toolArgs).slice(0, 60)}...)`);
+          if (toolCalls && toolCalls.length > 0) {
+            messages.push({
+              role: 'user',
+              content: `Tool executions completed. Continue implementing the task. Use 'write_file' to save code to disk, and 'run_command' to run tests.`,
+            });
+          }
 
-          const result = await this.toolManager.executeTool(toolName, toolArgs, toolCtx);
-
-          messages.push({
-            role: 'tool',
-            content: JSON.stringify(result),
-          });
+          continue;
         }
+
+        // 5. Nudge if implementation task didn't call any tools
+        if (isImplementationTask && filesWritten.length === 0 && toolsExecutedCount === 0 && turns < 3) {
+          onActivity(`[${this.config.name}] Nudging model to invoke write_file tool...`);
+          messages.push({
+            role: 'user',
+            content: 'CRITICAL: You explained the solution, but NO files were written to disk. You must call write_file(path, content) right now to persist the code into the workspace.',
+          });
+          continue;
+        }
+
+        finalSummary = assistantContent;
+        break;
       }
+
+      const summary = filesWritten.length > 0
+        ? `Successfully implemented and persisted files: ${filesWritten.join(', ')}`
+        : finalSummary || 'Task completed successfully.';
 
       return {
         success: true,
-        output: finalSummary || 'Task completed successfully.',
-        affectedFiles: task.affectedFiles,
+        output: summary,
+        affectedFiles: Array.from(new Set([...task.affectedFiles, ...filesWritten])),
       };
     } finally {
       // Release file locks held for this task

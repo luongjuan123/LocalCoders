@@ -2,6 +2,8 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { AgentRegistry } from '../agents/agent-registry';
 import { AgentOrchestrator } from '../agents/orchestrator';
+import { McpHost, McpConnectedServer } from '../mcp/mcp-host';
+import { PermissionManager, SecurityMode } from '../security/permission-manager';
 
 // 1. Agent Team Tree View
 export class AgentTeamTreeProvider implements vscode.TreeDataProvider<AgentTreeItem> {
@@ -295,5 +297,119 @@ export class CriticReviewsTreeProvider implements vscode.TreeDataProvider<vscode
     }
 
     return Promise.resolve(items);
+  }
+}
+
+// 6. MCP Servers Tree View
+export class McpServersTreeProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
+  private _onDidChangeTreeData = new vscode.EventEmitter<vscode.TreeItem | undefined | null | void>();
+  readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+
+  constructor(private mcpHost: McpHost) {}
+
+  refresh(): void {
+    this._onDidChangeTreeData.fire();
+  }
+
+  getTreeItem(element: vscode.TreeItem): vscode.TreeItem {
+    return element;
+  }
+
+  async getChildren(element?: vscode.TreeItem): Promise<vscode.TreeItem[]> {
+    if (!element) {
+      const servers = this.mcpHost.getAllServers();
+      const items: vscode.TreeItem[] = [];
+
+      const addItem = new vscode.TreeItem('+ Add External MCP Server...', vscode.TreeItemCollapsibleState.None);
+      addItem.description = 'Configure stdio or HTTP SSE server';
+      addItem.iconPath = new vscode.ThemeIcon('add');
+      addItem.command = { command: 'localcoders.addMcpServer', title: 'Add MCP Server' };
+      items.push(addItem);
+
+      if (servers.length === 0) {
+        const empty = new vscode.TreeItem('No MCP Servers Configured', vscode.TreeItemCollapsibleState.None);
+        empty.description = 'Click above to connect SQLite, GitHub, Brave, etc.';
+        empty.iconPath = new vscode.ThemeIcon('info');
+        items.push(empty);
+      } else {
+        for (const s of servers) {
+          const item = new vscode.TreeItem(
+            s.config.name,
+            s.status === 'connected' && s.tools.length > 0
+              ? vscode.TreeItemCollapsibleState.Collapsed
+              : vscode.TreeItemCollapsibleState.None
+          );
+          item.description = `[${s.status.toUpperCase()}] • ${s.config.transport} (${s.tools.length} tools)`;
+          item.iconPath = new vscode.ThemeIcon(
+            s.status === 'connected' ? 'plug' : s.status === 'error' ? 'error' : 'circle-slash'
+          );
+          (item as any).serverId = s.config.id;
+          items.push(item);
+        }
+      }
+
+      return items;
+    }
+
+    // Child items: tools discovered for server
+    const serverId = (element as any).serverId;
+    if (serverId) {
+      const server = this.mcpHost.getServer(serverId);
+      if (server && server.tools) {
+        return server.tools.map((t) => {
+          const item = new vscode.TreeItem(t.name, vscode.TreeItemCollapsibleState.None);
+          item.description = t.description ? t.description.substring(0, 40) + '...' : 'MCP Tool';
+          item.iconPath = new vscode.ThemeIcon('tools');
+          item.tooltip = `${t.name}\n${t.description || ''}`;
+          return item;
+        });
+      }
+    }
+
+    return [];
+  }
+}
+
+// 7. Security & Permissions Tree View
+export class SecurityPermissionsTreeProvider implements vscode.TreeDataProvider<vscode.TreeItem> {
+  private _onDidChangeTreeData = new vscode.EventEmitter<vscode.TreeItem | undefined | null | void>();
+  readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+
+  constructor(private permissionManager: PermissionManager) {}
+
+  refresh(): void {
+    this._onDidChangeTreeData.fire();
+  }
+
+  getTreeItem(element: vscode.TreeItem): vscode.TreeItem {
+    return element;
+  }
+
+  async getChildren(element?: vscode.TreeItem): Promise<vscode.TreeItem[]> {
+    if (element) return [];
+
+    const mode = this.permissionManager.getMode();
+    const items: vscode.TreeItem[] = [];
+
+    const modeItem = new vscode.TreeItem(`Security Mode: ${mode.toUpperCase().replace(/_/g, ' ')}`, vscode.TreeItemCollapsibleState.None);
+    modeItem.description = 'Click to switch security profile';
+    modeItem.iconPath = new vscode.ThemeIcon('shield');
+    modeItem.command = { command: 'localcoders.setSecurityMode', title: 'Set Security Mode' };
+    items.push(modeItem);
+
+    const history = this.permissionManager.getAuditHistory(10);
+    const auditHeader = new vscode.TreeItem(`Recent Tool Execution Audits (${history.length})`, vscode.TreeItemCollapsibleState.None);
+    auditHeader.iconPath = new vscode.ThemeIcon('history');
+    items.push(auditHeader);
+
+    for (const h of history.slice().reverse()) {
+      const item = new vscode.TreeItem(h.toolName, vscode.TreeItemCollapsibleState.None);
+      item.description = `[${h.status}] ${h.durationMs ? `${h.durationMs}ms` : ''}`;
+      item.iconPath = new vscode.ThemeIcon(h.status === 'completed' ? 'pass' : h.status === 'failed' ? 'error' : 'warning');
+      item.tooltip = `Agent: ${h.agentName}\nArgs: ${h.argsSummary}\nEnvironment: ${h.environment}`;
+      items.push(item);
+    }
+
+    return items;
   }
 }

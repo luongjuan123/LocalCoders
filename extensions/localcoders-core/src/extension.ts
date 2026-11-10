@@ -19,10 +19,19 @@ import {
   ProjectMemoryTreeProvider,
   ModelManagerTreeProvider,
   CriticReviewsTreeProvider,
+  McpServersTreeProvider,
+  SecurityPermissionsTreeProvider,
 } from './views/tree-views';
+import { McpHost } from './mcp/mcp-host';
+import { ModelProviderRegistry } from './models/model-provider-registry';
+import { PermissionManager, SecurityMode } from './security/permission-manager';
+import { ProcessManager } from './tools/process-manager';
+import { BrowserManager } from './tools/browser-tools';
 
 let activeOrchestrator: AgentOrchestrator | null = null;
 let activeOllamaClient: OllamaClient | null = null;
+let activeMcpHost: McpHost | null = null;
+let activePermissionManager: PermissionManager | null = null;
 
 export async function activate(context: vscode.ExtensionContext) {
   console.log('[LocalCoders] Initializing Multi-Agent AI Core...');
@@ -33,14 +42,53 @@ export async function activate(context: vscode.ExtensionContext) {
 
   // Initialize Core Services
   const ollama = new OllamaClient(ollamaHost);
+  const modelRegistry = ModelProviderRegistry.initialize(ollama, context.globalState);
   const registry = new AgentRegistry(context);
-  const toolManager = new ToolManager();
+  const permissionManager = new PermissionManager(workspaceRoot);
+  const mcpHost = new McpHost(workspaceRoot);
+  const toolManager = new ToolManager(mcpHost, permissionManager);
   const orchestrator = new AgentOrchestrator(ollama, registry, toolManager, workspaceRoot);
   const sessionManager = new SessionManager(context, workspaceRoot);
   const changesManager = new ChangesManager(workspaceRoot);
 
   activeOrchestrator = orchestrator;
   activeOllamaClient = ollama;
+  activeMcpHost = mcpHost;
+  activePermissionManager = permissionManager;
+
+  // Ensure default Main Agent exists
+  if (!registry.getMainAgent()) {
+    registry.setMainAgent({
+      id: 'main',
+      name: 'Main Agent',
+      role: 'Lead Architect & Autonomous Developer',
+      model: 'qwen3.8:27b',
+      systemPrompt: 'Lead autonomous developer and orchestrator. Directs implementation, creates files, writes code, and executes tests.',
+      enabled: true,
+      maxConcurrency: 1,
+      temperature: 0.2,
+      contextWindow: 32768,
+    });
+  }
+
+  // Handle workspace folder changes dynamically
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      const newRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (newRoot) {
+        orchestrator.setWorkspace(newRoot);
+        sessionManager.setWorkspace(newRoot);
+        changesManager.setWorkspace(newRoot);
+        permissionManager.setWorkspace(newRoot);
+        mcpHost.setWorkspace(newRoot);
+      }
+    })
+  );
+
+  // Auto-connect enabled MCP servers in background
+  mcpHost.connectAllEnabled().catch((err) => {
+    console.warn('[LocalCoders] MCP auto-connect warning:', err.message);
+  });
 
   // Status Bar Indicator
   const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
@@ -66,7 +114,15 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.window.registerWebviewViewProvider(NavigationViewProvider.viewType, navigationViewProvider)
   );
 
-  const chatViewProvider = new ChatViewProvider(context.extensionUri, orchestrator, sessionManager, ollama);
+  const chatViewProvider = new ChatViewProvider(
+    context.extensionUri,
+    orchestrator,
+    sessionManager,
+    ollama,
+    modelRegistry,
+    permissionManager,
+    toolManager
+  );
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatViewProvider)
   );
@@ -112,27 +168,68 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.window.registerTreeDataProvider('localcoders.projectMemoryView', projectMemoryTreeProvider)
   );
 
+  const mcpServersTreeProvider = new McpServersTreeProvider(mcpHost);
+  context.subscriptions.push(
+    vscode.window.registerTreeDataProvider('localcoders.mcpServersView', mcpServersTreeProvider)
+  );
+
+  const securityPermissionsTreeProvider = new SecurityPermissionsTreeProvider(permissionManager);
+  context.subscriptions.push(
+    vscode.window.registerTreeDataProvider('localcoders.securityPermissionsView', securityPermissionsTreeProvider)
+  );
+
   // 3. Mode State & Commands
   let currentMode: 'agent' | 'ide' = 'agent';
 
   context.subscriptions.push(
     vscode.commands.registerCommand('localcoders.activateAgentView', async () => {
       currentMode = 'agent';
-      AgentWorkspaceEditorPanel.createOrShow(context.extensionUri, orchestrator, sessionManager, ollama);
       try {
-        await vscode.commands.executeCommand('localcoders.navigationView.focus');
-        await vscode.commands.executeCommand('localcoders.changesView.focus');
+        // In Agents View: Close right auxiliary bar and left primary sidebar to dedicate full window to 3-column Devin cockpit
+        await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
+        await vscode.commands.executeCommand('workbench.action.closeSidebar');
+        await vscode.commands.executeCommand('workbench.action.closePanel');
       } catch (e) {
         console.warn('[LocalCoders] Focus error:', e);
       }
+
+      AgentWorkspaceEditorPanel.createOrShow(
+        context.extensionUri,
+        orchestrator,
+        sessionManager,
+        ollama,
+        changesManager,
+        modelRegistry,
+        toolManager,
+        permissionManager
+      );
+
+      // Re-enforce closing sidebars in case layout restoration re-opened them
+      setTimeout(async () => {
+        try {
+          if (currentMode === 'agent') {
+            await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
+            await vscode.commands.executeCommand('workbench.action.closeSidebar');
+          }
+        } catch (_) {}
+      }, 150);
     }),
 
     vscode.commands.registerCommand('localcoders.activateIDEView', async () => {
       currentMode = 'ide';
-      AgentWorkspaceEditorPanel.closeCurrent();
       try {
+        // In IDE View: Unconditionally close the center Agent webview cockpit
+        AgentWorkspaceEditorPanel.closeCurrent();
+
+        // Show genuine VS Code Explorer on left and dock LocalCoders AI Chat on right
         await vscode.commands.executeCommand('workbench.view.explorer');
         await vscode.commands.executeCommand('localcoders.chatView.focus');
+
+        // Reveal active or open code file if present
+        const activeDoc = vscode.workspace.textDocuments.find(d => !d.isUntitled && !d.uri.scheme.includes('webview'));
+        if (activeDoc) {
+          await vscode.window.showTextDocument(activeDoc.uri, { preview: true, preserveFocus: true });
+        }
       } catch (e) {
         console.warn('[LocalCoders] Focus error:', e);
       }
@@ -146,12 +243,36 @@ export async function activate(context: vscode.ExtensionContext) {
       }
     }),
 
-    vscode.commands.registerCommand('localcoders.openChat', () => {
-      vscode.commands.executeCommand('localcoders.chatView.focus');
+    vscode.commands.registerCommand('localcoders.openComposer', async () => {
+      if (currentMode === 'agent') {
+        AgentWorkspaceEditorPanel.currentPanel?.focusPrompt();
+      } else {
+        await vscode.commands.executeCommand('localcoders.chatView.focus');
+      }
+    }),
+
+    vscode.commands.registerCommand('localcoders.toggleAgentPanel', async () => {
+      if (currentMode === 'agent') {
+        await vscode.commands.executeCommand('localcoders.activateIDEView');
+      } else {
+        await vscode.commands.executeCommand('workbench.action.toggleAuxiliaryBar');
+      }
+    }),
+
+    vscode.commands.registerCommand('localcoders.openChat', async () => {
+      if (currentMode === 'agent') {
+        await vscode.commands.executeCommand('localcoders.activateAgentView');
+      } else {
+        await vscode.commands.executeCommand('localcoders.chatView.focus');
+      }
     }),
 
     vscode.commands.registerCommand('localcoders.openChanges', () => {
-      vscode.commands.executeCommand('localcoders.changesView.focus');
+      if (currentMode === 'agent') {
+        AgentWorkspaceEditorPanel.currentPanel?.syncActiveSession();
+      } else {
+        vscode.commands.executeCommand('localcoders.changesView.focus');
+      }
     }),
 
     vscode.commands.registerCommand('localcoders.newSession', async () => {
@@ -163,7 +284,11 @@ export async function activate(context: vscode.ExtensionContext) {
         const models = await ollama.listModels();
         const model = models[0]?.name || 'qwen3.8:27b';
         sessionManager.createSession(goal, model);
-        vscode.commands.executeCommand('localcoders.chatView.focus');
+        if (currentMode === 'agent') {
+          AgentWorkspaceEditorPanel.currentPanel?.syncActiveSession();
+        } else {
+          vscode.commands.executeCommand('localcoders.chatView.focus');
+        }
       }
     }),
 
@@ -178,6 +303,42 @@ export async function activate(context: vscode.ExtensionContext) {
       });
       if (prompt) {
         orchestrator.submitTask(prompt);
+      }
+    }),
+
+    vscode.commands.registerCommand('localcoders.setDefaultStartupView', async () => {
+      const config = vscode.workspace.getConfiguration('localcoders');
+      const current = config.get<'agent' | 'ide'>('defaultView', 'agent');
+      const picked = await vscode.window.showQuickPick(
+        [
+          {
+            label: '☵ Agent View (Autonomous Cockpit)',
+            description: current === 'agent' ? '(Current Default)' : '',
+            detail: 'Agent-first 3-column Devin workspace with sessions sidebar, conversation stream, and live changes review.',
+            value: 'agent' as const,
+          },
+          {
+            label: '💻 IDE View (Classic Workbench)',
+            description: current === 'ide' ? '(Current Default)' : '',
+            detail: 'Traditional VS Code code editor, Explorer file tree, and docked AI Assistant in the secondary sidebar.',
+            value: 'ide' as const,
+          },
+        ],
+        { placeHolder: 'Select your preferred default startup screen for LocalCoders' }
+      );
+      if (picked) {
+        await config.update('defaultView', picked.value, vscode.ConfigurationTarget.Global);
+        const action = await vscode.window.showInformationMessage(
+          `LocalCoders default startup screen is now set to ${picked.label}.`,
+          'Switch Now'
+        );
+        if (action === 'Switch Now') {
+          if (picked.value === 'ide') {
+            await vscode.commands.executeCommand('localcoders.activateIDEView');
+          } else {
+            await vscode.commands.executeCommand('localcoders.activateAgentView');
+          }
+        }
       }
     }),
 
@@ -298,14 +459,112 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('localcoders.stopAllAgents', () => {
       orchestrator.cancelTask();
       vscode.window.showInformationMessage('LocalCoders: All running agent executions stopped.');
+    }),
+
+    vscode.commands.registerCommand('localcoders.setSecurityMode', async () => {
+      const modes: Array<{ label: string; mode: SecurityMode; description: string }> = [
+        { label: 'Supervised', mode: 'supervised', description: 'Auto-read files; ask before writing, executing, or network calls' },
+        { label: 'Autonomous', mode: 'autonomous', description: 'Auto-execute tasks; ask only before destructive file/git/system actions' },
+        { label: 'Ask Every Time', mode: 'ask_every_time', description: 'Prompt for approval before every single tool action' },
+        { label: 'Restricted', mode: 'restricted', description: 'Read-only sandbox; block all modifications and executions' },
+      ];
+      const picked = await vscode.window.showQuickPick(modes, { placeHolder: 'Select Central Security Mode' });
+      if (picked) {
+        permissionManager.setMode(picked.mode);
+        securityPermissionsTreeProvider.refresh();
+        vscode.window.showInformationMessage(`LocalCoders: Security mode set to '${picked.label}'`);
+      }
+    }),
+
+    vscode.commands.registerCommand('localcoders.addMcpServer', async () => {
+      const name = await vscode.window.showInputBox({
+        prompt: 'Enter MCP Server Name',
+        placeHolder: 'e.g. SQLite Explorer or Brave Search',
+      });
+      if (!name) return;
+
+      const transport = await vscode.window.showQuickPick(['stdio', 'sse'], {
+        placeHolder: 'Select MCP Transport Protocol',
+      });
+      if (!transport) return;
+
+      const id = name.toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+
+      if (transport === 'stdio') {
+        const cmd = await vscode.window.showInputBox({
+          prompt: 'Enter CLI command for MCP server',
+          placeHolder: 'e.g. npx -y @modelcontextprotocol/server-sqlite or python3 -m my_mcp',
+        });
+        if (!cmd) return;
+        const parts = cmd.split(' ');
+        await mcpHost.addServer({
+          id,
+          name,
+          transport: 'stdio',
+          command: parts[0],
+          args: parts.slice(1),
+          enabled: true,
+        });
+      } else {
+        const url = await vscode.window.showInputBox({
+          prompt: 'Enter MCP SSE Server URL',
+          placeHolder: 'http://localhost:3000/sse',
+        });
+        if (!url) return;
+        await mcpHost.addServer({
+          id,
+          name,
+          transport: 'sse',
+          url,
+          enabled: true,
+        });
+      }
+
+      mcpServersTreeProvider.refresh();
+      vscode.window.showInformationMessage(`LocalCoders: MCP Server '${name}' added and connected.`);
+    }),
+
+    vscode.commands.registerCommand('localcoders.removeMcpServer', async () => {
+      const servers = mcpHost.getAllServers();
+      if (servers.length === 0) {
+        vscode.window.showInformationMessage('No MCP servers configured.');
+        return;
+      }
+      const picked = await vscode.window.showQuickPick(
+        servers.map((s) => ({ label: s.config.name, id: s.config.id })),
+        { placeHolder: 'Select MCP Server to remove' }
+      );
+      if (picked) {
+        await mcpHost.removeServer(picked.id);
+        mcpServersTreeProvider.refresh();
+        vscode.window.showInformationMessage(`Removed MCP server '${picked.label}'`);
+      }
     })
   );
+
+  // Launch into preferred startup screen on startup (Agent View by default, or IDE View if configured)
+  const launchPreferredView = () => {
+    const config = vscode.workspace.getConfiguration('localcoders');
+    const defaultView = config.get<'agent' | 'ide'>('defaultView', 'agent');
+    if (defaultView === 'ide') {
+      vscode.commands.executeCommand('localcoders.activateIDEView').then(undefined, (err) => {
+        console.warn('[LocalCoders] Auto-launch IDE View warning:', err);
+      });
+    } else {
+      vscode.commands.executeCommand('localcoders.activateAgentView').then(undefined, (err) => {
+        console.warn('[LocalCoders] Auto-launch Agents View warning:', err);
+      });
+    }
+  };
+
+  setTimeout(launchPreferredView, 250);
+  setTimeout(launchPreferredView, 650);
 
   console.log('[LocalCoders] Multi-Agent AI Core successfully activated.');
 }
 
 export async function deactivate(): Promise<void> {
-  console.log('[LocalCoders] Closing IDE: Cancelling active agent tasks and releasing Ollama models from memory/VRAM...');
+  console.log('[LocalCoders] Closing IDE: Cancelling tasks, unloading Ollama models, and terminating background processes & browsers...');
   try {
     if (activeOrchestrator) {
       activeOrchestrator.cancelTask();
@@ -313,6 +572,11 @@ export async function deactivate(): Promise<void> {
     if (activeOllamaClient) {
       await activeOllamaClient.unloadAllModels();
     }
+    if (activeMcpHost) {
+      await activeMcpHost.disconnectAll();
+    }
+    ProcessManager.getInstance().terminateAll();
+    await BrowserManager.getInstance().close();
   } catch (err: any) {
     console.warn('[LocalCoders] Warning during deactivation cleanup:', err.message);
   }

@@ -27,8 +27,26 @@ export class TaskQueue {
     return Array.from(this.tasks.values());
   }
 
+  getActiveCount(): number {
+    return Array.from(this.tasks.values()).filter((t) => t.status === 'in_progress').length;
+  }
+
   getReadyTasks(): TaskPlanItem[] {
-    const activeCount = Array.from(this.tasks.values()).filter((t) => t.status === 'in_progress').length;
+    // 1. Cascade failed dependencies: if any dependency failed or was cancelled, fail the pending task
+    for (const task of this.tasks.values()) {
+      if (task.status !== 'pending') continue;
+
+      const hasFailedDep = task.dependencies.some((depId) => {
+        const depTask = this.tasks.get(depId);
+        return depTask && (depTask.status === 'failed' || depTask.status === 'cancelled');
+      });
+
+      if (hasFailedDep) {
+        this.updateTaskStatus(task.id, 'failed', 'Prerequisite task dependency failed or was cancelled.');
+      }
+    }
+
+    const activeCount = this.getActiveCount();
     if (activeCount >= this.maxConcurrency) {
       return [];
     }
@@ -39,10 +57,11 @@ export class TaskQueue {
     for (const task of this.tasks.values()) {
       if (task.status !== 'pending') continue;
 
-      // Check if all dependencies are completed
+      // Check if all dependencies are satisfied (completed or not in the plan)
       const depsSatisfied = task.dependencies.every((depId) => {
         const depTask = this.tasks.get(depId);
-        return depTask && depTask.status === 'completed';
+        if (!depTask) return true; // Ignore hallucinated/missing dependency IDs
+        return depTask.status === 'completed';
       });
 
       if (depsSatisfied) {
@@ -52,6 +71,23 @@ export class TaskQueue {
     }
 
     return ready;
+  }
+
+  hasDeadlock(): boolean {
+    return this.getActiveCount() === 0 && this.getReadyTasks().length === 0 && !this.isComplete();
+  }
+
+  resolveDeadlock(): void {
+    // Break circular or unresolvable dependencies among remaining pending tasks
+    for (const task of this.tasks.values()) {
+      if (task.status === 'pending') {
+        this.updateTaskStatus(
+          task.id,
+          'failed',
+          'Task unresolved due to circular or unfulfilled dependency deadlock.'
+        );
+      }
+    }
   }
 
   updateTaskStatus(id: string, status: TaskPlanItem['status'], output?: string) {

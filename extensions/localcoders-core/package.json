@@ -65,6 +65,10 @@
           "name": "Task Monitor"
         },
         {
+          "id": "localcoders.securityPermissionsView",
+          "name": "Security & Permissions"
+        },
+        {
           "id": "localcoders.projectMemoryView",
           "name": "Project Rules & Memory"
         }
@@ -73,6 +77,10 @@
         {
           "id": "localcoders.agentTeamView",
           "name": "Agent Team"
+        },
+        {
+          "id": "localcoders.mcpServersView",
+          "name": "MCP Servers & Tools"
         },
         {
           "id": "localcoders.modelManagerView",
@@ -122,6 +130,21 @@
       {
         "command": "localcoders.activateIDEView",
         "title": "LocalCoders: Switch to IDE View",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.setSecurityMode",
+        "title": "LocalCoders: Set Security Mode",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.addMcpServer",
+        "title": "LocalCoders: Add MCP Server",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.removeMcpServer",
+        "title": "LocalCoders: Remove MCP Server",
         "category": "LocalCoders"
       },
       {
@@ -198,6 +221,21 @@
         "command": "localcoders.stopAllAgents",
         "title": "LocalCoders: Stop All Agents",
         "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.openComposer",
+        "title": "LocalCoders: Focus Agent Composer",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.toggleAgentPanel",
+        "title": "LocalCoders: Toggle Agent Panel in IDE",
+        "category": "LocalCoders"
+      },
+      {
+        "command": "localcoders.setDefaultStartupView",
+        "title": "LocalCoders: Set Preferred Default Startup Screen (Agent or IDE)",
+        "category": "LocalCoders"
       }
     ],
     "menus": {
@@ -242,14 +280,39 @@
     },
     "keybindings": [
       {
-        "command": "localcoders.toggleWorkbenchMode",
+        "command": "localcoders.activateAgentView",
         "key": "ctrl+shift+a",
         "mac": "cmd+shift+a"
+      },
+      {
+        "command": "localcoders.activateIDEView",
+        "key": "ctrl+shift+e",
+        "mac": "cmd+shift+e"
+      },
+      {
+        "command": "localcoders.openComposer",
+        "key": "ctrl+shift+l",
+        "mac": "cmd+shift+l"
+      },
+      {
+        "command": "localcoders.toggleAgentPanel",
+        "key": "ctrl+shift+j",
+        "mac": "cmd+shift+j"
       }
     ],
     "configuration": {
       "title": "LocalCoders",
       "properties": {
+        "localcoders.defaultView": {
+          "type": "string",
+          "enum": ["agent", "ide"],
+          "enumDescriptions": [
+            "Launch into the autonomous 3-column Agent View (Devin cockpit) on startup.",
+            "Launch into the classic VS Code IDE View with code editor, file explorer, and docked agent."
+          ],
+          "default": "agent",
+          "description": "Preferred default startup screen for LocalCoders ('agent' for Agent View, 'ide' for IDE View)."
+        },
         "localcoders.ollamaHost": {
           "type": "string",
           "default": "http://127.0.0.1:11434",

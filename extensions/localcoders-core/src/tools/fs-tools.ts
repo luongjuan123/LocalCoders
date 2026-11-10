@@ -14,9 +14,13 @@ export function assertWithinWorkspace(workspaceRoot: string, targetPath: string)
 
 export async function readFileTool(args: { path: string }, ctx: ToolExecutionContext): Promise<ToolResult> {
   try {
-    const fullPath = assertWithinWorkspace(ctx.workspaceRoot, args.path);
+    const rawPath = args.path || (args as any).filePath || (args as any).filepath || (args as any).file || (args as any).filename;
+    if (!rawPath) {
+      return { success: false, error: 'readFileTool: Missing required argument "path"' };
+    }
+    const fullPath = assertWithinWorkspace(ctx.workspaceRoot, rawPath);
     if (!fsSync.existsSync(fullPath)) {
-      return { success: false, error: `File not found: '${args.path}'` };
+      return { success: false, error: `File not found: '${rawPath}'` };
     }
     const content = await fs.readFile(fullPath, 'utf-8');
     return {
@@ -69,7 +73,11 @@ export async function readLinesTool(
 
 export async function writeFileTool(args: { path: string; content: string }, ctx: ToolExecutionContext): Promise<ToolResult> {
   try {
-    const fullPath = assertWithinWorkspace(ctx.workspaceRoot, args.path);
+    const rawPath = args.path || (args as any).filePath || (args as any).filepath || (args as any).file || (args as any).filename || (args as any).target;
+    if (!rawPath) {
+      return { success: false, error: 'writeFileTool: Missing required argument "path"' };
+    }
+    const fullPath = assertWithinWorkspace(ctx.workspaceRoot, rawPath);
     const relPath = path.relative(ctx.workspaceRoot, fullPath);
 
     let original = '';
@@ -96,16 +104,17 @@ export async function writeFileTool(args: { path: string; content: string }, ctx
       }
     }
 
+    const content = args.content !== undefined ? args.content : ((args as any).code ?? (args as any).text ?? (args as any).source ?? (args as any).body ?? (args as any).contents ?? '');
     const parentDir = path.dirname(fullPath);
     await fs.mkdir(parentDir, { recursive: true });
-    await fs.writeFile(fullPath, args.content, 'utf-8');
+    await fs.writeFile(fullPath, content, 'utf-8');
 
     return {
       success: true,
       output: {
         path: relPath,
         action: exists ? 'modified' : 'created',
-        bytesWritten: Buffer.byteLength(args.content, 'utf-8'),
+        bytesWritten: Buffer.byteLength(content, 'utf-8'),
       },
     };
   } catch (err: any) {
@@ -118,22 +127,29 @@ export async function editFileTool(
   ctx: ToolExecutionContext
 ): Promise<ToolResult> {
   try {
-    const fullPath = assertWithinWorkspace(ctx.workspaceRoot, args.path);
+    const rawPath = args.path || (args as any).filePath || (args as any).filepath || (args as any).file || (args as any).filename;
+    if (!rawPath) {
+      return { success: false, error: 'editFileTool: Missing required argument "path"' };
+    }
+    const fullPath = assertWithinWorkspace(ctx.workspaceRoot, rawPath);
     const relPath = path.relative(ctx.workspaceRoot, fullPath);
 
     if (!fsSync.existsSync(fullPath)) {
       return { success: false, error: `File not found: '${relPath}'` };
     }
 
+    const target = args.target || (args as any).search || (args as any).old_string || (args as any).oldText || (args as any).find;
+    const replacement = args.replacement !== undefined ? args.replacement : ((args as any).replace ?? (args as any).new_string ?? (args as any).newText ?? '');
+
     const original = await fs.readFile(fullPath, 'utf-8');
-    if (!original.includes(args.target)) {
+    if (!target || !original.includes(target)) {
       return {
         success: false,
         error: `Target string was not found in '${relPath}'. Please check exact indentation and whitespace.`,
       };
     }
 
-    const modified = original.replace(args.target, args.replacement);
+    const modified = original.replace(target, replacement);
 
     if (ctx.requireApproval) {
       const approved = await ctx.requestApproval({
@@ -267,7 +283,8 @@ export async function listDirectoryTool(
   ctx: ToolExecutionContext
 ): Promise<ToolResult> {
   try {
-    const targetPath = args.path ? assertWithinWorkspace(ctx.workspaceRoot, args.path) : ctx.workspaceRoot;
+    const rawPath = args.path || (args as any).dir || (args as any).directory || (args as any).folder || '.';
+    const targetPath = rawPath && rawPath !== '.' ? assertWithinWorkspace(ctx.workspaceRoot, rawPath) : ctx.workspaceRoot;
     const maxDepth = args.maxDepth || 3;
 
     async function scan(dir: string, depth: number): Promise<any[]> {

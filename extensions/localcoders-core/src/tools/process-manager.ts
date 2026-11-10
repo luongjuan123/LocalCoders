@@ -84,6 +84,11 @@ export class ProcessManager {
     return this.processes.get(id);
   }
 
+  public isProcessRunning(id: string): boolean {
+    const p = this.processes.get(id);
+    return !!p && p.status === 'running';
+  }
+
   public readOutput(id: string, tailLines: number = 50): string[] {
     const p = this.processes.get(id);
     if (!p) return [];
@@ -102,12 +107,12 @@ export class ProcessManager {
     if (!p) return false;
     if (p.status === 'running') {
       try {
-        p.child.kill('SIGTERM');
-        setTimeout(() => {
-          if (p.status === 'running') {
-            p.child.kill('SIGKILL');
-          }
-        }, 1500);
+        if (p.child.pid) {
+          try {
+            require('child_process').execSync(`pkill -P ${p.child.pid} 2>/dev/null || true; kill -9 ${p.child.pid} 2>/dev/null || true`);
+          } catch {}
+        }
+        p.child.kill('SIGKILL');
       } catch {
         // ignore
       }

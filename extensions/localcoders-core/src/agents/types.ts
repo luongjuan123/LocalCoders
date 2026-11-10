@@ -2,6 +2,8 @@
 
 export type PredefinedRole =
   | 'Frontend Developer'
+  | 'UI/UX Designer'
+  | 'Component Specialist'
   | 'Backend Developer'
   | 'Software Architect'
   | 'Database Engineer'

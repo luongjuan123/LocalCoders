@@ -35,9 +35,11 @@ export class CriticAgent {
     targetCommit?: string;
     changedFiles?: string[];
     onProgress?: (status: string) => void;
+    abortSignal?: AbortSignal;
   }): Promise<CriticReport> {
     const reportId = `report_${Date.now()}`;
     const timestamp = Date.now();
+    const effectiveModel = this.config.model || 'qwen3.8:27b';
 
     if (params.onProgress) params.onProgress('Gathering Git diff and relevant files...');
 
@@ -56,7 +58,7 @@ export class CriticAgent {
     // 2. Gather Project Rules
     const { rulesText } = await this.memory.getProjectRules();
 
-    if (params.onProgress) params.onProgress(`Running independent Critic review using model '${this.config.model}'...`);
+    if (params.onProgress) params.onProgress(`Running independent Critic review using model '${effectiveModel}'...`);
 
     const systemPrompt = `You are the LocalCoders Critic Agent — an independent, rigorous, adversarial software auditor.
 Your job is to challenge the implementation and detect verifiable defects, NOT to praise the code.
@@ -120,7 +122,7 @@ Please audit the implementation thoroughly according to your review strictness.`
     let responseContent = '';
     await this.ollama.chatStream(
       {
-        model: this.config.model,
+        model: effectiveModel,
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
@@ -129,7 +131,8 @@ Please audit the implementation thoroughly according to your review strictness.`
       },
       (chunk) => {
         responseContent += chunk.content;
-      }
+      },
+      params.abortSignal
     );
 
     // Parse structured JSON

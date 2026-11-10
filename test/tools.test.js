@@ -212,4 +212,46 @@ describe('ToolManager — Filesystem, Git, and Security Boundaries', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('should handle CRLF target normalization and return line-numbered file excerpt on edit_file mismatch', async () => {
+    const { PermissionManager } = require('../extensions/localcoders-core/dist/security/permission-manager');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-edit-hint-'));
+    try {
+      const pm = new PermissionManager(tmpDir);
+      pm.setMode('bypass');
+      const tm = new ToolManager(undefined, pm);
+      const ctx = {
+        workspaceRoot: tmpDir,
+        agentId: 'main',
+        agentName: 'Main Agent',
+        requireApproval: false,
+        requestApproval: async () => true,
+      };
+      await tm.executeTool('write_file', {
+        path: 'clock.py',
+        content: 'def show_time():\r\n    return "00:00"\r\n',
+      }, ctx);
+
+      // 1. Mismatched target includes actionable numbered file preview
+      const miss = await tm.executeTool('edit_file', {
+        path: 'clock.py',
+        target: 'return "99:99"',
+        replacement: 'return "12:00"',
+      }, ctx);
+      assert.strictEqual(miss.success, false);
+      assert.match(miss.error, /1: def show_time\(\):/);
+      assert.match(miss.error, /2:     return "00:00"/);
+
+      // 2. LF target matches CRLF file seamlessly
+      const hit = await tm.executeTool('edit_file', {
+        path: 'clock.py',
+        target: 'def show_time():\n    return "00:00"',
+        replacement: 'def show_time():\n    return "12:00"',
+      }, ctx);
+      assert.strictEqual(hit.success, true);
+      assert.match(fs.readFileSync(path.join(tmpDir, 'clock.py'), 'utf8'), /"12:00"/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

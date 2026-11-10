@@ -7,6 +7,7 @@ import { McpHost } from '../mcp/mcp-host';
 import { ModelProviderRegistry } from '../models/model-provider-registry';
 import { OllamaClient } from '../ollama/client';
 import { PermissionManager } from '../security/permission-manager';
+import { MessageQueueManager } from '../sessions/message-queue';
 import { SessionManager } from '../sessions/session-manager';
 import { TerminalSessionManager } from '../tools/terminal-session-manager';
 import { ToolManager } from '../tools/tool-manager';
@@ -39,6 +40,7 @@ export async function runSlashCommandForWorkspace(params: {
   mcpHost?: McpHost;
   registry?: AgentRegistry;
   ollama?: OllamaClient;
+  queueManager?: MessageQueueManager;
   ui?: CommandUIHooks;
 }): Promise<CommandResult> {
   const reg = ensureBuiltinSlashCommandsRegistered(SlashCommandRegistry.getInstance(), params.workspaceRoot);
@@ -56,6 +58,20 @@ export async function runSlashCommandForWorkspace(params: {
 
   const cm = params.changesManager || new ChangesManager(params.workspaceRoot);
   const mem = new MemoryManager(params.workspaceRoot);
+  const qm =
+    params.queueManager ||
+    MessageQueueManager.getShared() ||
+    new MessageQueueManager({
+      sessionManager: params.sessionManager,
+      orchestrator: params.orchestrator,
+      modelRegistry: params.modelRegistry,
+      permissionManager: pm,
+      changesManager: cm,
+      toolManager: params.toolManager,
+      mcpHost: params.mcpHost,
+      registry: params.registry,
+      ollama: params.ollama,
+    });
 
   const ctx: CommandContext = {
     workspaceRoot: params.workspaceRoot,
@@ -75,6 +91,7 @@ export async function runSlashCommandForWorkspace(params: {
     registry: params.registry,
     memoryManager: mem,
     ollama: params.ollama,
+    queueManager: qm,
     historyManager: OperationHistoryManager.getInstance(),
     ui: {
       ...params.ui,

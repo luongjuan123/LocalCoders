@@ -119,6 +119,96 @@ export class AgentRegistry {
     return Array.from(this.subagents.values());
   }
 
+  /**
+   * Default specialist roster used at runtime when no custom subagents have been configured yet,
+   * sharing the active coding model so local single-GPU Ollama instances incur zero model swap lag.
+   */
+  static getDefaultBuiltinSubagents(modelId: string): AgentConfig[] {
+    const roles = AgentRegistry.getPredefinedRoles();
+    const rolePrompt = (r: PredefinedRole) =>
+      roles.find((x) => x.role === r)?.defaultPrompt || `You are a specialist ${r}.`;
+    const mk = (id: string, name: string, role: PredefinedRole, temperature = 0.2): AgentConfig => ({
+      id,
+      name,
+      role,
+      model: modelId,
+      systemPrompt: rolePrompt(role),
+      enabled: true,
+      maxConcurrency: 1,
+      temperature,
+      contextWindow: 32768,
+    });
+    return [
+      mk('builtin_frontend', 'Frontend Specialist', 'Frontend Developer', 0.2),
+      mk('builtin_backend', 'Backend Specialist', 'Backend Developer', 0.2),
+      mk('builtin_test', 'Test Engineer', 'Test Engineer', 0.1),
+      mk('builtin_debug', 'Debugging Specialist', 'Debugging Specialist', 0.1),
+    ];
+  }
+
+  /**
+   * Returns all manageable subagent entries for configuration UIs (built-ins merged
+   * with any saved overrides, plus custom subagents), preserving empty model = inherit.
+   */
+  getManageableSubagents(
+    includeBuiltinDefaults = true
+  ): Array<AgentConfig & { isBuiltin: boolean; isCustomized: boolean }> {
+    const builtins = includeBuiltinDefaults ? AgentRegistry.getDefaultBuiltinSubagents('') : [];
+    const builtinIds = new Set(builtins.map((b) => b.id));
+    const result: Array<AgentConfig & { isBuiltin: boolean; isCustomized: boolean }> = [];
+
+    for (const def of builtins) {
+      const override = this.subagents.get(def.id);
+      result.push({
+        ...(override ? { ...def, ...override } : def),
+        isBuiltin: true,
+        isCustomized: Boolean(override),
+      });
+    }
+
+    for (const custom of this.subagents.values()) {
+      if (!builtinIds.has(custom.id)) {
+        result.push({
+          ...custom,
+          isBuiltin: false,
+          isCustomized: true,
+        });
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Returns active subagent configs (inheriting fallbackModelId when model is blank),
+   * merging any saved per-subagent model/instruction/enabled overrides with built-in defaults
+   * and custom user-created subagents.
+   */
+  getEffectiveSubagents(fallbackModelId: string, includeBuiltinDefaults = true): AgentConfig[] {
+    const merged: AgentConfig[] = [];
+    const seenIds = new Set<string>();
+
+    if (includeBuiltinDefaults) {
+      for (const def of AgentRegistry.getDefaultBuiltinSubagents('')) {
+        const override = this.subagents.get(def.id);
+        merged.push(override ? { ...def, ...override } : def);
+        seenIds.add(def.id);
+      }
+    }
+
+    for (const custom of this.subagents.values()) {
+      if (!seenIds.has(custom.id)) {
+        merged.push(custom);
+        seenIds.add(custom.id);
+      }
+    }
+
+    return merged
+      .filter((s) => s.enabled)
+      .map((s) => ({ ...s, model: (s.model || '').trim() || fallbackModelId }))
+      .filter((s) => Boolean(s.model));
+  }
+
   getSubagent(id: string): AgentConfig | undefined {
     return this.subagents.get(id);
   }
@@ -137,6 +227,13 @@ export class AgentRegistry {
     const existing = this.subagents.get(id);
     if (existing) {
       this.subagents.set(id, { ...existing, ...updates });
+      this.saveState();
+      return;
+    }
+
+    const builtinDefault = AgentRegistry.getDefaultBuiltinSubagents('').find((b) => b.id === id);
+    if (builtinDefault) {
+      this.subagents.set(id, { ...builtinDefault, ...updates });
       this.saveState();
     }
   }

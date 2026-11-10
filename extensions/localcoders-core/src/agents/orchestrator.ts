@@ -26,9 +26,11 @@ import {
   classifyUserPrompt,
   getSafePhaseLabel,
   isPlanExplicitlyRequested,
+  pairConversationHistory,
   sanitizeActivityText,
   sanitizeAssistantContent,
   sanitizeConversationHistory,
+  stripCancelledTurnsFromHistory,
 } from './events';
 
 export class AgentOrchestrator {
@@ -225,6 +227,36 @@ export class AgentOrchestrator {
     }
   }
 
+  public isTaskRunning(): boolean {
+    return Boolean(this.abortController);
+  }
+
+  /**
+   * Creates an isolated orchestrator runner sharing Ollama/registry/tools while forwarding
+   * monitor telemetry, critic reports, and approval resolution to the parent orchestrator.
+   */
+  public createScopedRunner(targetWorkspaceRoot?: string): AgentOrchestrator {
+    const runner = new AgentOrchestrator(
+      this.ollama,
+      this.registry,
+      this.toolManager,
+      targetWorkspaceRoot || this.workspaceRoot,
+      this.modelRegistry
+    );
+    runner.onActivity((ev) => this.emitActivity(ev.agentId, ev.agentName, ev.status, ev.latestActivity));
+    runner.onCriticReport((rep) => this.emitCritic(rep));
+    runner.onStreamEvent((ev) => {
+      if (ev.kind === 'activity_upsert') {
+        this.emitStreamEvent(ev);
+      }
+    });
+    runner.onApproval((req) => {
+      this.pendingApprovals.set(req.id, (approved) => runner.resolveApproval(req.id, approved));
+      this.emitApproval(req);
+    });
+    return runner;
+  }
+
   // Cancel currently running task
   cancelTask() {
     if (this.abortController) {
@@ -301,7 +333,19 @@ export class AgentOrchestrator {
       if (!resolution.ok) {
         const errMsg = resolution.error || `Selected model '${selectedModelId}' is unavailable.`;
         this.currentTask.status = 'failed';
+        this.currentTask.error = errMsg;
+        this.currentTask.updatedAt = Date.now();
         this.emitActivity(effectiveMainConfig.id, effectiveMainConfig.name, 'failed', errMsg);
+        this.emitStreamEvent({
+          kind: 'status',
+          id: `st_${runId}_model_unavail_${Date.now()}`,
+          runId,
+          agentId: effectiveMainConfig.id,
+          agentName: effectiveMainConfig.name,
+          phase: 'failed',
+          summary: errMsg,
+          timestamp: Date.now(),
+        });
         this.emitMessage({
           id: `msg_err_${Date.now()}`,
           senderId: 'system',
@@ -312,6 +356,7 @@ export class AgentOrchestrator {
           taskId,
         });
         this.abortController = null;
+        this.activeRunId = null;
         return this.currentTask;
       }
     }
@@ -319,7 +364,9 @@ export class AgentOrchestrator {
     // Prepare clean context & classify prompt intent BEFORE heavy indexing/planning
     const mode = sessionConfig?.executionMode || 'code';
     const intent = classifyUserPrompt(userPrompt, mode);
-    const cleanHistory = sanitizeConversationHistory(conversationContext, userPrompt);
+    const activeHistory = stripCancelledTurnsFromHistory(conversationContext);
+    const cleanHistory = sanitizeConversationHistory(activeHistory, userPrompt);
+    const pairedHistory = pairConversationHistory(cleanHistory, 3);
 
     let effectivePrompt = userPrompt;
     if (sessionConfig?.attachedFiles && sessionConfig.attachedFiles.length > 0) {
@@ -380,8 +427,10 @@ export class AgentOrchestrator {
       });
     };
 
-    // Build Subagents routed through LLMRouter
-    const activeSubagentConfigs = this.registry.getSubagents().filter((s) => s.enabled && s.model);
+    // Build Subagents routed through LLMRouter (inheriting selectedModelId & default specialists when none custom-configured)
+    const vsCfg = vscode.workspace.getConfiguration('localcoders');
+    const enableBuiltinSubs = vsCfg.get<boolean>('enableBuiltinSubagents') ?? true;
+    const activeSubagentConfigs = this.registry.getEffectiveSubagents(selectedModelId, enableBuiltinSubs);
     const subagents = activeSubagentConfigs.map(
       (c) => new Subagent(c, this.ollama, this.toolManager, this.fileLockManager, this.workspaceRoot, this.llmRouter)
     );
@@ -501,7 +550,7 @@ export class AgentOrchestrator {
         const reply = await mainAgent.answerConversationalFast(userPrompt, runAbortSignal, {
           ...runtimeOptions,
           streamMessageId: convId,
-          conversationHistory: cleanHistory.slice(-2),
+          conversationHistory: pairedHistory,
         });
 
         this.currentTask.status = 'completed';
@@ -534,7 +583,7 @@ export class AgentOrchestrator {
         const answer = await mainAgent.answerQuestion(effectivePrompt, runAbortSignal, {
           ...runtimeOptions,
           streamMessageId: answerId,
-          conversationHistory: cleanHistory,
+          conversationHistory: pairedHistory,
         });
 
         this.currentTask.status = 'completed';
@@ -618,19 +667,46 @@ export class AgentOrchestrator {
         return this.currentTask;
       }
 
-      // 3. CODE / SMART MODE: Full autonomous execution
-      emitSafeStatus(effectiveMainConfig.id, effectiveMainConfig.name, 'analyzing', 'Analyzing the task');
-      this.emitActivity(effectiveMainConfig.id, effectiveMainConfig.name, 'planning', 'Analyzing the task');
-
-      const plan = await mainAgent.createPlan(
-        effectivePrompt,
-        subagents,
-        (act) => {
-          this.emitActivity(effectiveMainConfig.id, effectiveMainConfig.name, 'planning', act);
-        },
-        runtimeOptions,
-        runAbortSignal
+      // 3. EXECUTE-ONLY / CODE / SMART MODE
+      const isExecuteOnly = intent === 'execute_task';
+      const taskRuntimeOptions: RuntimeModelOptions = {
+        ...runtimeOptions,
+        executeOnly: isExecuteOnly,
+      };
+      emitSafeStatus(
+        effectiveMainConfig.id,
+        effectiveMainConfig.name,
+        isExecuteOnly ? 'working' : 'analyzing',
+        isExecuteOnly ? 'Preparing execution' : 'Analyzing the task'
       );
+      this.emitActivity(
+        effectiveMainConfig.id,
+        effectiveMainConfig.name,
+        isExecuteOnly ? 'working' : 'planning',
+        isExecuteOnly ? 'Running requested command/application without modifying code' : 'Analyzing the task'
+      );
+
+      const plan: TaskPlanItem[] = isExecuteOnly
+        ? [
+            {
+              id: 'task-1',
+              title: 'Run Requested Application or Command',
+              description: userPrompt,
+              assignedTo: 'main',
+              dependencies: [],
+              status: 'pending',
+              affectedFiles: [],
+            },
+          ]
+        : await mainAgent.createPlan(
+            effectivePrompt,
+            subagents,
+            (act) => {
+              this.emitActivity(effectiveMainConfig.id, effectiveMainConfig.name, 'planning', act);
+            },
+            taskRuntimeOptions,
+            runAbortSignal
+          );
 
       this.currentTask.plan = plan;
       this.emitPlan(plan);
@@ -699,11 +775,15 @@ export class AgentOrchestrator {
         },
         approvalHandler,
         runAbortSignal,
-        runtimeOptions
+        taskRuntimeOptions
       );
 
       const wasCancelled = Boolean(runAbortSignal.aborted);
       this.currentTask.status = wasCancelled ? 'cancelled' : execResult.success ? 'completed' : 'failed';
+      if (!wasCancelled && !execResult.success) {
+        this.currentTask.error = execResult.summary || 'Task execution failed.';
+      }
+      this.currentTask.updatedAt = Date.now();
       this.currentTask.criticReport = execResult.criticReport;
 
       if (execResult.criticReport) {
@@ -768,6 +848,10 @@ export class AgentOrchestrator {
     } catch (err: any) {
       const wasCancelled = Boolean(runAbortSignal.aborted || /cancelled/i.test(err?.message || ''));
       this.currentTask.status = wasCancelled ? 'cancelled' : 'failed';
+      if (!wasCancelled) {
+        this.currentTask.error = err?.message || String(err);
+      }
+      this.currentTask.updatedAt = Date.now();
       const terminalPhase: SafeAgentPhase = wasCancelled ? 'cancelled' : 'failed';
       emitSafeStatus(mainConfig.id, mainConfig.name, terminalPhase, getSafePhaseLabel(terminalPhase));
       this.emitActivity(mainConfig.id, mainConfig.name, terminalPhase, err.message);

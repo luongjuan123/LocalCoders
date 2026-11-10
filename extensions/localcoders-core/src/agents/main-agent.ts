@@ -17,11 +17,12 @@ import {
   SafeAgentPhase,
   extractBalancedJsonObjects,
   getSafePhaseLabel,
+  pairConversationHistory,
   sanitizeAssistantContent,
 } from './events';
-import { executeTrackedTool } from './tool-runner';
+import { createTurnProgressGuard, createTurnThoughtTracker, executeTrackedTool } from './tool-runner';
 
-export const DEFAULT_MAX_CRITIC_CYCLES = 4;
+export const DEFAULT_MAX_CRITIC_CYCLES = 0; // 0 = unlimited review/fix cycles until approved or cancelled
 
 export interface RuntimeModelOptions {
   reasoningEffort?: ReasoningEffort;
@@ -31,6 +32,7 @@ export interface RuntimeModelOptions {
   contextLimit?: number;
   runId?: string;
   streamMessageId?: string;
+  executeOnly?: boolean;
   conversationHistory?: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
   onStreamEvent?: (event: AgentStreamEvent) => void;
   onCriticReport?: (report: CriticReport) => void;
@@ -268,15 +270,29 @@ export class MainAgent {
     const summary = await this.indexer.index();
     const { rulesText } = await this.memoryManager.getProjectRules();
 
-    const subagentDescriptions = availableSubagents.map(
-      (s) => `- ID: "${s.config.id}", Name: "${s.config.name}", Role: "${s.config.role}"`
-    ).join('\n') || 'None (Main Agent handles all tasks)';
+    const subagentDescriptions =
+      availableSubagents
+        .map((s) => {
+          const hint = (s.config.systemPrompt || '').replace(/\s+/g, ' ').trim().slice(0, 140);
+          return `- ID: "${s.config.id}", Name: "${s.config.name}", Role: "${s.config.role}"${hint ? `, Instructions: "${hint}"` : ''}`;
+        })
+        .join('\n') || 'None (Main Agent handles all tasks)';
+
+    const findSubagentId = (rolePat: RegExp): string | undefined =>
+      availableSubagents.find((s) => rolePat.test(s.config.role) || rolePat.test(s.config.name))?.config.id;
+    const testSubId = findSubagentId(/\b(test|qa)\b/i) || 'main';
+    const frontendSubId = findSubagentId(/\b(frontend|ui|designer|component)\b/i) || 'main';
 
     const systemPrompt = `You are the Lead Main Agent in LocalCoders.
 You are responsible for understanding the user request, inspecting project architecture, and creating a structured, actionable task breakdown.
 
 AVAILABLE SUBAGENTS FOR DELEGATION:
 ${subagentDescriptions}
+
+DELEGATION POLICY:
+- Use "assignedTo": "${availableSubagents.length > 0 ? frontendSubId : 'main'}" for UI/frontend layout, styles, or interactive view tasks when a Frontend specialist is available.
+- Use "assignedTo": "${availableSubagents.length > 0 ? testSubId : 'main'}" for writing or running automated unit/integration test suites when a Test specialist is available.
+- Use "assignedTo": "main" for core architecture, primary backend/domain logic, and final coordination.
 
 PROJECT STRUCTURE:
 Root: ${summary.rootName}
@@ -291,39 +307,39 @@ CRITICAL PLANNING INSTRUCTIONS:
 - LocalCoders is an autonomous software development environment.
 - Every task plan MUST culminate in real code files written to disk (via write_file/edit_file) and automated test execution (via run_command).
 - NEVER create plans that ONLY inspect, review, or recommend next steps without implementing them!
-- If the user asks to build or add a feature (e.g., Python clock with alarm, REST API, UI component):
-  1. Concrete source code implementation tasks (specify target filenames in affectedFiles, e.g. ["clock.py"]).
-  2. Interactive entry point or CLI module (e.g. ["main.py"]).
-  3. Comprehensive unit and integration test suite (e.g. ["test_clock.py"]).
-  4. Automated test run and verification using run_command.
+- Plan ONLY tasks explicitly requested in USER REQUEST. NEVER invent unrelated features or copy example filenames.
+- Include concrete steps appropriate to the user request:
+  1. Source code implementation tasks (specify actual target filenames from the request/repo in affectedFiles).
+  2. UI or entry-point updates when requested (assign UI tasks to "${frontendSubId}" if available).
+  3. Unit/integration test updates and verification via run_command (assign test tasks to "${testSubId}" if available).
 - If dependencies exist (e.g. tests depend on implementation), link them using dependencies.
 
 OUTPUT FORMAT:
-Respond with a STRICT JSON block in this exact schema:
+Respond with a STRICT JSON block matching this schema (replace placeholders with real task details):
 \`\`\`json
 {
   "tasks": [
     {
       "id": "task-1",
-      "title": "Implement Core Logic in clock.py",
-      "description": "Create the Clock and Alarm classes in clock.py with full feature set",
+      "title": "<Implement requested changes in target file>",
+      "description": "<Specific implementation details for the user request>",
       "assignedTo": "main",
       "dependencies": [],
-      "affectedFiles": ["clock.py"]
+      "affectedFiles": ["<target_file>"]
     },
     {
       "id": "task-2",
-      "title": "Create Comprehensive Test Suite in test_clock.py",
-      "description": "Write automated unit tests for Clock and Alarm in test_clock.py",
-      "assignedTo": "main",
+      "title": "<Update or add tests>",
+      "description": "<Verify requested behavior with automated tests>",
+      "assignedTo": "${testSubId}",
       "dependencies": ["task-1"],
-      "affectedFiles": ["test_clock.py"]
+      "affectedFiles": ["<test_file>"]
     },
     {
       "id": "task-3",
       "title": "Execute Tests and Verify Implementation",
       "description": "Run the automated tests using terminal execution and verify zero failures",
-      "assignedTo": "main",
+      "assignedTo": "${testSubId}",
       "dependencies": ["task-2"],
       "affectedFiles": []
     }
@@ -333,7 +349,17 @@ Respond with a STRICT JSON block in this exact schema:
 `;
 
     let responseContent = '';
+    let responseThinking = '';
     let planningNotified = false;
+    const planThought = createTurnThoughtTracker({
+      runId: options?.runId || 'run_default',
+      agentId: this.config.id,
+      agentName: this.config.name,
+      agentRole: this.config.role,
+      title: 'Planning Approach',
+      stepKey: 'plan',
+      onStreamEvent: options?.onStreamEvent,
+    });
     // Cap planning reasoning effort & tokens so local models formulate JSON plans quickly instead of multi-minute CoT
     const planEffort: ReasoningEffort | undefined =
       options?.reasoningEffort === 'extra_high'
@@ -358,6 +384,8 @@ Respond with a STRICT JSON block in this exact schema:
       },
       (chunk) => {
         responseContent += chunk.content;
+        if (chunk.thinking) responseThinking += chunk.thinking;
+        planThought.updateFromStream(responseContent, responseThinking);
         if (!planningNotified && (chunk.content || chunk.thinking)) {
           planningNotified = true;
           this.emitSafeStatus(options, 'planning', 'Planning approach');
@@ -365,6 +393,38 @@ Respond with a STRICT JSON block in this exact schema:
       },
       abortSignal
     );
+
+    const normalizePlanDelegation = (list: TaskPlanItem[]): TaskPlanItem[] => {
+      if (availableSubagents.length === 0 || list.length <= 1) return list;
+      const alreadyDelegated = list.some((t) => t.assignedTo && t.assignedTo !== 'main');
+      if (alreadyDelegated) return list;
+      const validIds = new Set(availableSubagents.map((s) => s.config.id));
+      const backendSubId = findSubagentId(/\b(backend|api|server|database)\b/i);
+      const debugSubId = findSubagentId(/\b(debug|fix|diagnos)\b/i);
+
+      return list.map((t, idx) => {
+        if (t.assignedTo && validIds.has(t.assignedTo)) return t;
+        const text = `${t.title} ${t.description} ${(t.affectedFiles || []).join(' ')}`.toLowerCase();
+        const isTest = /\b(test|unittest|pytest|spec|verify|verification|execute tests)\b/i.test(text) ||
+          (t.affectedFiles || []).some((f) => /test|spec/i.test(f));
+        const isUi = /\b(ui|frontend|gui|component|css|html|tkinter|react|vue)\b/i.test(text) ||
+          (t.affectedFiles || []).some((f) => /\.(vue|tsx|jsx|css|html|svelte)$/i.test(f));
+        const isDebug = /\b(debug|troubleshoot)\b/i.test(text);
+        if (isUi && frontendSubId !== 'main' && validIds.has(frontendSubId)) {
+          return { ...t, assignedTo: frontendSubId };
+        }
+        if (isTest && testSubId !== 'main' && validIds.has(testSubId)) {
+          return { ...t, assignedTo: testSubId };
+        }
+        if (isDebug && debugSubId && validIds.has(debugSubId)) {
+          return { ...t, assignedTo: debugSubId };
+        }
+        if (idx > 0 && backendSubId && validIds.has(backendSubId) && /\b(backend|api|database|endpoint|server)\b/i.test(text)) {
+          return { ...t, assignedTo: backendSubId };
+        }
+        return t;
+      });
+    };
 
     try {
       const match = responseContent.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
@@ -380,14 +440,16 @@ Respond with a STRICT JSON block in this exact schema:
         affectedFiles: Array.isArray(t.affectedFiles) ? t.affectedFiles : [],
       }));
 
-      // Guardrail: If model only created inspection/summary tasks without code implementation, augment plan
-      const hasImplementation = tasks.some(
+      // Guardrail: If model only created inspection/summary tasks without implementation or execution, augment plan
+      const hasImplementationOrExec = tasks.some(
         (t) =>
           t.affectedFiles.length > 0 ||
-          /\b(implement|create|write|build|add|code|fix|develop)\b/i.test(t.title + ' ' + t.description)
+          /\b(implement|create|write|build|add|code|fix|develop|run|execute|launch|start|serve|verify|test)\b/i.test(
+            t.title + ' ' + t.description
+          )
       );
 
-      if (!hasImplementation && tasks.length > 0) {
+      if (!hasImplementationOrExec && tasks.length > 0) {
         tasks.push({
           id: `task-${tasks.length + 1}`,
           title: 'Direct Code Implementation',
@@ -401,7 +463,7 @@ Respond with a STRICT JSON block in this exact schema:
           id: `task-${tasks.length + 1}`,
           title: 'Automated Testing and Verification',
           description: 'Run automated tests and verify working implementation',
-          assignedTo: 'main',
+          assignedTo: testSubId !== 'main' ? testSubId : 'main',
           dependencies: [`task-${tasks.length}`],
           status: 'pending',
           affectedFiles: [],
@@ -422,8 +484,13 @@ Respond with a STRICT JSON block in this exact schema:
         ];
       }
 
+      tasks = normalizePlanDelegation(tasks);
+      const planSummaryText = `Plan (${tasks.length} step${tasks.length === 1 ? '' : 's'}): ` +
+        tasks.map((t) => `${t.title} [${t.assignedTo}]`).join(' -> ');
+      planThought.finalize(responseContent, responseThinking, planSummaryText);
       return tasks;
     } catch {
+      planThought.finalize(responseContent, responseThinking, `Direct execution plan for: ${userPrompt}`);
       return [
         {
           id: 'task-1',
@@ -445,16 +512,21 @@ Respond with a STRICT JSON block in this exact schema:
     options?: RuntimeModelOptions
   ): Promise<string> {
     const systemPrompt =
-      'You are LocalCoders AI (running model: ' + (this.config.model || 'local LLM') + '), a coding agent inside the LocalCoders IDE. Answer the user directly, clearly, and naturally in 1-3 sentences. Do not invent code plans or execute tasks unless the user asks for code changes.';
+      'You are LocalCoders AI (running model: ' +
+      (this.config.model || 'local LLM') +
+      '), an assistant inside the LocalCoders IDE. You are currently in casual conversation mode. Respond ONLY to the user\'s latest message clearly and naturally in 1-3 sentences. Remember conversational details the user shared earlier in this chat (such as their name or preferences). Do NOT invent code plans or claim you will add, edit, or run code/files unless the user explicitly asked for a code change.';
 
     let rawResponse = '';
     let prevSanitized = '';
     const messageId = options?.streamMessageId || `conv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const runId = options?.runId || 'run_default';
+    const safeChatHistory = pairConversationHistory(options?.conversationHistory, 3).filter(
+      (m) => m.role !== 'system'
+    );
 
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       { role: 'system', content: systemPrompt },
-      ...(options?.conversationHistory || []).slice(-2),
+      ...safeChatHistory,
       { role: 'user', content: prompt },
     ];
 
@@ -534,9 +606,10 @@ ${rulesText}
 
     this.emitSafeStatus(options, 'analyzing', 'Analyzing the task');
 
+    const safeQaHistory = pairConversationHistory(options?.conversationHistory, 4);
     const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
       { role: 'system', content: systemPrompt },
-      ...(options?.conversationHistory || []),
+      ...safeQaHistory,
       { role: 'user', content: question },
     ];
 
@@ -616,17 +689,24 @@ ${rulesText}
       requestApproval,
     };
 
-    // Pre-execution safe checkpoint (non-fatal)
-    try {
-      await this.toolManager.executeTool('create_checkpoint', { description: 'Pre-multiagent task run' }, toolCtx);
-    } catch (checkpointErr: any) {
-      console.warn('[MainAgent] Non-fatal checkpoint note:', checkpointErr.message);
+    // Pre-execution safe checkpoint (non-fatal; skipped for execute-only runs)
+    if (!runtimeOptions?.executeOnly) {
+      try {
+        await this.toolManager.executeTool('create_checkpoint', { description: 'Pre-multiagent task run' }, toolCtx);
+      } catch (checkpointErr: any) {
+        console.warn('[MainAgent] Non-fatal checkpoint note:', checkpointErr.message);
+      }
     }
 
-    onActivity('Starting orchestrated multi-agent plan execution...');
+    onActivity(
+      runtimeOptions?.executeOnly
+        ? 'Executing requested application or command...'
+        : 'Starting orchestrated multi-agent plan execution...'
+    );
 
     let initialVerificationFailed = false;
     let verificationSummary = '';
+    let lastMainTaskOutput = '';
 
     while (!queue.isComplete()) {
       if (abortSignal?.aborted) {
@@ -711,6 +791,12 @@ ${rulesText}
               timestamp: subEnd,
             });
 
+            for (const f of res.affectedFiles || []) modifiedFilesSet.add(f);
+            if (res.verificationSummary) {
+              verificationSummary = res.verificationSummary;
+              initialVerificationFailed = Boolean(res.verificationFailed);
+            }
+
             queue.updateTaskStatus(
               task.id,
               subCancelled ? 'cancelled' : res.success ? 'completed' : 'failed',
@@ -718,8 +804,13 @@ ${rulesText}
             );
           } else {
             // Main Agent executes task directly
-            this.emitSafeStatus(runtimeOptions, 'working', `Working on ${task.title}`);
+            this.emitSafeStatus(
+              runtimeOptions,
+              'working',
+              runtimeOptions?.executeOnly ? 'Running application' : `Working on ${task.title}`
+            );
             const res = await this.executeMainTask(task, userPrompt, onActivity, requestApproval, abortSignal, runtimeOptions);
+            if (res.output) lastMainTaskOutput = res.output;
             for (const f of res.modifiedFiles || []) modifiedFilesSet.add(f);
             if (res.verificationSummary) {
               verificationSummary = res.verificationSummary;
@@ -760,20 +851,25 @@ ${rulesText}
       };
     }
 
-    // 3. Iterative Code -> Critic Review -> Remediation Cycle until clean or bounded max rounds
+    // 3. Iterative Code -> Critic Review -> Remediation Cycle (skipped for execute-only runs with zero file edits)
     let criticReport: CriticReport | undefined = undefined;
     let verificationFailed = initialVerificationFailed;
     let cyclesExecuted = 0;
     const runId = runtimeOptions?.runId || `run_${Date.now()}`;
+    const isExecuteOnlyRun = Boolean(runtimeOptions?.executeOnly) && modifiedFilesSet.size === 0;
 
-    if (criticAgent && !abortSignal?.aborted) {
-      const maxCycles = Math.max(1, Math.min(6, vsConfig.get<number>('maxCriticCycles') ?? DEFAULT_MAX_CRITIC_CYCLES));
+    if (criticAgent && !abortSignal?.aborted && !isExecuteOnlyRun) {
+      const rawMaxCycles = vsConfig.get<number>('maxCriticCycles');
+      const maxCycles =
+        typeof rawMaxCycles === 'number' && !Number.isNaN(rawMaxCycles)
+          ? Math.max(0, Math.floor(rawMaxCycles))
+          : DEFAULT_MAX_CRITIC_CYCLES;
       const strictness = criticAgent.getConfig().strictness || 'strict';
       const criticModel = criticAgent.getConfig().model || this.config.model;
       let prevFingerprint = '';
       let lastFixMadeNoChanges = false;
 
-      for (let cycle = 1; cycle <= maxCycles; cycle++) {
+      for (let cycle = 1; ; cycle++) {
         if (abortSignal?.aborted) {
           throw new Error('Multi-agent execution cancelled by user.');
         }
@@ -809,6 +905,9 @@ ${rulesText}
           userRequirements: userPrompt,
           changedFiles: Array.from(modifiedFilesSet),
           verificationSummary,
+          runId,
+          round: cycle,
+          onStreamEvent: runtimeOptions?.onStreamEvent,
           onProgress: onActivity,
           abortSignal,
         });
@@ -865,7 +964,7 @@ ${rulesText}
           .map((f) => `${f.filePath}:${f.lineRange || ''}:${f.explanation}`)
           .join('||')}`;
 
-        if (cycle >= maxCycles) {
+        if (maxCycles > 0 && cycle >= maxCycles) {
           onActivity(`[Critic Agent] Reached max review cycles (${maxCycles}); stopping with verdict '${criticReport.verdict}'.`);
           break;
         }
@@ -895,6 +994,7 @@ ${rulesText}
           runtimeOptions
         );
 
+        const prevVerifFailed: boolean = verificationFailed;
         for (const mf of fixRes.modifiedFiles) modifiedFilesSet.add(mf);
         lastFixMadeNoChanges = fixRes.modifiedFiles.length === 0;
 
@@ -902,8 +1002,13 @@ ${rulesText}
           verificationSummary = fixRes.verificationSummary;
           verificationFailed = fixRes.verificationFailed;
         }
+
+        if (lastFixMadeNoChanges && verificationFailed === prevVerifFailed) {
+          onActivity(`[Critic Agent] Stopping remediation cycle cleanly after Round ${cycle}: no files were modified to alter failing state.`);
+          break;
+        }
       }
-    } else if (verificationFailed && !abortSignal?.aborted) {
+    } else if (verificationFailed && !abortSignal?.aborted && !isExecuteOnlyRun) {
       // Critic disabled, but automated verification failed — allow direct Main Agent repair pass
       onActivity('[Main Agent] Verification failed; applying targeted fix pass...');
       const syntheticReport: CriticReport = {
@@ -962,7 +1067,9 @@ ${rulesText}
     return {
       success: true,
       criticReport,
-      summary: `All tasks completed successfully. Files created/modified and verified.${cycleNote}`,
+      summary: isExecuteOnlyRun
+        ? lastMainTaskOutput || 'Execution completed successfully.'
+        : `All tasks completed successfully. Files created/modified and verified.${cycleNote}`,
     };
   }
 
@@ -1002,8 +1109,40 @@ ${rulesText}
       if (rootEntries.length > 0) rootListingText = rootEntries.join(', ');
     } catch {}
 
-    const tools = this.toolManager.getOllamaTools(this.config.role, taskContext);
-    const systemPrompt = `You are the Lead Main Agent in LocalCoders, an autonomous development environment.
+    const isExecuteOnly = Boolean(runtimeOptions?.executeOnly);
+    const executeOnlyBlockedTools = new Set([
+      'write_file',
+      'edit_file',
+      'rename_file',
+      'delete_file',
+      'create_file',
+      'revert_file',
+      'stage_file',
+      'unstage_file',
+      'git_commit',
+      'git_checkout',
+      'git_create_branch',
+      'git_worktree_create',
+      'git_worktree_remove',
+    ]);
+    const rawTools = this.toolManager.getOllamaTools(this.config.role, taskContext);
+    const tools = isExecuteOnly
+      ? rawTools.filter((t: any) => !executeOnlyBlockedTools.has(t?.function?.name || ''))
+      : rawTools;
+    const systemPrompt = isExecuteOnly
+      ? `You are the Lead Main Agent in LocalCoders.
+${this.config.systemPrompt}
+
+EXECUTION-ONLY MODE:
+- The project code is ALREADY implemented on disk (Workspace Root Files: ${rootListingText}).
+- Do NOT rewrite, recreate, or modify existing source files or tests. Write/edit tools are disabled.
+- Use read_file / list_directory only if you need to check the entrypoint filename or start command.
+- Run the requested existing application or command right now using:
+  * start_process(command) + read_output(id): for GUI applications (Tkinter, Qt, Pygame, Electron), dev servers, or continuously running clocks/timers.
+  * run_command(command, stdin?): for finite scripts, CLIs (pass stdin if input() is needed), or test commands.
+- Never execute standalone 'source venv/bin/activate' or './venv/bin/activate' in run_command; any workspace venv/bin is already on PATH so run 'python3', 'pip', or 'pytest' directly.
+- Once executed, concisely report the exact command run and observed output/process status.`
+      : `You are the Lead Main Agent in LocalCoders, an autonomous development environment.
 ${this.config.systemPrompt}
 
 CRITICAL EXECUTION MANDATE:
@@ -1021,11 +1160,21 @@ CRITICAL EXECUTION MANDATE:
 - Never call write_file multiple times in a loop with identical path and content. Once a file is written and tests pass, provide your final concise summary.
 - Always write complete, production-ready, clean code with zero placeholders or omissions.`;
 
-    const targetFilePrompt = task.affectedFiles.length > 0
+    const targetFilePrompt = isExecuteOnly
+      ? `Inspect root files (${rootListingText}) if needed and run the existing entrypoint using run_command or start_process now. Do NOT modify or rewrite code files.`
+      : task.affectedFiles.length > 0
       ? `You MUST immediately write/update the required code for: ${task.affectedFiles.join(', ')} using write_file. Do not waste turns reading directory listings when files must be written.`
       : `Inspect/match existing workspace files (${rootListingText}) and use tools (write_file, edit_file, run_command) to execute this task now.`;
 
-    const userMsg = `TASK TO IMPLEMENT:
+    const userMsg = isExecuteOnly
+      ? `TASK TO EXECUTE:
+Title: ${task.title}
+Description: ${task.description}
+USER REQUEST: ${userPrompt}
+
+MANDATORY ACTION:
+${targetFilePrompt}`
+      : `TASK TO IMPLEMENT:
 Title: ${task.title}
 Description: ${task.description}
 Affected Files: ${task.affectedFiles.join(', ') || 'Determine needed files'}
@@ -1040,17 +1189,16 @@ ${targetFilePrompt}`;
     ];
 
     let turns = 0;
-    const maxTurns = 12;
+    const maxTurns = isExecuteOnly ? 6 : 12;
     let finalOutput = '';
     const filesWritten: string[] = [];
-    const succeededMutationSignatures = new Set<string>();
-    const blockedCommandSignatures = new Map<string, string>();
-    let consecutiveDuplicateWrites = 0;
+    const progressGuard = createTurnProgressGuard({ maxStuckTurns: 2 });
     let toolsExecutedCount = 0;
 
     const isImplementationTask =
-      task.affectedFiles.length > 0 ||
-      /\b(implement|create|write|build|add|code|fix|develop|test|setup)\b/i.test(task.title + ' ' + task.description);
+      !isExecuteOnly &&
+      (task.affectedFiles.length > 0 ||
+        /\b(implement|create|write|build|add|code|fix|develop|test|setup)\b/i.test(task.title + ' ' + task.description));
 
     const runId = runtimeOptions?.runId || `run_${Date.now()}`;
 
@@ -1061,12 +1209,23 @@ ${targetFilePrompt}`;
       }
 
       let content = '';
+      let rawThinking = '';
       let toolCalls: any = undefined;
       let phaseNotified = false;
       this.emitSafeStatus(runtimeOptions, 'analyzing', 'Analyzing the task');
+      const turnThought = createTurnThoughtTracker({
+        runId,
+        agentId: this.config.id,
+        agentName: this.config.name,
+        agentRole: this.config.role,
+        title: `${this.config.name} Thinking`,
+        stepKey: `${task.id}_t${turns}`,
+        onStreamEvent: runtimeOptions?.onStreamEvent,
+      });
 
       for (let streamAttempt = 0; streamAttempt < 2; streamAttempt++) {
         content = '';
+        rawThinking = '';
         toolCalls = undefined;
         phaseNotified = false;
         try {
@@ -1083,12 +1242,18 @@ ${targetFilePrompt}`;
             },
             (chunk) => {
               content += chunk.content;
+              if (chunk.thinking) rawThinking += chunk.thinking;
+              turnThought.updateFromStream(content, rawThinking);
               if (chunk.toolCalls && chunk.toolCalls.length > 0) {
                 toolCalls = [...(toolCalls || []), ...chunk.toolCalls];
               }
               if (!phaseNotified && (chunk.content || chunk.thinking)) {
                 phaseNotified = true;
-                this.emitSafeStatus(runtimeOptions, 'generating', 'Generating code');
+                this.emitSafeStatus(
+                  runtimeOptions,
+                  isExecuteOnly ? 'working' : 'generating',
+                  isExecuteOnly ? 'Running application' : 'Generating code'
+                );
               }
             },
             abortSignal
@@ -1103,6 +1268,7 @@ ${targetFilePrompt}`;
             await new Promise((r) => setTimeout(r, 1500));
             continue;
           }
+          turnThought.finalize(content, rawThinking);
           throw streamErr;
         }
       }
@@ -1130,8 +1296,14 @@ ${targetFilePrompt}`;
         }
       }
 
+      const fallbackThoughtNote =
+        activeCalls.length > 0
+          ? `Step "${task.title}": executing ${activeCalls.map((c) => `${c.name}(${c.args?.path || c.args?.command || ''})`).join(', ')}`
+          : undefined;
+      turnThought.finalize(content, rawThinking, fallbackThoughtNote);
+
       // 3. Fallback: Parse code blocks with filenames and automatically persist them via write_file
-      if (activeCalls.length === 0) {
+      if (activeCalls.length === 0 && !isExecuteOnly) {
         const extractedFiles = parseCodeBlocksFromContent(content, task.affectedFiles);
         if (extractedFiles.length > 0) {
           for (const ef of extractedFiles) {
@@ -1164,55 +1336,50 @@ ${targetFilePrompt}`;
       // 4. Execute tool calls if any were found
       if (activeCalls.length > 0) {
         let skippedAllAsDuplicate = true;
+        let turnMadeProgress = false;
+        let executedReadOnly = false;
         let lastCommandHint = '';
         for (const call of activeCalls) {
           if (abortSignal?.aborted) {
             throw new Error('Multi-agent execution cancelled by user.');
           }
-          const isMutationCall =
-            call.name === 'write_file' ||
-            call.name === 'create_file' ||
-            call.name === 'edit_file';
-          const mutSig = isMutationCall ? `${call.name}:${JSON.stringify(call.args || {})}` : '';
-          if (isMutationCall && succeededMutationSignatures.has(mutSig)) {
-            consecutiveDuplicateWrites++;
-            const dupNotice = JSON.stringify({
-              success: true,
-              skippedDuplicate: true,
-              message: `Skipped redundant write: '${call.args?.path || 'file'}' was already written with identical content. Do not call write_file again for unchanged content; run tests or summarize completion.`,
+
+          if (isExecuteOnly && executeOnlyBlockedTools.has(call.name)) {
+            const blockedJson = JSON.stringify({
+              success: false,
+              error: `Tool '${call.name}' is disabled because the user asked to run existing code without modifying files. Use 'run_command' or 'start_process' to run existing files.`,
             });
+            skippedAllAsDuplicate = false;
+            lastCommandHint = `Do NOT use ${call.name}. Run the existing application using 'run_command' or 'start_process'.`;
             if (toolCalls && toolCalls.length > 0) {
-              messages.push({ role: 'tool', tool_name: call.name, content: dupNotice });
+              messages.push({ role: 'tool', tool_name: call.name, content: blockedJson });
             } else {
-              messages.push({ role: 'user', content: `[Tool Result for ${call.name}]: ${dupNotice}` });
+              messages.push({ role: 'user', content: `[Tool Result for ${call.name}]: ${blockedJson}` });
             }
             continue;
           }
 
-          const cmdSig =
-            call.name === 'run_command'
-              ? `${String(call.args?.command || call.args?.cmd || '').trim()}::${String(call.args?.stdin ?? call.args?.input ?? '')}`
-              : '';
-          if (cmdSig && blockedCommandSignatures.has(cmdSig)) {
-            consecutiveDuplicateWrites++;
-            const prevReason = blockedCommandSignatures.get(cmdSig) || 'Command previously timed out or requested interactive input.';
-            const dupCmdNotice = JSON.stringify({
-              success: false,
-              skippedDuplicate: true,
-              error: `Skipped identical retry of blocked command: ${prevReason}`,
-            });
-            lastCommandHint = prevReason;
+          const preCheck = progressGuard.checkBeforeCall(call.name, call.args);
+          if (preCheck.skip) {
+            if (preCheck.reason) lastCommandHint = preCheck.reason;
             if (toolCalls && toolCalls.length > 0) {
-              messages.push({ role: 'tool', tool_name: call.name, content: dupCmdNotice });
+              messages.push({ role: 'tool', tool_name: call.name, content: preCheck.cachedResultJson });
             } else {
-              messages.push({ role: 'user', content: `[Tool Result for ${call.name}]: ${dupCmdNotice}` });
+              messages.push({ role: 'user', content: `[Tool Result for ${call.name}]: ${preCheck.cachedResultJson}` });
             }
             continue;
           }
 
           skippedAllAsDuplicate = false;
-          consecutiveDuplicateWrites = 0;
           toolsExecutedCount++;
+          if (
+            call.name === 'read_file' ||
+            call.name === 'list_directory' ||
+            call.name === 'search_codebase' ||
+            call.name === 'search_symbols'
+          ) {
+            executedReadOnly = true;
+          }
 
           const { result: res } = await executeTrackedTool({
             runId,
@@ -1231,19 +1398,10 @@ ${targetFilePrompt}`;
             throw new Error('Multi-agent execution cancelled by user.');
           }
 
-          if (cmdSig && !res.success && (res.output?.interactiveRequired || res.output?.timedOut)) {
-            const hint = String(res.error || 'Command blocked waiting on stdin or long-running UI.');
-            blockedCommandSignatures.set(cmdSig, hint);
-            lastCommandHint = hint;
-          }
-
-          if (res.success && (call.name === 'write_file' || call.name === 'create_file' || call.name === 'edit_file' || call.name === 'delete_file' || call.name === 'rename_file')) {
-            const p = call.args.path || call.args.filePath || call.args.newPath;
-            if (p) filesWritten.push(p);
-            if (isMutationCall && mutSig) {
-              succeededMutationSignatures.add(mutSig);
-            }
-          }
+          const outcome = progressGuard.recordOutcome(call.name, call.args, res);
+          if (outcome.modifiedFile) filesWritten.push(outcome.modifiedFile);
+          if (outcome.madeProgress) turnMadeProgress = true;
+          if (outcome.commandHint) lastCommandHint = outcome.commandHint;
 
           const resStr = JSON.stringify(res);
           const boundedStr = resStr.length > 12000 ? resStr.slice(0, 12000) + '... [truncated]' : resStr;
@@ -1260,6 +1418,8 @@ ${targetFilePrompt}`;
               content: `[Tool Result for ${call.name}]: ${boundedStr}\n${
                 lastCommandHint
                   ? lastCommandHint
+                  : isExecuteOnly
+                  ? 'Execution step recorded. If the application/command has now run or started, reply concisely with the observed command and output. Do NOT rewrite existing files.'
                   : filesWritten.length > 0
                   ? 'If code changes are complete, run verification tests or provide a concise summary without repeating identical file writes.'
                   : 'Continue implementing the task.'
@@ -1268,8 +1428,8 @@ ${targetFilePrompt}`;
           }
         }
 
-        if (skippedAllAsDuplicate && consecutiveDuplicateWrites >= 2) {
-          finalOutput = `Completed task updates for: ${Array.from(new Set(filesWritten)).join(', ') || 'workspace files'}.`;
+        if (progressGuard.shouldStopTurn({ skippedAll: skippedAllAsDuplicate, turnMadeProgress, executedReadOnly })) {
+          finalOutput = `Stopped task after repeated unchanged/blocked operations (${Array.from(new Set(filesWritten)).join(', ') || 'no file changes'}).`;
           break;
         }
 
@@ -1279,6 +1439,8 @@ ${targetFilePrompt}`;
             role: 'user',
             content: lastCommandHint
               ? `Command guidance: ${lastCommandHint}`
+              : isExecuteOnly
+              ? `Tool executions completed. If you already ran or started the target application/command, report the exact command and output concisely. Otherwise run it with 'run_command' or 'start_process' now.`
               : filesWritten.length > 0
               ? `Tool executions completed. If all required files (${Array.from(new Set(filesWritten)).join(', ')}) are complete, run verification tests with 'run_command' or reply with a concise completion summary.`
               : `Tool executions completed. Continue implementing the task. Use 'write_file' to save code to disk, and 'run_command' to run tests.`,
@@ -1288,7 +1450,15 @@ ${targetFilePrompt}`;
         continue;
       }
 
-      // 5. Nudge if an implementation task produced pure text without writing any files
+      // 5. Nudge if task produced pure text without invoking required tools
+      if (isExecuteOnly && toolsExecutedCount === 0 && turns < 3) {
+        this.emitSafeStatus(runtimeOptions, 'working', 'Requesting application execution');
+        messages.push({
+          role: 'user',
+          content: 'Please execute the requested existing file or command right now using run_command or start_process (inspecting root files with list_directory/read_file first if needed), without modifying source files.',
+        });
+        continue;
+      }
       if (isImplementationTask && filesWritten.length === 0 && toolsExecutedCount === 0 && turns < 3) {
         this.emitSafeStatus(runtimeOptions, 'working', 'Requesting file write execution');
         messages.push({
@@ -1425,17 +1595,43 @@ ${targetFilePrompt}`;
       )
       .join('\n\n');
 
+    const targetCandidates = Array.from(
+      new Set([
+        ...affectedFiles,
+        ...(report.findings || []).map((f) => f.filePath).filter((p) => Boolean(p && p !== 'workspace')),
+      ])
+    ).slice(0, 4);
+
+    const fileSnapshots: string[] = [];
+    for (const rel of targetCandidates) {
+      try {
+        const abs = path.resolve(this.workspaceRoot, rel);
+        if (abs.startsWith(path.resolve(this.workspaceRoot)) && fs.existsSync(abs) && fs.statSync(abs).isFile()) {
+          const rawText = fs.readFileSync(abs, 'utf-8');
+          const numbered = rawText
+            .split(/\r?\n/)
+            .slice(0, 100)
+            .map((l, idx) => `${idx + 1}: ${l}`)
+            .join('\n')
+            .slice(0, 2500);
+          fileSnapshots.push(`--- CURRENT FILE: ${rel} ---\n${numbered}`);
+        }
+      } catch {
+        // non-fatal snapshot skip
+      }
+    }
+
     const prompt = `CRITIC REVIEW FEEDBACK (Round ${round}, Verdict: ${report.verdict.toUpperCase()}):
 Summary: ${report.summary}
 
 ${findingsList || 'No structured findings array provided; see verification output below.'}
 ${verificationSummary ? `\nRECENT VERIFICATION OUTPUT:\n${verificationSummary}\n` : ''}
 Currently affected files: ${affectedFiles.join(', ') || '(inspect workspace)'}
-
+${fileSnapshots.length > 0 ? `\nACTUAL FILE CONTENTS ON DISK:\n${fileSnapshots.join('\n\n')}\n` : ''}
 INSTRUCTIONS:
-1. Read affected files if needed and fix EVERY defect reported above using 'write_file' or 'edit_file'.
-2. Ensure valid, complete source code — never write JSON tool payloads into source files.
-3. Run verification tests with 'run_command' after editing to confirm errors are resolved.`;
+1. Fix EVERY defect reported above using exact substrings in 'edit_file' or complete corrected contents in 'write_file'.
+2. Ensure valid, complete source code — never write JSON tool payloads into source files, and never repeat an identical failing 'edit_file'.
+3. Run verification tests with 'run_command' only AFTER saving edits to confirm errors are resolved.`;
 
     const messages: any[] = [
       {
@@ -1447,17 +1643,27 @@ INSTRUCTIONS:
 
     const modifiedFiles: string[] = [];
     const fixRunId = runtimeOptions?.runId || `run_${Date.now()}`;
-    const mutSignatures = new Set<string>();
+    const progressGuard = createTurnProgressGuard({ maxStuckTurns: 2 });
     let turns = 0;
 
-    while (turns < 8) {
+    while (turns < 5) {
       turns++;
       if (abortSignal?.aborted) {
         throw new Error('Multi-agent execution cancelled by user.');
       }
 
       let content = '';
+      let rawThinking = '';
       let toolCalls: any = undefined;
+      const fixThought = createTurnThoughtTracker({
+        runId: fixRunId,
+        agentId: this.config.id,
+        agentName: this.config.name,
+        agentRole: this.config.role,
+        title: `Fixing Critic Feedback (Round ${round})`,
+        stepKey: `fix_r${round}_t${turns}`,
+        onStreamEvent: runtimeOptions?.onStreamEvent,
+      });
 
       await this.llmRouter.chatStream(
         {
@@ -1472,6 +1678,8 @@ INSTRUCTIONS:
         },
         (chunk) => {
           content += chunk.content;
+          if (chunk.thinking) rawThinking += chunk.thinking;
+          fixThought.updateFromStream(content, rawThinking);
           if (chunk.toolCalls && chunk.toolCalls.length > 0) {
             toolCalls = [...(toolCalls || []), ...chunk.toolCalls];
           }
@@ -1502,23 +1710,39 @@ INSTRUCTIONS:
         }
       }
 
+      fixThought.finalize(
+        content,
+        rawThinking,
+        activeCalls.length > 0
+          ? `Applying Critic Round ${round} fixes: ${activeCalls.map((c) => `${c.name}(${c.args?.path || c.args?.command || ''})`).join(', ')}`
+          : undefined
+      );
+
       messages.push({ role: 'assistant', content, tool_calls: toolCalls && toolCalls.length > 0 ? toolCalls : undefined });
       if (activeCalls.length === 0) break;
 
       let skippedAll = true;
+      let turnMadeProgress = false;
+      let executedReadOnly = false;
       for (const call of activeCalls) {
-        const isMut = call.name === 'write_file' || call.name === 'create_file' || call.name === 'edit_file';
-        const sig = isMut ? `${call.name}:${JSON.stringify(call.args || {})}` : '';
-        if (isMut && mutSignatures.has(sig)) {
-          const dupMsg = JSON.stringify({ success: true, skippedDuplicate: true });
+        const preCheck = progressGuard.checkBeforeCall(call.name, call.args);
+        if (preCheck.skip) {
           if (toolCalls && toolCalls.length > 0) {
-            messages.push({ role: 'tool', tool_name: call.name, content: dupMsg });
+            messages.push({ role: 'tool', tool_name: call.name, content: preCheck.cachedResultJson });
           } else {
-            messages.push({ role: 'user', content: `[Tool Result for ${call.name}]: ${dupMsg}` });
+            messages.push({ role: 'user', content: `[Tool Result for ${call.name}]: ${preCheck.cachedResultJson}` });
           }
           continue;
         }
         skippedAll = false;
+        if (
+          call.name === 'read_file' ||
+          call.name === 'list_directory' ||
+          call.name === 'search_codebase' ||
+          call.name === 'search_symbols'
+        ) {
+          executedReadOnly = true;
+        }
 
         const { result: res } = await executeTrackedTool({
           runId: fixRunId,
@@ -1537,11 +1761,9 @@ INSTRUCTIONS:
           throw new Error('Multi-agent execution cancelled by user.');
         }
 
-        if (res.success && (isMut || call.name === 'delete_file' || call.name === 'rename_file')) {
-          const p = call.args?.path || call.args?.filePath || call.args?.newPath;
-          if (p) modifiedFiles.push(p);
-          if (sig) mutSignatures.add(sig);
-        }
+        const outcome = progressGuard.recordOutcome(call.name, call.args, res);
+        if (outcome.modifiedFile) modifiedFiles.push(outcome.modifiedFile);
+        if (outcome.madeProgress) turnMadeProgress = true;
 
         const resStr = JSON.stringify(res);
         const boundedStr = resStr.length > 12000 ? resStr.slice(0, 12000) + '... [truncated]' : resStr;
@@ -1551,7 +1773,9 @@ INSTRUCTIONS:
           messages.push({ role: 'user', content: `[Tool Result for ${call.name}]: ${boundedStr}` });
         }
       }
-      if (skippedAll) break;
+      if (progressGuard.shouldStopTurn({ skippedAll, turnMadeProgress, executedReadOnly })) {
+        break;
+      }
       if (toolCalls && toolCalls.length > 0) {
         messages.push({
           role: 'user',

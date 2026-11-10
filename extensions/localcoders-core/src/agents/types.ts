@@ -100,6 +100,7 @@ export interface AgentTask {
   userPrompt: string;
   plan: TaskPlanItem[];
   status: 'idle' | 'running' | 'completed' | 'failed' | 'paused' | 'cancelled';
+  error?: string;
   criticReport?: CriticReport;
   createdAt: number;
   updatedAt: number;

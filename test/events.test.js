@@ -15,7 +15,9 @@ const {
   isPlanExplicitlyRequested,
   getSafePhaseLabel,
   classifyUserPrompt,
+  pairConversationHistory,
   sanitizeConversationHistory,
+  stripCancelledTurnsFromHistory,
 } = require('../extensions/localcoders-core/dist/agents/events');
 const { executeTrackedTool } = require('../extensions/localcoders-core/dist/agents/tool-runner');
 const { AgentOrchestrator } = require('../extensions/localcoders-core/dist/agents/orchestrator');
@@ -1360,6 +1362,7 @@ describe('Event Streaming, Thinking Filter, Command Cards & Cockpit UI (12 Scena
     assert.strictEqual(listEl.children[0].classList.contains('active'), true);
     assert.match(listEl.children[0].innerHTML, /11 hours ago/);
     assert.match(listEl.children[0].innerHTML, /lc-sess-dot/);
+    assert.ok(!listEl.children[0].innerHTML.includes('lc-sess-meta-icon'), 'Removed Devin-style triangle icon from session rows');
     assert.match(listEl.children[1].innerHTML, /6 days ago/);
 
     // Toggle By Folder grouping -> creates collapsible folder parent header + indented children
@@ -1369,26 +1372,42 @@ describe('Event Streaming, Thinking Filter, Command Cards & Cockpit UI (12 Scena
     assert.strictEqual(listEl.children[1].children[0].classList.contains('child'), true);
   });
 
-  it('27. LocalCoders branding assets use simple LC monogram with Aura design across SVG, Activity Bar, Titlebar, and PNG', () => {
+  it('27. LocalCoders branding & desktop icons use LC Aura design while sidebar header shows logged-in device username', () => {
     const brandSvg = fs.readFileSync(path.join(__dirname, '..', 'branding', 'localcoders-logo.svg'), 'utf8');
     const extSvg = fs.readFileSync(path.join(__dirname, '..', 'extensions', 'localcoders-core', 'resources', 'icon.svg'), 'utf8');
     const actSvg = fs.readFileSync(path.join(__dirname, '..', 'extensions', 'localcoders-core', 'resources', 'activitybar-icon.svg'), 'utf8');
     const titleSvg = fs.readFileSync(path.join(__dirname, '..', 'vscode-src', 'src', 'vs', 'workbench', 'browser', 'media', 'code-icon.svg'), 'utf8');
-    const pngStat = fs.statSync(path.join(__dirname, '..', 'branding', 'localcoders-icon.png'));
+    const brandPng = fs.readFileSync(path.join(__dirname, '..', 'branding', 'localcoders-icon.png'));
+    const linuxCodePng = fs.readFileSync(path.join(__dirname, '..', 'vscode-src', 'resources', 'linux', 'code.png'));
+    const linuxLocalCodersPng = fs.readFileSync(path.join(__dirname, '..', 'vscode-src', 'resources', 'linux', 'localcoders.png'));
 
     assert.strictEqual(brandSvg, extSvg);
     assert.strictEqual(brandSvg, titleSvg);
     assert.ok(brandSvg.includes('auraCenter') && brandSvg.includes('auraRingGrad'), 'Brand SVG defines layered Aura gradients');
     assert.ok(!brandSvg.includes('mainAgentGrad') && !brandSvg.includes('criticGrad'), 'Legacy multi-node logo removed');
     assert.ok(actSvg.includes('fill="none"') && actSvg.includes('<circle cx="12" cy="12"'), 'Activity Bar icon retains crisp LC + Aura circle mask stroke');
-    assert.ok(pngStat.size > 10000, 'Rendered 512x512 PNG logo exists');
+    assert.ok(brandPng.length > 10000, 'Rendered 512x512 PNG logo exists');
+    assert.strictEqual(Buffer.compare(brandPng, linuxCodePng), 0, 'Linux desktop code.png matches LC Aura PNG icon');
+    assert.strictEqual(Buffer.compare(brandPng, linuxLocalCodersPng), 0, 'Linux desktop localcoders.png matches LC Aura PNG icon');
 
+    const { getDeviceUsername, getUserProfileBadgeMarkup } = require('../extensions/localcoders-core/dist/views/sessions-bar-ui');
     const { AgentWorkspaceEditorPanel } = require('../extensions/localcoders-core/dist/views/agent-workspace-editor');
     const { NavigationViewProvider } = require('../extensions/localcoders-core/dist/views/navigation-view');
+
+    const expectedUser = getDeviceUsername();
+    assert.ok(expectedUser.length > 0 && expectedUser !== 'LocalCoders', 'Resolved device login username');
+
     const agentHtml = AgentWorkspaceEditorPanel.prototype._getHtmlForWebview.call({ _panel: { webview: { cspSource: 'vscode-webview:' } } });
     const navHtml = NavigationViewProvider.prototype._getHtmlForWebview.call({ _extensionUri: { fsPath: process.cwd() } });
-    assert.ok(agentHtml.includes('lc-brand-svg'), 'Agent View header includes LC Aura logo SVG');
-    assert.ok(navHtml.includes('lc-brand-svg'), 'Navigation View header includes LC Aura logo SVG');
+
+    assert.ok(agentHtml.includes('class="lc-user-name">' + expectedUser + '</span>'), 'Agent View header shows device login username');
+    assert.ok(navHtml.includes('class="lc-user-name">' + expectedUser + '</span>'), 'Navigation View header shows device login username');
+    assert.ok(!agentHtml.includes('lc-brand-svg'), 'Agent View sidebar header does not show LC brand SVG');
+    assert.ok(!navHtml.includes('lc-brand-svg'), 'Navigation View sidebar header does not show LC brand SVG');
+
+    const escapedBadge = getUserProfileBadgeMarkup('<alice&bob>');
+    assert.ok(escapedBadge.includes('&lt;alice&amp;bob&gt;'), 'User profile badge escapes HTML characters');
+    assert.ok(!escapedBadge.includes('<alice'), 'User profile badge prevents raw HTML injection');
   });
 
   it('28. Agent Workspace composer is docked in flex flow below chat scroll container so it never overlaps messages', () => {
@@ -1459,5 +1478,492 @@ describe('Event Streaming, Thinking Filter, Command Cards & Cockpit UI (12 Scena
     const chatHtml = ChatViewProvider.prototype._getHtmlForWebview.call({ _extensionUri: { fsPath: process.cwd() } });
     assert.ok(agentHtml.includes('return lcRenderMarkdown(text);'), 'Agent view uses shared lcRenderMarkdown');
     assert.ok(chatHtml.includes('return lcRenderMarkdown(text);'), 'Chat view uses shared lcRenderMarkdown');
+  });
+
+  it('30. Built-in specialist delegation & live agent thinking entries surface multiple agents and reasoning inside Thinking drawer', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-ev-30-'));
+    const vscode = require('vscode');
+    const origFolders = vscode.workspace.workspaceFolders;
+    vscode.workspace.workspaceFolders = [{ uri: { fsPath: tmpDir }, name: 'tmp', index: 0 }];
+    try {
+      const registry = makeRegistry(makeMockContext(tmpDir));
+      const toolManager = new ToolManager();
+      const { extractAgentReasoningText } = require('../extensions/localcoders-core/dist/agents/events');
+
+      // Registry has NO custom subagents registered -> Orchestrator should supply built-in specialists cleanly
+      assert.strictEqual(registry.getSubagents().length, 0);
+
+      assert.strictEqual(
+        extractAgentReasoningText('<think>Plan clock first</think>Writing module now<tool_call>{"name":"write_file"}</tool_call>'),
+        'Plan clock first\n\nWriting module now'
+      );
+
+      const mockLlm = {
+        getHost: () => 'http://127.0.0.1:11434',
+        chatStream: async (params, onChunk) => {
+          const sys = String(params.messages[0]?.content || '');
+          const userAll = params.messages.map((m) => String(m.content || '')).join('\n');
+
+          if (sys.includes('PLANNING INSTRUCTIONS')) {
+            // Mock a local LLM that leaves assignedTo='main' on all tasks -> planner normalizes UI & test tasks to specialists
+            onChunk({
+              content:
+                '```json\n' +
+                JSON.stringify({
+                  tasks: [
+                    { id: 't1', title: 'Implement Core Logic in clock.py', description: 'Clock class', assignedTo: 'main', dependencies: [], affectedFiles: ['clock.py'] },
+                    { id: 't2', title: 'Build UI Component in index.html', description: 'Web UI', assignedTo: 'main', dependencies: ['t1'], affectedFiles: ['index.html'] },
+                    { id: 't3', title: 'Write Unit Tests in test_clock.py', description: 'Verify behavior', assignedTo: 'main', dependencies: ['t1'], affectedFiles: ['test_clock.py'] },
+                  ],
+                }) +
+                '\n```',
+              thinking: 'Analyzing whether to split core, UI, and tests across agents.',
+              done: true,
+            });
+            return;
+          }
+
+          if (sys.includes('LocalCoders Critic Agent')) {
+            onChunk({
+              content: '<think>All three files and tests align cleanly.</think>```json\n{"verdict":"approved","summary":"All clean","findings":[]}\n```',
+              done: true,
+            });
+            return;
+          }
+
+          const hasTool = params.messages.some((m) => m.role === 'tool' || (m.role === 'user' && String(m.content).includes('[Tool Result')));
+          if (!hasTool) {
+            if (userAll.includes('index.html')) {
+              onChunk({
+                content: '',
+                thinking: 'Structuring accessible minimal clock HTML layout.',
+                toolCalls: [{ function: { name: 'write_file', arguments: { path: 'index.html', content: '<div id="clock"></div>' } } }],
+                done: true,
+              });
+            } else if (userAll.includes('test_clock.py')) {
+              onChunk({
+                content: '',
+                thinking: 'Writing isolated unittest assertions for clock module.',
+                toolCalls: [{ function: { name: 'write_file', arguments: { path: 'test_clock.py', content: 'import unittest\nclass T(unittest.TestCase):\n  def test_ok(self): self.assertTrue(True)\n' } } }],
+                done: true,
+              });
+            } else {
+              onChunk({
+                content: '',
+                thinking: 'Designing Clock state class in clock.py.',
+                toolCalls: [{ function: { name: 'write_file', arguments: { path: 'clock.py', content: 'class Clock:\n  pass\n' } } }],
+                done: true,
+              });
+            }
+            return;
+          }
+          onChunk({ content: 'Completed.', done: true });
+        },
+      };
+
+      const orchestrator = new AgentOrchestrator(mockLlm, registry, toolManager, tmpDir);
+      const upserts = [];
+      orchestrator.onStreamEvent((ev) => {
+        if (ev.kind === 'activity_upsert') upserts.push(ev.item);
+      });
+
+      const task = await orchestrator.submitTask('Build clock with HTML UI and tests', {
+        providerId: 'ollama',
+        modelId: 'qwen2.5-coder:7b',
+        modelName: 'qwen2.5-coder:7b',
+        reasoningEffort: 'medium',
+        fastMode: false,
+        executionMode: 'code',
+        permissionMode: 'bypass',
+        enabledMcpServers: [],
+        enabledSkills: [],
+        activeRules: [],
+        attachedFiles: [],
+        projectContext: [],
+      });
+
+      assert.strictEqual(task.status, 'completed');
+      const agentNames = new Set(upserts.map((i) => i.agentName));
+      assert.ok(agentNames.has('Main Agent'), 'Includes Main Agent');
+      assert.ok(agentNames.has('Frontend Specialist'), 'Delegates UI task to Frontend Specialist');
+      assert.ok(agentNames.has('Test Engineer'), 'Delegates test task to Test Engineer');
+      assert.ok(agentNames.has('Critic Agent'), 'Includes Critic Agent review');
+
+      const thoughts = upserts.filter((i) => i.category === 'thinking_summary' && i.status === 'completed');
+      assert.ok(thoughts.some((t) => (t.stdout || '').includes('Analyzing whether to split core')), 'Emits planning thought');
+      assert.ok(thoughts.some((t) => t.agentName === 'Frontend Specialist' && (t.stdout || '').includes('Structuring accessible minimal clock')), 'Emits Frontend Specialist thought');
+      assert.ok(thoughts.some((t) => t.agentName === 'Test Engineer' && (t.stdout || '').includes('Writing isolated unittest')), 'Emits Test Engineer thought');
+      assert.ok(thoughts.some((t) => t.agentName === 'Critic Agent' && (t.stdout || '').includes('All three files')), 'Emits Critic thought');
+
+      // Verify UI drawer renders thinking_summary items cleanly as .lc-thought-entry nodes
+      const vm = require('vm');
+      const actUi = require('../extensions/localcoders-core/dist/views/activity-stream-ui');
+      const makeDomNode = (tag) => {
+        const node = { tagName: tag, className: '', innerHTML: '', textContent: '', children: [], style: {}, setAttribute() {}, addEventListener() {}, appendChild(c) { this.children.push(c); }, querySelector() { return null; } };
+        return node;
+      };
+      const sandbox = {
+        document: { createElement: makeDomNode },
+        lcIcon: () => '<svg></svg>',
+      };
+      vm.createContext(sandbox);
+      vm.runInContext(actUi.getActivityClientScript(), sandbox);
+
+      const groupNode = sandbox.lcBuildInlineThinkingGroup({
+        turnKey: 't0',
+        activities: thoughts.slice(0, 2),
+        isExpanded: true,
+        isLive: false,
+      });
+      const drawerNode = groupNode.children[1];
+      assert.ok(drawerNode.children.length >= 2);
+      assert.ok(drawerNode.children[0].className.includes('lc-thought-entry'), 'Thoughts render using dedicated .lc-thought-entry blocks');
+      assert.ok(drawerNode.children[0].innerHTML.includes('lc-thought-body'), 'Thought body is directly visible inside Thinking drawer');
+    } finally {
+      vscode.workspace.workspaceFolders = origFolders;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('31. Casual introductions, memory queries, and post-cancel greetings never leak cancelled tasks or trigger coding plans', async () => {
+    // 1. Conversational classification cases (must stay 'greeting', never 'coding_task')
+    for (const casual of [
+      'My name is Nigfa',
+      'I am Juan',
+      "I'm Alex",
+      'Call me Juan',
+      'Please remember my name is Nigfa',
+      'Can you remember my name if i tell you ?',
+      'What is my name?',
+      'Do you remember my name?',
+      'Nice to meet you',
+      'Never mind',
+      'Yes',
+      'No',
+      'Today is sunny',
+    ]) {
+      assert.strictEqual(
+        classifyUserPrompt(casual, 'code'),
+        'greeting',
+        `Expected casual chat "${casual}" to classify as greeting, not coding_task`
+      );
+    }
+
+    // Real coding requests still classify cleanly as coding_task
+    assert.strictEqual(classifyUserPrompt('Improve the settings page', 'code'), 'coding_task');
+    assert.strictEqual(classifyUserPrompt('Build an UI for the clock then run the clock', 'code'), 'coding_task');
+    assert.strictEqual(classifyUserPrompt('rewrite the readme.md, NO USE ICONS', 'code'), 'coding_task');
+
+    // 2. Cancelled task turns are stripped and orphaned prompts are never passed back-to-back before "Hi"
+    const postCancelRaw = [
+      { role: 'user', content: 'Add an alarm feature to clock.py' },
+      { role: 'assistant', content: '### Implementation Plan\n1. Modify clock.py' },
+      { role: 'system', content: 'Execution cancelled by user.' },
+      { role: 'user', content: 'Hi' },
+    ];
+    const withoutCancel = stripCancelledTurnsFromHistory(postCancelRaw);
+    assert.strictEqual(withoutCancel.length, 1);
+    assert.strictEqual(withoutCancel[0].content, 'Hi');
+
+    const paired = pairConversationHistory([
+      { role: 'user', content: 'unanswered coding prompt' },
+      { role: 'user', content: 'Hi' },
+      { role: 'assistant', content: 'Hello!' },
+      { role: 'user', content: 'trailing unpaired prompt' },
+    ]);
+    assert.deepStrictEqual(paired, [
+      { role: 'user', content: 'Hi' },
+      { role: 'assistant', content: 'Hello!' },
+    ]);
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-ev-31-'));
+    try {
+      const registry = makeRegistry(makeMockContext(tmpDir));
+      const toolManager = new ToolManager();
+      const recordedPayloads = [];
+      let sawPlanOrTools = false;
+
+      const mockLlm = {
+        getHost: () => 'https://api.openai.com',
+        chatStream: async (params, onChunk) => {
+          recordedPayloads.push(params.messages.map((m) => ({ role: m.role, content: m.content })));
+          if (params.tools && params.tools.length > 0) sawPlanOrTools = true;
+          if (params.messages.some((m) => /OUTPUT FORMAT:|CRITICAL PLANNING INSTRUCTIONS/i.test(m.content || ''))) {
+            sawPlanOrTools = true;
+          }
+          const lastUser = (params.messages[params.messages.length - 1]?.content || '').toLowerCase();
+          if (lastUser.includes('my name is nigfa')) {
+            onChunk({ content: 'Nice to meet you, Nigfa! I will remember that.', done: true });
+          } else if (lastUser.includes('what is my name')) {
+            const knowsName = params.messages.some((m) => /Nigfa/.test(m.content || ''));
+            onChunk({ content: knowsName ? 'Your name is Nigfa.' : 'I do not know your name yet.', done: true });
+          } else {
+            onChunk({ content: 'Hello! How can I help you today?', done: true });
+          }
+        },
+      };
+
+      const orchestrator = new AgentOrchestrator(mockLlm, registry, toolManager, tmpDir);
+      const events = [];
+      orchestrator.onStreamEvent((ev) => events.push(ev));
+
+      const baseConfig = {
+        providerId: 'openai',
+        modelId: 'gpt-4o',
+        modelName: 'GPT-4o',
+        reasoningEffort: 'medium',
+        fastMode: false,
+        executionMode: 'code',
+        permissionMode: 'smart',
+        enabledMcpServers: [],
+        enabledSkills: [],
+        activeRules: [],
+        attachedFiles: [],
+        projectContext: [],
+      };
+
+      // Turn A: User says "Hi" right after cancelling a coding task -> no orphaned coding prompt passed
+      const hiTask = await orchestrator.submitTask('Hi', baseConfig, postCancelRaw);
+      assert.strictEqual(hiTask.status, 'completed');
+      assert.strictEqual(
+        recordedPayloads[0].some((m) => /alarm/i.test(m.content || '')),
+        false,
+        'Post-cancel Hi must not receive cancelled alarm prompt in chat history'
+      );
+
+      // Turn B: "My name is Nigfa" -> stays in casual fast chat (zero planning, zero tools, zero Critic)
+      const convHistory = [
+        ...postCancelRaw.slice(0, 3),
+        { role: 'user', content: 'Hi' },
+        { role: 'assistant', content: 'Hello! How can I help you today?' },
+        { role: 'user', content: 'Can you remember my name if i tell you ?' },
+        { role: 'assistant', content: 'Yes, I can remember your name if you tell me.' },
+      ];
+      const nameTask = await orchestrator.submitTask('My name is Nigfa', baseConfig, convHistory);
+      assert.strictEqual(nameTask.status, 'completed');
+      assert.strictEqual(sawPlanOrTools, false, 'Casual self-introduction must never trigger planning, tools, or Critic');
+      assert.strictEqual(events.filter((e) => e.kind === 'plan').length, 0);
+
+      // Turn C: "What is my name?" recalls "Nigfa" from paired chat history without coding tools
+      convHistory.push(
+        { role: 'user', content: 'My name is Nigfa' },
+        { role: 'assistant', content: 'Nice to meet you, Nigfa! I will remember that.' }
+      );
+      let recalledReply = '';
+      orchestrator.onMessage((msg) => {
+        if (msg.senderRole === 'assistant') recalledReply = msg.content;
+      });
+      await orchestrator.submitTask('What is my name?', baseConfig, convHistory);
+      assert.match(recalledReply, /Nigfa/, 'Assistant recalls shared name cleanly across paired chat turns');
+      assert.strictEqual(sawPlanOrTools, false);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('32. Execute-only prompts ("ok, now run the clock") run existing code without rewriting files or triggering coding plans/Critic', async () => {
+    for (const runPrompt of [
+      'ok, now run the clock',
+      'run clock.py',
+      'start the app',
+      'launch App.vue',
+      'run the test suite',
+    ]) {
+      assert.strictEqual(classifyUserPrompt(runPrompt, 'code'), 'execute_task', `Expected execute_task for "${runPrompt}"`);
+    }
+    assert.strictEqual(classifyUserPrompt('how do I run clock.py?', 'code'), 'question');
+    assert.strictEqual(classifyUserPrompt('Build an UI for the clock then run the clock', 'code'), 'coding_task');
+    assert.strictEqual(classifyUserPrompt('Fix clock.py and run tests', 'code'), 'coding_task');
+
+    const vscode = require('vscode');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-ev-32-'));
+    const origFolders = vscode.workspace.workspaceFolders;
+    vscode.workspace.workspaceFolders = [{ uri: { fsPath: tmpDir } }];
+    try {
+      const originalCode = 'print("CLOCK_RUNNING_OK")\n';
+      fs.writeFileSync(path.join(tmpDir, 'clock.py'), originalCode, 'utf8');
+
+      const { PermissionManager } = require('../extensions/localcoders-core/dist/security/permission-manager');
+      const pm = new PermissionManager(tmpDir);
+      pm.setMode('bypass');
+      const toolManager = new ToolManager(undefined, pm);
+      const registry = makeRegistry(makeMockContext(tmpDir));
+      registry.setCriticConfig({ enabled: true, model: 'mock-critic', strictness: 'strict', reviewMode: 'changed_files' });
+
+      let sawPlanning = false;
+      let sawCritic = false;
+      let sawWriteToolSchema = false;
+      let sawOldPromptInRunContext = false;
+      let turn = 0;
+
+      const mockLlm = {
+        getHost: () => 'http://localhost:11434',
+        chatStream: async (params, onChunk) => {
+          const sys = String(params.messages[0]?.content || '');
+          const allText = params.messages.map((m) => String(m.content || '')).join('\n');
+          if (/CRITICAL PLANNING INSTRUCTIONS/i.test(sys)) sawPlanning = true;
+          if (/LocalCoders Critic Agent/i.test(sys)) sawCritic = true;
+          if ((params.tools || []).some((t) => ['write_file', 'edit_file', 'delete_file'].includes(t?.function?.name))) {
+            sawWriteToolSchema = true;
+          }
+          if (/Add timing feature/i.test(allText)) sawOldPromptInRunContext = true;
+
+          turn++;
+          if (turn === 1) {
+            // Even if a local model tries hallucinating write_file alongside run_command, execute-only blocks the write!
+            onChunk({
+              content: '',
+              toolCalls: [
+                { function: { name: 'write_file', arguments: { path: 'clock.py', content: 'OVERWRITTEN' } } },
+                { function: { name: 'run_command', arguments: { command: 'python3 clock.py' } } },
+              ],
+              done: true,
+            });
+          } else {
+            onChunk({ content: 'Started clock.py cleanly (output: CLOCK_RUNNING_OK).', done: true });
+          }
+        },
+      };
+
+      const orchestrator = new AgentOrchestrator(mockLlm, registry, toolManager, tmpDir);
+      const priorHistory = [
+        { role: 'user', content: 'Add timing feature' },
+        { role: 'assistant', content: '### Execution Complete\nAll tasks completed successfully.' },
+      ];
+      const task = await orchestrator.submitTask(
+        'ok, now run the clock',
+        {
+          providerId: 'ollama',
+          modelId: 'qwen2.5-coder:7b',
+          modelName: 'qwen2.5-coder:7b',
+          reasoningEffort: 'medium',
+          fastMode: false,
+          executionMode: 'code',
+          permissionMode: 'bypass',
+          enabledMcpServers: [],
+          enabledSkills: [],
+          activeRules: [],
+          attachedFiles: [],
+          projectContext: [],
+        },
+        priorHistory
+      );
+
+      assert.strictEqual(task.status, 'completed');
+      assert.strictEqual(sawPlanning, false, 'Execute-only prompt must skip multi-step coding createPlan');
+      assert.strictEqual(sawCritic, false, 'Execute-only run with 0 file edits must not trigger Critic loop');
+      assert.strictEqual(sawWriteToolSchema, false, 'Write/edit tools must not be exposed in execute-only mode');
+      assert.strictEqual(sawOldPromptInRunContext, false, 'Prior coding goal must not pollute execute-only run prompt');
+      assert.strictEqual(
+        fs.readFileSync(path.join(tmpDir, 'clock.py'), 'utf8'),
+        originalCode,
+        'Existing finished clock.py on disk must remain untouched'
+      );
+    } finally {
+      vscode.workspace.workspaceFolders = origFolders;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('33. Agents modal renders per-subagent model dropdowns & instruction editors and orchestrator executes delegated tasks with subagent model + instructions', async () => {
+    const modals = require('../extensions/localcoders-core/dist/views/agent-cockpit-modals');
+    const modalScript = modals.getCockpitModalScript();
+    new vm.Script(modalScript, { filename: 'cockpit_modals_33.js' });
+
+    // Verify modal markup builders include subagent model selector & instruction textarea + Critic-parity options
+    assert.ok(modalScript.includes('data-subagent-model='), 'Subagents render per-agent model dropdowns');
+    assert.ok(modalScript.includes('data-subagent-prompt='), 'Subagents render editable instruction textareas');
+    assert.ok(modalScript.includes('cmSubagentModelSelect'), 'Create Subagent renders model dropdown like Critic Agent');
+    assert.ok(modalScript.includes('cmSubagentPrompt'), 'Create Subagent renders instruction textarea');
+    assert.ok(modalScript.includes('Same as coding model'), 'Subagent dropdown matches Critic model inheritance option');
+    assert.ok(modalScript.includes('cockpitUpdateSubagent'), 'Saves updated model and instructions per subagent');
+
+    // Verify runtime execution routes delegated subagent task to configured model & system instructions
+    const vscode = require('vscode');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-ev-33-'));
+    const origFolders = vscode.workspace.workspaceFolders;
+    vscode.workspace.workspaceFolders = [{ uri: { fsPath: tmpDir } }];
+    try {
+      const { PermissionManager } = require('../extensions/localcoders-core/dist/security/permission-manager');
+      const pm = new PermissionManager(tmpDir);
+      pm.setMode('bypass');
+      const tm = new ToolManager(undefined, pm);
+      const reg = makeRegistry(makeMockContext(tmpDir));
+      reg.setCriticConfig({ enabled: false, model: '', strictness: 'strict', reviewMode: 'changed_files' });
+      reg.updateSubagent('builtin_test', {
+        model: 'custom-test-model:latest',
+        systemPrompt: 'CUSTOM_SUBAGENT_DIRECTIVE: Use unittest with verbose docstrings.',
+      });
+
+      let sawSubagentModel = '';
+      let sawSubagentSystem = '';
+      const mockLlm = {
+        getHost: () => 'http://localhost:11434',
+        chatStream: async (params, onChunk) => {
+          const sys = String(params.messages[0]?.content || '');
+          const userAll = params.messages.map((m) => String(m.content || '')).join('\n');
+          if (/CRITICAL PLANNING INSTRUCTIONS/i.test(sys)) {
+            onChunk({
+              content:
+                '```json\n' +
+                JSON.stringify({
+                  tasks: [
+                    {
+                      id: 't1',
+                      title: 'Write Unit Tests in test_app.py',
+                      description: 'Write tests for app',
+                      assignedTo: 'builtin_test',
+                      dependencies: [],
+                      affectedFiles: ['test_app.py'],
+                    },
+                  ],
+                }) +
+                '\n```',
+              done: true,
+            });
+            return;
+          }
+          if (sys.includes('Test Engineer')) {
+            sawSubagentModel = params.model;
+            sawSubagentSystem = sys;
+            const hasTool = params.messages.some((m) => m.role === 'tool' || userAll.includes('[Tool Result'));
+            if (!hasTool) {
+              onChunk({
+                content: '',
+                toolCalls: [{ function: { name: 'write_file', arguments: { path: 'test_app.py', content: 'import unittest\nclass T(unittest.TestCase):\n  def test_a(self): self.assertTrue(True)\n' } } }],
+                done: true,
+              });
+              return;
+            }
+            onChunk({ content: 'Wrote test_app.py cleanly.', done: true });
+            return;
+          }
+          onChunk({ content: 'Done.', done: true });
+        },
+      };
+
+      const orchestrator = new AgentOrchestrator(mockLlm, reg, tm, tmpDir);
+      const task = await orchestrator.submitTask('Add unit tests in test_app.py', {
+        providerId: 'ollama',
+        modelId: 'qwen2.5-coder:7b',
+        modelName: 'qwen2.5-coder:7b',
+        reasoningEffort: 'medium',
+        fastMode: false,
+        executionMode: 'code',
+        permissionMode: 'bypass',
+        enabledMcpServers: [],
+        enabledSkills: [],
+        activeRules: [],
+        attachedFiles: [],
+        projectContext: [],
+      });
+
+      assert.strictEqual(task.status, 'completed');
+      assert.strictEqual(sawSubagentModel, 'custom-test-model:latest', 'Delegated subagent runs with its configured model');
+      assert.match(sawSubagentSystem, /CUSTOM_SUBAGENT_DIRECTIVE/, 'Delegated subagent receives user-written instructions');
+    } finally {
+      vscode.workspace.workspaceFolders = origFolders;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });

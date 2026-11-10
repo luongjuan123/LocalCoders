@@ -619,6 +619,49 @@ export function getActivityStreamStyles(): string {
       color: var(--vscode-textLink-foreground, #60a5fa);
       text-decoration: underline;
     }
+
+    /* Readable Agent Thought Entries inside Thinking Drawer */
+    .lc-thought-entry {
+      border-left: 2px solid color-mix(in srgb, var(--vscode-textLink-foreground, #60a5fa) 55%, transparent);
+      background: color-mix(in srgb, var(--vscode-editor-foreground, #e2e8f0) 3%, transparent);
+      border-radius: 0 6px 6px 0;
+      padding: 6px 10px;
+      margin: 2px 0;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .lc-thought-entry.running {
+      border-left-color: #38bdf8;
+    }
+    .lc-thought-meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--vscode-descriptionForeground, #94a3b8);
+    }
+    .lc-thought-agent {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      color: var(--vscode-editor-foreground, #e2e8f0);
+    }
+    .lc-thought-role {
+      font-weight: 400;
+      color: var(--vscode-descriptionForeground, #94a3b8);
+    }
+    .lc-thought-body {
+      font-size: 12px;
+      line-height: 1.5;
+      color: var(--vscode-descriptionForeground, #cbd5e1);
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 220px;
+      overflow-y: auto;
+    }
   `;
 }
 
@@ -770,9 +813,32 @@ export function getActivityClientScript(): string {
     function lcFormatTurnThinkingLabel(opts) {
       var list = Array.isArray(opts.activities) ? opts.activities : [];
       var isLive = !!opts.isLive;
+      var thoughtCount = 0;
+      var cmdCount = 0;
+      var fileCount = 0;
+      var actionCount = 0;
+      var latestThought = null;
+      for (var i = 0; i < list.length; i++) {
+        var it = list[i];
+        if (!it) continue;
+        if (it.category === 'thinking_summary') {
+          thoughtCount++;
+          latestThought = it;
+        } else {
+          actionCount++;
+          if (it.category === 'command') cmdCount++;
+          else if (it.category === 'file') fileCount++;
+        }
+      }
       if (isLive) {
         var phaseText = (opts.statusSummary || 'Analyzing the task').trim();
-        var countSuffix = list.length > 0 ? (' · ' + list.length + (list.length === 1 ? ' step' : ' steps')) : '';
+        if (latestThought && latestThought.status === 'running' && latestThought.summary) {
+          var who = latestThought.agentName || 'Agent';
+          var preview = String(latestThought.summary).replace(/\\s+/g, ' ').trim();
+          if (preview.length > 52) preview = preview.slice(0, 49) + '...';
+          phaseText = who + ': ' + preview;
+        }
+        var countSuffix = actionCount > 0 ? (' · ' + actionCount + (actionCount === 1 ? ' step' : ' steps')) : '';
         return 'Thinking · ' + phaseText + countSuffix;
       }
       if (list.length === 1 && list[0].command) {
@@ -780,13 +846,8 @@ export function getActivityClientScript(): string {
         if (cmd.length > 48) cmd = cmd.slice(0, 45) + '...';
         return 'Thinking · ' + cmd;
       }
-      var cmdCount = 0;
-      var fileCount = 0;
-      for (var i = 0; i < list.length; i++) {
-        if (list[i].category === 'command') cmdCount++;
-        else if (list[i].category === 'file') fileCount++;
-      }
       var parts = [];
+      if (thoughtCount > 0) parts.push(thoughtCount + (thoughtCount === 1 ? ' thought' : ' thoughts'));
       if (cmdCount > 0) parts.push(cmdCount + (cmdCount === 1 ? ' command' : ' commands'));
       if (fileCount > 0) parts.push(fileCount + (fileCount === 1 ? ' file' : ' files'));
       if (parts.length === 0 && list.length > 0) {
@@ -794,6 +855,27 @@ export function getActivityClientScript(): string {
       }
       if (parts.length === 0) return 'Thinking';
       return 'Thinking · ' + parts.join(', ');
+    }
+
+    function lcBuildThoughtEntryElement(act) {
+      var box = document.createElement('div');
+      var isRunning = act.status === 'running';
+      box.className = 'lc-thought-entry' + (isRunning ? ' running' : '');
+      box.setAttribute('data-act-id', act.id || '');
+      var bodyText = act.stdout || act.summary || '';
+      var roleHtml = act.agentRole ? '<span class="lc-thought-role">(' + lcEscapeHtml(act.agentRole) + ')</span>' : '';
+      var durHtml = act.durationMs ? ('<span>' + lcEscapeHtml(lcFormatDuration(act.durationMs)) + '</span>') : (isRunning ? '<span>thinking...</span>' : '');
+      box.innerHTML =
+        '<div class="lc-thought-meta">' +
+          '<span class="lc-thought-agent">' +
+            lcIcon('brain', 12) +
+            '<span>' + lcEscapeHtml(act.agentName || 'Main Agent') + '</span>' +
+            roleHtml +
+          '</span>' +
+          durHtml +
+        '</div>' +
+        '<div class="lc-thought-body">' + lcEscapeHtml(bodyText) + '</div>';
+      return box;
     }
 
     function lcBuildInlineThinkingGroup(opts) {
@@ -842,6 +924,10 @@ export function getActivityClientScript(): string {
       }
 
       activities.forEach(function (act) {
+        if (act && act.category === 'thinking_summary') {
+          drawer.appendChild(lcBuildThoughtEntryElement(act));
+          return;
+        }
         var expandedMap = opts.expandedActivityIds;
         var card = lcBuildActivityCardElement(
           act,

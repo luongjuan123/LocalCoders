@@ -8,7 +8,8 @@ import { ToolManager } from '../tools/tool-manager';
 import { ToolExecutionContext } from '../tools/types';
 import { OperationHistoryManager } from '../commands/operation-history';
 import { computeUnifiedLineDiff } from '../context/changes-manager';
-import { extractBalancedJsonObjects } from './events';
+import { AgentStreamEvent, extractBalancedJsonObjects } from './events';
+import { createTurnThoughtTracker } from './tool-runner';
 
 const IGNORED_REVIEW_DIRS = new Set(['.git', 'node_modules', 'venv', '.venv', '.localcoders', '__pycache__', 'dist', 'out']);
 
@@ -50,6 +51,9 @@ export class CriticAgent {
     targetCommit?: string;
     changedFiles?: string[];
     verificationSummary?: string;
+    runId?: string;
+    round?: number;
+    onStreamEvent?: (ev: AgentStreamEvent) => void;
     onProgress?: (status: string) => void;
     abortSignal?: AbortSignal;
   }): Promise<CriticReport> {
@@ -109,7 +113,9 @@ AUDIT CATEGORIES TO EVALUATE:
 RULES:
 - Never invent problems. Every finding MUST cite verifiable evidence in the diff, source files, or test output.
 - If automated verification failed or a file contains syntax errors/corrupted JSON/wrong code, ALWAYS return "blocker" or "changes_requested" with exact file and recommendedFix.
-- Do not complain about personal stylistic preferences (spacing, quote styles) as bugs.
+- Assign "Critical" or "High" severity ONLY to real defects: failing tests, syntax/import/runtime errors, security vulnerabilities, race conditions, or clearly unmet user requirements.
+- Classify stylistic preferences, naming choices, or optional cleanup (e.g. redundant helper methods when tests pass) strictly as "Low" or "Informational" — NEVER mark working code with "Critical" or "blocker" over optional refactoring.
+- Do not block completion when automated verification passed (Exit code: 0) and there are no real runtime, security, or requirement defects.
 - If the implementation and verification are completely solid and free of defects, return an empty findings list and "verdict": "approved".
 
 OUTPUT FORMAT:
@@ -149,9 +155,20 @@ ${ctx.fileSnapshotsText ? `\nCURRENT WORKSPACE FILE CONTENTS ON DISK:\n${ctx.fil
 Please audit the implementation thoroughly according to your review strictness and return valid JSON.`;
 
     let responseContent = '';
+    let responseThinking = '';
+    const criticThought = createTurnThoughtTracker({
+      runId: params.runId || 'run_default',
+      agentId: 'critic',
+      agentName: 'Critic Agent',
+      agentRole: 'Code Quality & Security Critic',
+      title: params.round ? `Critic Reasoning (Round ${params.round})` : 'Critic Reasoning',
+      stepKey: `r${params.round || 1}`,
+      onStreamEvent: params.onStreamEvent,
+    });
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
         responseContent = '';
+        responseThinking = '';
         try {
           await this.llmRouter.chatStream(
             {
@@ -164,6 +181,8 @@ Please audit the implementation thoroughly according to your review strictness a
             },
             (chunk) => {
               responseContent += chunk.content;
+              if (chunk.thinking) responseThinking += chunk.thinking;
+              criticThought.updateFromStream(responseContent, responseThinking);
             },
             params.abortSignal
           );
@@ -184,6 +203,7 @@ Please audit the implementation thoroughly according to your review strictness a
         }
       }
     } catch (err: any) {
+      criticThought.finalize(responseContent, responseThinking, `Critic review halted: ${err?.message || 'error'}`);
       if (params.abortSignal?.aborted || /cancelled/i.test(err?.message || '')) {
         throw err;
       }
@@ -216,6 +236,11 @@ Please audit the implementation thoroughly according to your review strictness a
     }
 
     const parsed = this.parseCriticResponse(responseContent);
+    criticThought.finalize(
+      responseContent,
+      responseThinking,
+      `Audited ${ctx.filesReviewed.join(', ') || 'workspace changes'} -> ${parsed.verdict.toUpperCase()}: ${parsed.summary}`
+    );
     return {
       id: reportId,
       timestamp,

@@ -144,42 +144,7 @@ export function getSlashCommandStyles(): string {
       gap: 8px;
     }
 
-    /* Active Bypass Permission Indicator */
-    .lc-bypass-indicator {
-      display: none;
-      align-items: center;
-      gap: 6px;
-      padding: 3px 9px;
-      margin-bottom: 6px;
-      border-radius: 6px;
-      background: rgba(245, 158, 11, 0.12);
-      border: 1px solid rgba(245, 158, 11, 0.35);
-      color: #fbbf24;
-      font-size: 11px;
-      font-weight: 600;
-      justify-content: space-between;
-    }
-    .lc-bypass-indicator.active {
-      display: flex;
-    }
-    .lc-bypass-indicator-left {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-    }
-    .lc-bypass-reset-btn {
-      background: rgba(245, 158, 11, 0.16);
-      border: 1px solid rgba(245, 158, 11, 0.38);
-      color: #fde68a;
-      border-radius: 4px;
-      font-size: 10.5px;
-      padding: 1px 7px;
-      cursor: pointer;
-      font-family: inherit;
-    }
-    .lc-bypass-reset-btn:hover {
-      background: rgba(245, 158, 11, 0.28);
-    }
+    /* Active Bypass Permission Pill Highlight */
     .tool-btn-pill.bypass-active {
       border-color: rgba(245, 158, 11, 0.45);
       background: rgba(245, 158, 11, 0.14);

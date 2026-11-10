@@ -5,6 +5,7 @@ import { AgentMessage, TaskPlanItem, CriticReport } from '../agents/types';
 import { ExecutionActivityItem, SafeAgentPhase } from '../agents/events';
 import { ReasoningEffort } from '../models/model-provider-registry';
 import type { CommandResult } from '../commands/types';
+import type { PersistedQueueState } from './message-queue';
 
 export type ExecutionMode = 'code' | 'smart' | 'ask' | 'plan';
 export type PermissionMode = 'ask' | 'smart' | 'bypass';
@@ -59,6 +60,7 @@ export interface SessionData {
   activities?: ExecutionActivityItem[];
   commandResults?: CommandResult[];
   criticReport?: CriticReport | null;
+  queueState?: PersistedQueueState;
   archived: boolean;
 }
 
@@ -273,9 +275,13 @@ export class SessionManager {
     }
   }
 
-  public updateActiveSession(updater: (session: SessionData) => void) {
-    const session = this.getActiveSession();
-    if (!session) return;
+  public updateSession(
+    sessionId: string,
+    updater: (session: SessionData) => void,
+    options?: { silent?: boolean }
+  ): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
     updater(session);
     if (session.messages && session.messages.length > 1) {
       const seen = new Set<string>();
@@ -301,7 +307,35 @@ export class SessionManager {
     }
     session.updatedAt = Date.now();
     this.saveSession(session);
-    this._onDidChangeSessions.fire();
+    if (!options?.silent) {
+      this._onDidChangeSessions.fire();
+    }
+    return true;
+  }
+
+  public updateActiveSession(updater: (session: SessionData) => void) {
+    if (!this.activeSessionId) return;
+    this.updateSession(this.activeSessionId, updater);
+  }
+
+  public getQueueState(sessionId: string): PersistedQueueState | undefined {
+    return this.sessions.get(sessionId)?.queueState;
+  }
+
+  public saveQueueState(
+    sessionId: string,
+    queueState: PersistedQueueState,
+    options?: { silent?: boolean }
+  ): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    session.queueState = queueState;
+    session.updatedAt = Date.now();
+    this.saveSession(session);
+    if (!options?.silent) {
+      this._onDidChangeSessions.fire();
+    }
+    return true;
   }
 
   public updateActiveConfig(updater: (config: AgentSessionConfig) => void): SessionData | undefined {

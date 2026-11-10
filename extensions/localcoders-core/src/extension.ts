@@ -6,6 +6,7 @@ import { ToolManager } from './tools/tool-manager';
 import { AgentOrchestrator } from './agents/orchestrator';
 import { SessionManager } from './sessions/session-manager';
 import { ChangesManager } from './context/changes-manager';
+import { MessageQueueManager } from './sessions/message-queue';
 import { SetupWizardPanel } from './views/wizard-view';
 import { ModelManagerPanel } from './views/model-manager-view';
 import { AgentWorkspaceEditorPanel } from './views/agent-workspace-editor';
@@ -35,6 +36,7 @@ let activeOrchestrator: AgentOrchestrator | null = null;
 let activeOllamaClient: OllamaClient | null = null;
 let activeMcpHost: McpHost | null = null;
 let activePermissionManager: PermissionManager | null = null;
+let activeQueueManager: MessageQueueManager | null = null;
 let isDeactivating = false;
 
 export async function activate(context: vscode.ExtensionContext) {
@@ -58,11 +60,23 @@ export async function activate(context: vscode.ExtensionContext) {
   const orchestrator = new AgentOrchestrator(ollama, registry, toolManager, workspaceRoot, modelRegistry);
   const sessionManager = new SessionManager(context, workspaceRoot);
   const changesManager = new ChangesManager(workspaceRoot);
+  const queueManager = MessageQueueManager.getOrCreateShared({
+    sessionManager,
+    orchestrator,
+    modelRegistry,
+    changesManager,
+    permissionManager,
+    toolManager,
+    registry,
+    mcpHost,
+    ollama,
+  });
 
   activeOrchestrator = orchestrator;
   activeOllamaClient = ollama;
   activeMcpHost = mcpHost;
   activePermissionManager = permissionManager;
+  activeQueueManager = queueManager;
 
   // Ensure Main Agent exists without hardcoding unavailable models
   if (!registry.getMainAgent()) {
@@ -89,6 +103,7 @@ export async function activate(context: vscode.ExtensionContext) {
         changesManager.setWorkspace(newRoot);
         permissionManager.setWorkspace(newRoot);
         mcpHost.setWorkspace(newRoot);
+        queueManager.hydrateFromSessions();
       }
     })
   );
@@ -162,7 +177,8 @@ export async function activate(context: vscode.ExtensionContext) {
     toolManager,
     registry,
     mcpHost,
-    changesManager
+    changesManager,
+    queueManager
   );
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatViewProvider)
@@ -220,7 +236,7 @@ export async function activate(context: vscode.ExtensionContext) {
   );
 
   // 3. Mode State & Commands
-  AgentWorkspaceEditorPanel.configureServices(registry, mcpHost);
+  AgentWorkspaceEditorPanel.configureServices(registry, mcpHost, queueManager);
   let currentMode: 'agent' | 'ide' = config.get<'agent' | 'ide'>('defaultView', 'agent') === 'ide' ? 'ide' : 'agent';
   let isEnforcingSingleAgentTab = false;
 
@@ -233,7 +249,8 @@ export async function activate(context: vscode.ExtensionContext) {
       changesManager,
       modelRegistry,
       toolManager,
-      permissionManager
+      permissionManager,
+      queueManager
     );
 
   const enforceSingleAgentTab = async () => {
@@ -412,7 +429,10 @@ export async function activate(context: vscode.ExtensionContext) {
         placeHolder: 'e.g. Implement user authentication with password hashing and tests',
       });
       if (prompt) {
-        orchestrator.submitTask(prompt);
+        await queueManager.submitMessage({
+          sessionId: sessionManager.getActiveSession()?.id,
+          content: prompt,
+        });
       }
     }),
 
@@ -545,7 +565,11 @@ export async function activate(context: vscode.ExtensionContext) {
 
       const fileRel = path.relative(workspaceRoot, editor.document.uri.fsPath);
       vscode.window.showInformationMessage(`LocalCoders: Critic auditing '${fileRel}'...`);
-      await orchestrator.submitTask(`Review and audit file '${fileRel}' for edge cases, bugs, and security weaknesses.`);
+      await queueManager.submitMessage({
+        sessionId: sessionManager.getActiveSession()?.id,
+        content: `Review and audit file '${fileRel}' for edge cases, bugs, and security weaknesses.`,
+        attachments: [editor.document.uri.fsPath],
+      });
     }),
 
     vscode.commands.registerCommand('localcoders.explainSelection', async () => {
@@ -555,7 +579,11 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
       }
       const text = editor.document.getText(editor.selection);
-      await orchestrator.submitTask(`Explain this code snippet:\n\`\`\`\n${text}\n\`\`\``);
+      await queueManager.submitMessage({
+        sessionId: sessionManager.getActiveSession()?.id,
+        content: `Explain this code snippet:\n\`\`\`\n${text}\n\`\`\``,
+        attachments: [editor.document.uri.fsPath],
+      });
     }),
 
     vscode.commands.registerCommand('localcoders.refactorSelection', async () => {
@@ -566,9 +594,11 @@ export async function activate(context: vscode.ExtensionContext) {
       }
       const text = editor.document.getText(editor.selection);
       const fileRel = path.relative(workspaceRoot, editor.document.uri.fsPath);
-      await orchestrator.submitTask(
-        `Refactor the following code in '${fileRel}' to improve readability and eliminate code smells while preserving behavior:\n\`\`\`\n${text}\n\`\`\``
-      );
+      await queueManager.submitMessage({
+        sessionId: sessionManager.getActiveSession()?.id,
+        content: `Refactor the following code in '${fileRel}' to improve readability and eliminate code smells while preserving behavior:\n\`\`\`\n${text}\n\`\`\``,
+        attachments: [editor.document.uri.fsPath],
+      });
     }),
 
     vscode.commands.registerCommand('localcoders.generateTests', async () => {
@@ -579,12 +609,15 @@ export async function activate(context: vscode.ExtensionContext) {
       }
       const text = editor.document.getText(editor.selection);
       const fileRel = path.relative(workspaceRoot, editor.document.uri.fsPath);
-      await orchestrator.submitTask(
-        `Generate comprehensive unit tests covering edge cases and boundary conditions for this code in '${fileRel}':\n\`\`\`\n${text}\n\`\`\``
-      );
+      await queueManager.submitMessage({
+        sessionId: sessionManager.getActiveSession()?.id,
+        content: `Generate comprehensive unit tests covering edge cases and boundary conditions for this code in '${fileRel}':\n\`\`\`\n${text}\n\`\`\``,
+        attachments: [editor.document.uri.fsPath],
+      });
     }),
 
     vscode.commands.registerCommand('localcoders.stopAllAgents', () => {
+      queueManager.cancelActiveTask();
       orchestrator.cancelTask();
       vscode.window.showInformationMessage('LocalCoders: All running agent executions stopped.');
     }),
@@ -696,6 +729,9 @@ export async function deactivate(): Promise<void> {
   isDeactivating = true;
   console.log('[LocalCoders] Closing IDE: Stopping active tasks, unloading Ollama models, stopping local Ollama server, and freeing GPU/RAM...');
   try {
+    if (activeQueueManager) {
+      activeQueueManager.cancelActiveTask();
+    }
     if (activeOrchestrator) {
       activeOrchestrator.cancelTask();
     }

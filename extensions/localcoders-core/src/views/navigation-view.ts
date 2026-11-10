@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
-import { getLucideCss, getLucideClientScript, lucideSvg, getLocalCodersLogoSvg } from './lucide-icons';
-import { getSessionsBarStyles, getSessionsBarClientScript } from './sessions-bar-ui';
+import { getLucideCss, getLucideClientScript, lucideSvg } from './lucide-icons';
+import { getSessionsBarStyles, getSessionsBarClientScript, getUserProfileBadgeMarkup } from './sessions-bar-ui';
 import { SessionManager, SessionData } from '../sessions/session-manager';
 import { OllamaClient } from '../ollama/client';
 import { ModelProviderRegistry } from '../models/model-provider-registry';
@@ -179,15 +179,7 @@ export class NavigationViewProvider implements vscode.WebviewViewProvider {
       display: flex;
       align-items: center;
       justify-content: space-between;
-    }
-    .profile-name {
-      font-weight: 600;
-      color: var(--fg);
-      font-size: 12px;
-      letter-spacing: 0.01em;
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
+      gap: 8px;
     }
     .btn-icon {
       background: transparent;
@@ -338,7 +330,7 @@ export class NavigationViewProvider implements vscode.WebviewViewProvider {
 </head>
 <body>
   <div class="profile-card">
-    <span class="profile-name">${getLocalCodersLogoSvg(18)}<span>LocalCoders</span></span>
+    ${getUserProfileBadgeMarkup()}
     <button class="btn-icon" id="btn-settings" title="Settings">${lucideSvg('settings', 14)}</button>
   </div>
 
@@ -522,7 +514,6 @@ export class NavigationViewProvider implements vscode.WebviewViewProvider {
               '</div>' +
             '</div>' +
             '<div class="lc-sess-meta">' +
-              '<span class="lc-sess-meta-icon">' + lcIcon('session-node', 11) + '</span>' +
               '<span class="lc-sess-time">' + escapeHtml(formatTimeAgo(s.updatedAt || s.createdAt)) + '</span>' +
             '</div>' +
           '</div>';

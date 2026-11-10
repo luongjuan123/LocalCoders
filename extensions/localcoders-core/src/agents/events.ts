@@ -154,6 +154,57 @@ export function sanitizeAssistantContent(raw: string): string {
 }
 
 /**
+ * Extracts human-readable internal reasoning (<think>, <thought>, <analysis>, raw chunk.thinking,
+ * and pre-tool explanation prose) for display inside the Thinking drawer while stripping tool/JSON noise.
+ */
+export function extractAgentReasoningText(
+  rawContent: string,
+  rawThinking?: string,
+  fallbackNote?: string
+): string {
+  const parts: string[] = [];
+  const cleanThinking = String(rawThinking || '').trim();
+  if (cleanThinking) {
+    parts.push(cleanThinking);
+  }
+
+  const contentStr = String(rawContent || '');
+  const tagRe = /<(think|thought|analysis)>([\s\S]*?)(?:<\/\1>|$)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = tagRe.exec(contentStr)) !== null) {
+    const inner = (m[2] || '').trim();
+    if (inner && !parts.includes(inner)) {
+      parts.push(inner);
+    }
+  }
+
+  // Include non-code/non-JSON explanatory prose emitted alongside tool calls
+  let prose = sanitizeAssistantContent(contentStr)
+    .replace(/<thought>[\s\S]*?(?:<\/thought>|$)/gi, '')
+    .replace(/```[\s\S]*?(?:```|$)/g, '')
+    .trim();
+  if (prose && !/^\s*[\[{]/.test(prose)) {
+    // Strip trailing partial JSON object fragments
+    const firstBrace = prose.indexOf('{');
+    if (firstBrace > 0 && /"(?:name|tool|tasks|verdict|findings)"/.test(prose.slice(firstBrace))) {
+      prose = prose.slice(0, firstBrace).trim();
+    }
+    if (prose && !parts.some((p) => p.includes(prose))) {
+      parts.push(prose);
+    }
+  }
+
+  let combined = parts.join('\n\n').replace(/\n{3,}/g, '\n\n').trim();
+  if (!combined && fallbackNote) {
+    combined = fallbackNote.trim();
+  }
+  if (combined.length > 3000) {
+    combined = combined.slice(0, 2997) + '...';
+  }
+  return combined;
+}
+
+/**
  * Filters raw activity strings to prevent leaking internal chain-of-thought or token counters.
  * Returns a safe status summary instead of "Thinking: ..." or "Generating implementation (19 tokens)...".
  */
@@ -352,7 +403,7 @@ export function isPlanExplicitlyRequested(prompt: string, executionMode?: string
   return /\b(plan|roadmap|steps|architecture plan|outline|design doc|implementation plan)\b/.test(p);
 }
 
-export type PromptIntent = 'greeting' | 'question' | 'coding_task' | 'plan';
+export type PromptIntent = 'greeting' | 'question' | 'execute_task' | 'coding_task' | 'plan';
 
 const CONVERSATIONAL_GREETINGS = new Set([
   'hi',
@@ -411,14 +462,38 @@ const CONVERSATIONAL_GREETINGS = new Set([
   'can you help me',
 ]);
 
+const CODE_AUTHORING_VERBS_REGEX =
+  /\b(write|create|fix|implement|add|modify|change|refactor|delete|remove|edit|build|install|setup|generate|make|update|deploy|optimize|clean|rename|move|append|insert|replace|apply|debug|solve|patch|convert|port|migrate|improve|enhance|redesign|upgrade|style|format|lint|rewrite|scaffold|configure|enable|disable|integrate|connect|compile|init|initialize|document|commit|push|pull|clone|revert|undo)\b/i;
+
+const EXECUTE_ONLY_VERBS_REGEX =
+  /\b(run|execute|launch|start|serve|boot|open|re-?run|rerun|restart)\b/i;
+
+const CLI_RUN_PREFIX_REGEX =
+  /^(?:python(?:3)?|node|npm|npx|pnpm|yarn|pytest|cargo|go|uvicorn|flask|vite|streamlit)\s+/i;
+
+const HOW_TO_QUESTION_REGEX =
+  /^(?:how\s+(?:do|can|to|should|would)\b|what\s+(?:command|script|does|is|are)\b|which\s+(?:command|script|file)\b|why\s+(?:does|doesn't|did|is|won't)\b)/i;
+
 const ACTION_MUTATION_REGEX =
-  /\b(write|create|fix|implement|add|modify|change|refactor|delete|remove|edit|build|run|test|install|setup|generate|make|update|deploy|commit|optimize|clean|rename|move|append|insert|replace|apply|execute|start|stop|kill|debug|solve|patch|convert|port|migrate)\b/i;
+  /\b(write|create|fix|implement|add|modify|change|refactor|delete|remove|edit|build|run|test|install|setup|generate|make|update|deploy|commit|optimize|clean|rename|move|append|insert|replace|apply|execute|start|stop|kill|debug|solve|patch|convert|port|migrate|improve|enhance|redesign|upgrade|style|format|lint|rewrite|scaffold|configure|enable|disable|integrate|connect|compile|serve|restart|push|pull|clone|revert|undo|init|initialize|document)\b/i;
 
 const INFORMATIONAL_STARTER_REGEX =
   /^(what|why|how|when|where|who|which|explain|describe|summarize|list|show me|tell me|can you explain|can you describe|can you tell|can you check|could you explain|could you tell|is there|is this|is it|are there|does|do)\b/i;
 
 const LEADING_GREETING_PREFIX_REGEX =
   /^(?:hi+|hello+|hey+|yo|hola|howdy|greetings|good\s+(?:morning|afternoon|evening|night)|ok(?:ay)?|sure|thanks?(?:\s+you)?)(?:\s+(?:there|localcoders|assistant|agent|ai|bot))?[\s,!.~:;?]+/i;
+
+const CODE_TASK_DOMAIN_REGEX =
+  /\b(file|files|folder|directory|code|codebase|bug|bugs|error|errors|exception|traceback|function|method|class|interface|type|module|package|library|dependency|dependencies|script|program|python|typescript|javascript|node|npm|pip|pytest|unittest|react|vue|html|css|sql|git|github|branch|commit|pr|diff|repo|repository|project|workspace|terminal|shell|command|cli|server|endpoint|route|api|database|db|schema|table|query|auth|login|feature|app|application|ui|ux|component|widget|button|form|page|screen|view|layout|theme|icon|logo|sidebar|header|footer|config|settings|env|yaml|json|readme|docs|documentation|test|tests|spec|clock|alarm|timer|stopwatch)\b/i;
+
+const CASUAL_SELF_INTRO_REGEX =
+  /^(?:my name(?:\s+is|'s)?|i am|i['’]?m|call me|you can call me|just call me|people call me|(?:please\s+)?remember(?:\s+that)?\s+(?:my|i)\b|don'?t forget(?:\s+that)?\s+(?:my|i)\b|nice to meet you|pleased to meet you|glad to meet you)\b/i;
+
+const PERSONAL_MEMORY_QUERY_REGEX =
+  /^(?:what(?:\s+is|'s)\s+my\s+name|who\s+am\s+i|do\s+you\s+(?:know|remember)\s+(?:my\s+name|who\s+i\s+am|me)|can\s+you\s+remember\s+(?:my\s+name|that|this|me)(?:\s+if\s+i\s+tell\s+you)?)\b/i;
+
+const SHORT_SOCIAL_ACK_REGEX =
+  /^(?:yes|yeah|yep|yup|no|nope|nah|maybe|perhaps|alright|fine|ok|okay|sure|k|lol|lmao|haha+|hehe+|wow|omg|oh|hmm+|ah+|sorry|my bad|no problem|np|you(?:\s+are|'re)\s+welcome|good\s+(?:job|work|luck|point)|well\s+done|never\s*mind|nevermind|forget\s+it|i\s+see|makes\s+sense|just\s+kidding|jk|have\s+a\s+(?:good|great|nice)\s+(?:day|night|one)|see\s+you(?:\s+later)?|take\s+care)(?:\s+(?:localcoders|assistant|agent|ai|bot|buddy|friend|thanks|thank you))?[\s,!.~:;?]*$/i;
 
 function normalizeCasualPhrasing(text: string): string {
   return (text || '')
@@ -445,36 +520,46 @@ function stripLeadingGreeting(text: string): string {
 
 /**
  * Classifies prompt complexity & intent before entering the heavy planning/tool/critic pipeline.
- * Ensures simple greetings and read-only questions never trigger multi-step coding execution.
+ * Ensures simple greetings, casual social chat, and read-only questions never trigger coding execution.
  */
 export function classifyUserPrompt(prompt: string, executionMode: string = 'code'): PromptIntent {
   const raw = (prompt || '').trim();
   const lower = normalizeCasualPhrasing(raw);
   const bodyAfterGreeting = stripLeadingGreeting(lower);
+  const candidate = bodyAfterGreeting || lower;
 
-  const hasFileOrPath = /\.[a-z0-9]{1,5}\b/i.test(raw) || /[\\\/`]/.test(raw);
-  const hasCodeTaskWords =
-    /\b(file|code|bug|error|function|class|script|python|typescript|javascript|repo|project|workspace|terminal|server|api|feature|app|module|alarm|clock)\b/i.test(
-      lower
-    );
+  const hasFileOrPath = /\.[a-z][a-z0-9]{0,5}\b/.test(raw) || /[\\\/`]/.test(raw);
+  const hasCodeTaskWords = CODE_TASK_DOMAIN_REGEX.test(lower);
+  const hasActionVerb = ACTION_MUTATION_REGEX.test(candidate);
+  const hasCodeIdentifier = /\b[a-z]+_[a-z0-9_]+\b|\b[a-z]+[A-Z][a-zA-Z0-9]*\b/.test(raw);
 
-  // Check lightweight conversational openers / identity questions first across modes
-  if (raw.length > 0 && raw.length <= 100 && !hasFileOrPath && !hasCodeTaskWords && !ACTION_MUTATION_REGEX.test(lower)) {
-    const normalizeForGreetingSet = (s: string) =>
-      s
-        .replace(/[!?.~,;:'"()]+/g, ' ')
-        .replace(/\b(there|localcoders|assistant|agent|ai|bot|buddy|friend|please|pls)\b/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-    const normFull = normalizeForGreetingSet(lower);
-    const normStripped = normalizeForGreetingSet(bodyAfterGreeting);
+  // Check lightweight conversational openers, social pleasantries, self-introductions, and personal memory queries
+  if (raw.length > 0 && raw.length <= 160 && !hasFileOrPath && !hasCodeTaskWords) {
     if (
-      CONVERSATIONAL_GREETINGS.has(normFull) ||
-      (normStripped === '' && normFull.length > 0) ||
-      CONVERSATIONAL_GREETINGS.has(normStripped)
+      CASUAL_SELF_INTRO_REGEX.test(candidate) ||
+      PERSONAL_MEMORY_QUERY_REGEX.test(candidate) ||
+      SHORT_SOCIAL_ACK_REGEX.test(lower)
     ) {
       return 'greeting';
+    }
+
+    if (raw.length <= 100 && !ACTION_MUTATION_REGEX.test(lower)) {
+      const normalizeForGreetingSet = (s: string) =>
+        s
+          .replace(/[!?.~,;:'"()]+/g, ' ')
+          .replace(/\b(there|localcoders|assistant|agent|ai|bot|buddy|friend|please|pls)\b/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+
+      const normFull = normalizeForGreetingSet(lower);
+      const normStripped = normalizeForGreetingSet(bodyAfterGreeting);
+      if (
+        CONVERSATIONAL_GREETINGS.has(normFull) ||
+        (normStripped === '' && normFull.length > 0) ||
+        CONVERSATIONAL_GREETINGS.has(normStripped)
+      ) {
+        return 'greeting';
+      }
     }
   }
 
@@ -486,14 +571,102 @@ export function classifyUserPrompt(prompt: string, executionMode: string = 'code
   }
 
   // In 'code' and 'smart' modes, route purely informational questions cleanly without coding plans/tools
-  const candidateQuestion = bodyAfterGreeting || lower;
-  if (!ACTION_MUTATION_REGEX.test(candidateQuestion)) {
-    if (INFORMATIONAL_STARTER_REGEX.test(candidateQuestion) || /\?\s*$/.test(raw)) {
+  if (!hasActionVerb) {
+    if (INFORMATIONAL_STARTER_REGEX.test(candidate) || /\?\s*$/.test(raw)) {
       return 'question';
     }
+  } else if (
+    !CODE_AUTHORING_VERBS_REGEX.test(candidate) &&
+    HOW_TO_QUESTION_REGEX.test(candidate) &&
+    /\?\s*$/.test(raw)
+  ) {
+    return 'question';
+  }
+
+  // Detect execute/run/launch requests ("ok, now run the clock", "run clock.py", "start the server")
+  // that have execution verbs and NO code-authoring/mutation verbs so existing files are run without being rewritten.
+  if (
+    !CODE_AUTHORING_VERBS_REGEX.test(lower) &&
+    (EXECUTE_ONLY_VERBS_REGEX.test(candidate) || CLI_RUN_PREFIX_REGEX.test(candidate))
+  ) {
+    return 'execute_task';
+  }
+
+  // Require at least one software/engineering/action signal before entering coding pipeline;
+  // arbitrary casual chat statements ("My dog is happy", "Nigfa", etc.) stay in fast chat mode.
+  if (!hasActionVerb && !hasFileOrPath && !hasCodeTaskWords && !hasCodeIdentifier) {
+    return 'greeting';
   }
 
   return 'coding_task';
+}
+
+/**
+ * Strips cancelled task turn groups from raw session history so an interrupted instruction
+ * does not leak into subsequent greetings, Q&A, or unrelated future tasks.
+ */
+export function stripCancelledTurnsFromHistory(
+  history: Array<{ role: string; content: string }> | undefined
+): Array<{ role: string; content: string }> {
+  if (!history || history.length === 0) return [];
+  const out: Array<{ role: string; content: string }> = [];
+
+  for (const m of history) {
+    const content = (m.content || '').trim();
+    const isCancelMarker =
+      /^### Execution Cancelled\b/i.test(content) ||
+      /^Execution cancelled by user\b/i.test(content);
+
+    if (isCancelMarker) {
+      // Remove any intermediate assistant plan/failure messages and the preceding user prompt of this cancelled turn
+      while (out.length > 0 && out[out.length - 1].role !== 'user') {
+        out.pop();
+      }
+      if (out.length > 0 && out[out.length - 1].role === 'user') {
+        out.pop();
+      }
+      continue;
+    }
+
+    out.push(m);
+  }
+
+  return out;
+}
+
+/**
+ * Filters sanitized history to strictly alternating completed (user -> assistant) pairs,
+ * dropping orphaned/unanswered user prompts so they never collide with the user's new message.
+ */
+export function pairConversationHistory(
+  history: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> | undefined,
+  maxPairs: number = 3
+): Array<{ role: 'system' | 'user' | 'assistant'; content: string }> {
+  if (!history || history.length === 0) return [];
+
+  let compactedSystem: { role: 'system'; content: string } | null = null;
+  let pendingUser: { role: 'user'; content: string } | null = null;
+  const pairs: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+
+  for (const m of history) {
+    if (m.role === 'system') {
+      compactedSystem = { role: 'system', content: m.content };
+      continue;
+    }
+    if (m.role === 'user') {
+      // Overwrite any earlier user message that never got a surviving assistant response
+      pendingUser = { role: 'user', content: m.content };
+      continue;
+    }
+    if (m.role === 'assistant' && pendingUser) {
+      pairs.push(pendingUser, { role: 'assistant', content: m.content });
+      pendingUser = null;
+    }
+  }
+
+  const maxMsgs = Math.max(2, maxPairs * 2);
+  const sliced = pairs.slice(-maxMsgs);
+  return compactedSystem ? [compactedSystem, ...sliced] : sliced;
 }
 
 /**

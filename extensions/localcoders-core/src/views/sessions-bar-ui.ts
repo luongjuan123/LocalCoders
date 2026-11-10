@@ -4,8 +4,71 @@
  * section, dot/chevron left gutter, 2-line title + node/timestamp meta row, and matte active pill.
  */
 
+import * as os from 'os';
+
+function escapeProfileHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+export function getDeviceUsername(): string {
+  let detected = '';
+  try {
+    detected = os.userInfo()?.username || '';
+  } catch {
+    detected = '';
+  }
+  const resolved = (detected || process.env.USER || process.env.USERNAME || 'user').trim();
+  return resolved || 'user';
+}
+
+export function getUserProfileBadgeMarkup(username?: string): string {
+  const rawName = (username !== undefined ? username : getDeviceUsername()).trim() || 'user';
+  const safeName = escapeProfileHtml(rawName);
+  const firstChar = Array.from(rawName)[0] || 'U';
+  const safeInitial = escapeProfileHtml(firstChar.toUpperCase());
+  return `<span class="lc-user-badge" title="${safeName}"><span class="lc-user-avatar" aria-hidden="true">${safeInitial}</span><span class="lc-user-name">${safeName}</span></span>`;
+}
+
 export function getSessionsBarStyles(): string {
   return `
+    /* Logged-in OS User Sidebar Profile Badge */
+    .lc-user-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      flex: 1;
+    }
+    .lc-user-avatar {
+      width: 20px;
+      height: 20px;
+      border-radius: 50%;
+      background: color-mix(in srgb, var(--fg, #e4e4e7) 12%, transparent);
+      border: 1px solid color-mix(in srgb, var(--fg, #e4e4e7) 20%, transparent);
+      color: var(--fg, #f4f4f5);
+      font-size: 10.5px;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      user-select: none;
+    }
+    .lc-user-name {
+      font-size: 12.5px;
+      font-weight: 600;
+      color: var(--fg, #e4e4e7);
+      letter-spacing: 0.01em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
     /* Minimalist Sessions Bar Header */
     .lc-sessions-header {
       padding: 10px 12px 6px 14px;
@@ -308,12 +371,6 @@ export function getSessionsBarStyles(): string {
       line-height: 1.25;
       color: var(--text-muted, #8b8f98);
       min-width: 0;
-    }
-    .lc-sess-meta-icon {
-      display: inline-flex;
-      align-items: center;
-      color: var(--text-muted, #71717a);
-      flex-shrink: 0;
     }
     .lc-sess-time {
       white-space: nowrap;

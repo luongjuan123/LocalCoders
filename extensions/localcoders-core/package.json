@@ -342,6 +342,12 @@
           "default": "strict",
           "description": "Review strictness of the Critic Agent"
         },
+        "localcoders.maxCriticCycles": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Maximum Code -> Critic -> Fix review cycles per task (0 = unlimited until approved or cancelled by user)"
+        },
         "localcoders.requireApprovalForEdits": {
           "type": "boolean",
           "default": true,
@@ -357,6 +363,11 @@
           "type": "number",
           "default": 3,
           "description": "Maximum number of subagents running concurrently"
+        },
+        "localcoders.queueCapacity": {
+          "type": "number",
+          "default": 200,
+          "description": "Maximum number of pending queued messages allowed per session as a resource-protection cap"
         }
       }
     }

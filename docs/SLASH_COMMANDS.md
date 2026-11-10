@@ -13,7 +13,7 @@ LocalCoders provides a centralized, extensible slash-command architecture across
 | `src/commands/registry.ts` | Central singleton `SlashCommandRegistry` storing built-in, workspace (`.localcoders/commands/*.json`), user (`~/.localcoders/commands/*.json`), and external plugin/MCP commands (`registerExternalCommand`). |
 | `src/commands/executor.ts` | `SlashCommandExecutor` pipeline: syntax parsing, registry lookup with fuzzy typo hints, concurrent duplicate suppression, abort-signal checks, mode/workspace/argument validation, permission & prohibited-pattern enforcement, confirmation handling, secret redaction, and audit logging. |
 | `src/commands/operation-history.ts` | Workspace-scoped undo/redo stack (`OperationHistoryManager`) populated by `writeFileTool`, `editFileTool`, `renameFileTool`, and `deleteFileTool`. |
-| `src/commands/builtin-commands.ts` | Registers all 34 built-in commands plus real context compaction (`compactSessionContext`) and project run/test detection (`detectConfiguredProjectCommand`). |
+| `src/commands/builtin-commands.ts` | Registers all 35 built-in commands plus real context compaction (`compactSessionContext`) and project run/test detection (`detectConfiguredProjectCommand`). |
 | `src/commands/command-ui.ts` | Shared autocomplete popup styles/markup/controller (`lcCreateSlashController`), active bypass banner (`#bypassModeBanner`), and `.lc-cmd-result-card` UI rendering. |
 | `src/commands/index.ts` | Exports the command API and `runSlashCommandForWorkspace(...)`, which wires runtime services, persists non-ephemeral command cards to `session.commandResults`, and records activity telemetry. |
 
@@ -99,6 +99,7 @@ Typing `/` at the start of the composer input opens the command suggestion popup
 | `/agent-status` | `/status` | `/agent-status` | Reports the active orchestrator task status, subtasks progress, and running background jobs. |
 | `/agent-stop` | `/stop` | `/agent-stop` | Safely cancels the currently running orchestrator task and marks active session state cancelled. |
 | `/mcp` | — | `/mcp [list \| connect <name> \| disconnect <name>]` | Lists MCP servers from `McpHost` and connects or disconnects configured stdio/SSE servers. |
+| `/queue` | `/q` | `/queue [status\|pause\|resume\|skip\|clear]` | Inspects and controls the active session's sequential multi-message queue (`status`, `pause`, `resume`, `skip`, or confirmation-gated `clear`). |
 | `/help` | `/h`, `/?` | `/help [command]` | Dynamically reads the live `SlashCommandRegistry` to show all registered commands (including custom/plugin commands) or detailed usage, aliases, arguments, and security notes for a specific command. |
 
 ---

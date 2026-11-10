@@ -407,10 +407,7 @@ describe('Complete Slash Command System for LocalCoders', () => {
       confirmBtns[0].dispatch('click', {});
       assert.ok(agentDom.posted.some((m) => m.command === 'confirmSlashCommand' && m.text === '/clear'));
 
-      agentDom.elements.get('btnResetBypass').dispatch('click', { stopPropagation() {} });
-      assert.ok(agentDom.posted.some((m) => m.command === 'runSlashCommand' && m.text === '/normal'));
-
-      // Also verify ChatViewProvider sidebar autocomplete + bypass banner parity
+      // Also verify ChatViewProvider sidebar autocomplete parity
       const chatHtml = ChatViewProvider.prototype._getHtmlForWebview.call({ _extensionUri: { fsPath: process.cwd() } });
       const chatDom = createWebviewSandbox(chatHtml);
       chatDom.sendMessageToWebview({
@@ -511,7 +508,7 @@ describe('Complete Slash Command System for LocalCoders', () => {
         currentConfig: h.sessionManager.getActiveSession().config,
         permissionMode: 'bypass',
       });
-      assert.strictEqual(dom.elements.get('bypassModeBanner').classList.contains('active'), true);
+      assert.ok(!agentHtml.includes('id="bypassModeBanner"'), 'Extra bypass banner removed from composer');
       assert.strictEqual(dom.elements.get('btnPermMode').classList.contains('bypass-active'), true);
 
       // /normal restores 'ask'

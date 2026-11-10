@@ -153,14 +153,36 @@ export async function editFileTool(
     const replacement = args.replacement !== undefined ? args.replacement : ((args as any).replace ?? (args as any).new_string ?? (args as any).newText ?? '');
 
     const original = await fs.readFile(fullPath, 'utf-8');
-    if (!target || !original.includes(target)) {
+    let matchedTarget = target && original.includes(target) ? target : '';
+
+    // Safe newline / surrounding-blank-line normalization fallback when exact substring differs only in CRLF or blank edges
+    if (!matchedTarget && target) {
+      const normOrig = original.replace(/\r\n/g, '\n');
+      const trimmedTarget = target.replace(/\r\n/g, '\n').replace(/^\n+|\n+$/g, '');
+      if (trimmedTarget) {
+        const firstIdx = normOrig.indexOf(trimmedTarget);
+        const lastIdx = firstIdx >= 0 ? normOrig.lastIndexOf(trimmedTarget) : -1;
+        if (firstIdx >= 0 && firstIdx === lastIdx) {
+          matchedTarget = trimmedTarget;
+        }
+      }
+    }
+
+    if (!matchedTarget) {
+      const lines = original.split(/\r?\n/);
+      const previewLines = lines.slice(0, 80).map((l, idx) => `${idx + 1}: ${l}`).join('\n');
+      const boundedPreview = previewLines.length > 3000 ? previewLines.slice(0, 3000) + '\n... [truncated]' : previewLines;
       return {
         success: false,
-        error: `Target string was not found in '${relPath}'. Please check exact indentation and whitespace.`,
+        error:
+          `Target string was not found in '${relPath}'. Do NOT retry the same edit_file target. ` +
+          `Use an exact substring from '${relPath}' below or call write_file('${relPath}', fullContent):\n\n` +
+          `--- ${relPath} (lines 1-${Math.min(lines.length, 80)} of ${lines.length}) ---\n${boundedPreview}`,
       };
     }
 
-    const modified = original.replace(target, replacement);
+    const baseText = original.includes(matchedTarget) ? original : original.replace(/\r\n/g, '\n');
+    const modified = baseText.replace(matchedTarget, replacement);
 
     if (ctx.requireApproval) {
       const approved = await ctx.requestApproval({

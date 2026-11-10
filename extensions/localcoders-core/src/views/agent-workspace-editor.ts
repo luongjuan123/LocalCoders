@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
-import { getLucideCss, getLucideClientScript, lucideSvg, getLocalCodersLogoSvg } from './lucide-icons';
+import { getLucideCss, getLucideClientScript, lucideSvg } from './lucide-icons';
 import * as path from 'path';
 import { AgentOrchestrator } from '../agents/orchestrator';
 import { AgentRegistry } from '../agents/agent-registry';
@@ -13,8 +13,15 @@ import { ChangesManager, ChangesSummary } from '../context/changes-manager';
 import { ModelProviderRegistry, ModelMetadata, ReasoningEffort } from '../models/model-provider-registry';
 import { getModelSelectorStyles, getModelSelectorMarkup, getModelSelectorScript } from './model-selector-ui';
 import { getActivityStreamStyles, getActivityClientScript, inspectorTabIcon } from './activity-stream-ui';
-import { getSessionsBarStyles, getSessionsBarClientScript } from './sessions-bar-ui';
+import { getSessionsBarStyles, getSessionsBarClientScript, getUserProfileBadgeMarkup } from './sessions-bar-ui';
+import { getQueuePanelStyles, getQueuePanelMarkup, getQueuePanelClientScript } from './queue-panel-ui';
 import { CockpitModalType, getCockpitModalStyles, getCockpitModalMarkup, getCockpitModalScript } from './agent-cockpit-modals';
+import {
+  MessageQueueManager,
+  handleQueueActionCommand,
+  isQueueControlSlashCommand,
+  isQueueableSlashCommand,
+} from '../sessions/message-queue';
 import { ToolManager } from '../tools/tool-manager';
 import { PermissionManager, SecurityMode } from '../security/permission-manager';
 import { TerminalSessionManager } from '../tools/terminal-session-manager';
@@ -35,12 +42,20 @@ export class AgentWorkspaceEditorPanel {
   public static readonly viewType = 'localcoders.agentWorkspace';
   private static _registry?: AgentRegistry;
   private static _mcpHost?: McpHost;
+  private static _queueManager?: MessageQueueManager;
   public static onDidDisposeUnexpected?: () => void;
   private static _closingInternally = false;
 
-  public static configureServices(registry?: AgentRegistry, mcpHost?: McpHost): void {
+  public static configureServices(
+    registry?: AgentRegistry,
+    mcpHost?: McpHost,
+    queueManager?: MessageQueueManager
+  ): void {
     AgentWorkspaceEditorPanel._registry = registry;
     AgentWorkspaceEditorPanel._mcpHost = mcpHost;
+    if (queueManager) {
+      AgentWorkspaceEditorPanel._queueManager = queueManager;
+    }
   }
 
   private readonly _panel: vscode.WebviewPanel;
@@ -48,6 +63,7 @@ export class AgentWorkspaceEditorPanel {
   private _disposables: vscode.Disposable[] = [];
   private _telemetryTimer?: NodeJS.Timeout;
   private _telemetryInFlight = false;
+  private readonly queueManager: MessageQueueManager;
 
   public static createOrShow(
     extensionUri: vscode.Uri,
@@ -57,7 +73,8 @@ export class AgentWorkspaceEditorPanel {
     changesManager: ChangesManager,
     modelRegistry?: ModelProviderRegistry,
     toolManager?: ToolManager,
-    permissionManager?: PermissionManager
+    permissionManager?: PermissionManager,
+    queueManager?: MessageQueueManager
   ): AgentWorkspaceEditorPanel {
     const column = vscode.ViewColumn.One;
 
@@ -87,7 +104,8 @@ export class AgentWorkspaceEditorPanel {
       changesManager,
       modelRegistry,
       toolManager,
-      permissionManager
+      permissionManager,
+      queueManager
     );
     return AgentWorkspaceEditorPanel.currentPanel;
   }
@@ -124,10 +142,25 @@ export class AgentWorkspaceEditorPanel {
     private readonly changesManager: ChangesManager,
     private readonly modelRegistry: ModelProviderRegistry = ModelProviderRegistry.getInstance(),
     private readonly toolManager?: ToolManager,
-    private readonly permissionManager?: PermissionManager
+    private readonly permissionManager?: PermissionManager,
+    queueManager?: MessageQueueManager
   ) {
     this._panel = panel;
     this._extensionUri = extensionUri;
+    this.queueManager =
+      queueManager ||
+      AgentWorkspaceEditorPanel._queueManager ||
+      MessageQueueManager.getOrCreateShared({
+        sessionManager: this.sessionManager,
+        orchestrator: this.orchestrator,
+        modelRegistry: this.modelRegistry,
+        changesManager: this.changesManager,
+        permissionManager: this.permissionManager,
+        toolManager: this.toolManager,
+        mcpHost: AgentWorkspaceEditorPanel._mcpHost,
+        registry: AgentWorkspaceEditorPanel._registry,
+        ollama: this.ollama,
+      });
 
     this._panel.iconPath = {
       light: vscode.Uri.joinPath(extensionUri, 'resources', 'icon.svg'),
@@ -166,64 +199,39 @@ export class AgentWorkspaceEditorPanel {
       }
     }, 4000);
 
-    // Track message IDs completed in live run to prevent duplicate rendering
-    let currentRunId = '';
-
-    // Event connections tracked in disposables
+    // Track message & stream updates strictly scoped to whichever session matches the active UI session
     this._disposables.push(
-      this.orchestrator.onMessage((msg) => {
-        if (msg.senderRole === 'user') {
-          // User messages are already optimistically added upon submit
+      this.queueManager.onDidSessionEvent((ev) => {
+        const activeId = this.sessionManager.getActiveSession()?.id;
+        if (activeId && ev.sessionId !== activeId) {
           return;
         }
-        this.sessionManager.updateActiveSession((s) => {
-          if (!s.messages.some((m) => m.id === msg.id)) {
-            s.messages.push(msg);
-          }
-        });
-        this.postMessageSafe({ type: 'addMessage', message: msg });
-        this.updateTitle();
-      })
-    );
-
-    this._disposables.push(
-      this.orchestrator.onStreamEvent((ev) => {
-        if (ev.runId) currentRunId = ev.runId;
-        switch (ev.kind) {
-          case 'status':
-            this.sessionManager.updateActiveSession((s) => {
-              s.activePhase = ev.phase;
-              s.activePhaseSummary = ev.summary;
-              if (ev.phase === 'completed' || ev.phase === 'failed' || ev.phase === 'cancelled') {
-                s.activities = finalizeRunningActivities(s.activities || [], ev.runId, ev.phase);
-                if (s.status === 'running') {
-                  s.status = ev.phase;
-                }
-              }
-            });
-            this.postMessageSafe({ type: 'streamStatus', event: ev });
+        switch (ev.type) {
+          case 'queueUpdated':
+            this.postMessageSafe({ type: 'queueUpdated', snapshot: ev.payload });
             break;
-
-          case 'message_delta':
-            this.postMessageSafe({ type: 'messageDelta', event: ev });
+          case 'addMessage':
+            this.postMessageSafe({ type: 'addMessage', message: ev.payload });
+            this.updateTitle();
             break;
-
-          case 'activity_upsert':
-            this.sessionManager.updateActiveSession((s) => {
-              s.activities = upsertActivityItem(s.activities || [], ev.item);
-            });
-            this.postMessageSafe({ type: 'activityUpsert', item: ev.item });
-            if (ev.item.category === 'file' && ev.item.status === 'completed') {
-              this.changesManager.refresh().catch(() => {});
-            }
+          case 'messageDelta':
+            this.postMessageSafe({ type: 'messageDelta', event: ev.payload });
             break;
-
-          case 'plan':
-            this.sessionManager.updateActiveSession((s) => {
-              s.plan = ev.plan;
-              s.planExplicit = ev.explicit;
-            });
-            this.postMessageSafe({ type: 'planUpdate', plan: ev.plan, explicit: ev.explicit });
+          case 'streamStatus':
+            this.postMessageSafe({ type: 'streamStatus', event: ev.payload });
+            break;
+          case 'activityUpsert':
+            this.postMessageSafe({ type: 'activityUpsert', item: ev.payload });
+            break;
+          case 'planUpdate':
+            this.postMessageSafe({ type: 'planUpdate', plan: ev.payload?.plan || [], explicit: Boolean(ev.payload?.explicit) });
+            break;
+          case 'runFinished':
+            this.syncActiveSession();
+            break;
+          case 'slashCommandResult':
+            this.postMessageSafe({ type: 'slashCommandResult', result: ev.payload });
+            this.syncActiveSession();
             break;
         }
       })
@@ -265,6 +273,44 @@ export class AgentWorkspaceEditorPanel {
             const rawCmd = String(data.text || '').trim();
             if (!rawCmd) return;
             const confirmed = data.command === 'confirmSlashCommand' || !!data.confirmed;
+            const activeSess = this.sessionManager.getActiveSession();
+            if (
+              !confirmed &&
+              !isQueueControlSlashCommand(rawCmd) &&
+              isQueueableSlashCommand(rawCmd) &&
+              activeSess &&
+              this.queueManager.isSessionBusy(activeSess.id)
+            ) {
+              const qRes = await this.queueManager.submitMessage({
+                sessionId: activeSess.id,
+                content: rawCmd,
+                kind: 'slash_command',
+                attachments: Array.isArray(data.attachments) ? data.attachments : undefined,
+                clientSubmissionId: data.clientSubmissionId,
+                dedupeDoubleClick: true,
+              });
+              if (!qRes.ok) {
+                this.postMessageSafe({ type: 'queueActionError', error: qRes.error || 'Unable to queue command.' });
+                return;
+              }
+              if (qRes.mode === 'queued' && qRes.snapshot) {
+                this.postMessageSafe({ type: 'queueUpdated', snapshot: qRes.snapshot });
+                this.postMessageSafe({
+                  type: 'slashCommandResult',
+                  result: {
+                    id: `cmd_q_${Date.now()}`,
+                    command: 'queue',
+                    rawInput: rawCmd,
+                    ok: true,
+                    status: 'info',
+                    title: `Queued ${rawCmd}`,
+                    message: `Added '${rawCmd}' to the queue at position #${qRes.snapshot.queuedCount}. It will execute after current tasks complete.`,
+                    timestamp: Date.now(),
+                  },
+                });
+              }
+              return;
+            }
             await this.executeSlashCommand(rawCmd, confirmed);
             return;
           }
@@ -272,91 +318,86 @@ export class AgentWorkspaceEditorPanel {
           case 'sendMessage': {
             const text = data.text?.trim();
             if (!text) return;
+            const activeSess = this.sessionManager.getActiveSession();
+
+            // Queue-control commands ALWAYS execute immediately; other slash commands execute immediately when idle
+            if (isQueueControlSlashCommand(text)) {
+              await this.executeSlashCommand(text, false);
+              return;
+            }
             if (isSlashCommandInput(text)) {
+              if (activeSess && this.queueManager.isSessionBusy(activeSess.id) && isQueueableSlashCommand(text)) {
+                const qRes = await this.queueManager.submitMessage({
+                  sessionId: activeSess.id,
+                  content: text,
+                  kind: 'slash_command',
+                  attachments: Array.isArray(data.attachments) ? data.attachments : undefined,
+                  clientSubmissionId: data.clientSubmissionId,
+                  dedupeDoubleClick: true,
+                });
+                if (!qRes.ok) {
+                  this.postMessageSafe({ type: 'queueActionError', error: qRes.error || 'Unable to queue command.' });
+                } else if (qRes.snapshot) {
+                  this.postMessageSafe({ type: 'queueUpdated', snapshot: qRes.snapshot });
+                }
+                return;
+              }
               await this.executeSlashCommand(text, false);
               return;
             }
 
-            let active = this.sessionManager.getActiveSession();
-            if (!active) {
-              const firstAvailable = await this.modelRegistry.getDefaultOrFirstAvailableModel();
-              const model = firstAvailable?.id || '';
-              active = this.sessionManager.createSession(text, model, {
-                providerId: firstAvailable?.providerId || 'ollama',
-                modelId: model,
-                modelName: firstAvailable?.displayName || '',
-              });
-            } else if (active.title === 'New Session' || active.title === 'New Section') {
-              const newTitle = text.length > 36 ? text.substring(0, 36).trim() + '...' : text;
-              this.sessionManager.renameSession(active.id, newTitle);
-            }
-
-            const userMsg: AgentMessage = {
-              id: `usr_${Date.now()}`,
-              senderId: 'user',
-              senderName: 'You',
-              senderRole: 'user',
+            const prevCount = this.sessionManager.getAllSessions().length;
+            this.applyWorkingFolder(this.getActiveWorkspaceRoot());
+            const submitRes = await this.queueManager.submitMessage({
+              sessionId: activeSess?.id,
               content: text,
-              timestamp: Date.now(),
-            };
-
-            this.sessionManager.updateActiveSession((s) => {
-              s.messages.push(userMsg);
-              s.status = 'running';
-              s.activePhase = 'analyzing';
-              s.activePhaseSummary = getSafePhaseLabel('analyzing');
+              attachments: Array.isArray(data.attachments) ? data.attachments : undefined,
+              clientSubmissionId: data.clientSubmissionId,
+              dedupeDoubleClick: true,
             });
-            this.postMessageSafe({ type: 'addMessage', message: userMsg });
-            this.updateTitle();
-
-            try {
-              const currentSession = this.sessionManager.getActiveSession();
-              this.applyWorkingFolder(this.getActiveWorkspaceRoot());
-              const history = currentSession?.messages ? currentSession.messages.map((m) => ({ role: m.senderRole, content: m.content })) : [];
-              const completedTask = await this.orchestrator.submitTask(text, currentSession?.config, history);
-              const terminalStatus =
-                completedTask.status === 'cancelled'
-                  ? 'cancelled'
-                  : completedTask.status === 'failed'
-                  ? 'failed'
-                  : 'completed';
-              this.sessionManager.updateActiveSession((s) => {
-                s.status = terminalStatus;
-                s.activePhase = terminalStatus;
-                s.activePhaseSummary = getSafePhaseLabel(terminalStatus);
-                if (currentRunId && s.activities) {
-                  s.activities = finalizeRunningActivities(s.activities, currentRunId, terminalStatus);
-                }
+            if (!submitRes.ok) {
+              this.postMessageSafe({
+                type: 'queueActionError',
+                error: submitRes.error || 'Failed to add message to queue.',
               });
-            } catch (err: any) {
-              this.sessionManager.updateActiveSession((s) => {
-                s.status = 'failed';
-                s.activePhase = 'failed';
-                s.activePhaseSummary = getSafePhaseLabel('failed');
-                if (currentRunId && s.activities) {
-                  s.activities = finalizeRunningActivities(s.activities, currentRunId, 'failed');
-                }
-              });
-              vscode.window.showErrorMessage(`Agent task failed: ${err.message}`);
+              if (submitRes.snapshot) {
+                this.postMessageSafe({ type: 'queueUpdated', snapshot: submitRes.snapshot });
+              }
+              return;
             }
-            this.syncActiveSession();
+            if (submitRes.snapshot) {
+              this.postMessageSafe({ type: 'queueUpdated', snapshot: submitRes.snapshot });
+            }
+            if (this.sessionManager.getAllSessions().length !== prevCount || !activeSess) {
+              await this.syncActiveSession();
+            } else {
+              this.updateTitle();
+            }
             break;
           }
 
-          case 'stopTask':
+          case 'stopTask': {
             this._slashAbortController?.abort();
             this._slashAbortController = undefined;
-            this.orchestrator.cancelTask();
-            this.sessionManager.updateActiveSession((s) => {
-              s.status = 'cancelled';
-              s.activePhase = 'cancelled';
-              s.activePhaseSummary = getSafePhaseLabel('cancelled');
-              if (currentRunId && s.activities) {
-                s.activities = finalizeRunningActivities(s.activities, currentRunId, 'cancelled');
-              }
-            });
-            this.syncActiveSession();
+            const activeSess = this.sessionManager.getActiveSession();
+            this.queueManager.cancelActiveTask(activeSess?.id);
+            await this.syncActiveSession();
             break;
+          }
+
+          case 'queueAction': {
+            const activeSess = this.sessionManager.getActiveSession();
+            if (!activeSess) {
+              this.postMessageSafe({ type: 'queueActionError', error: 'No active session available.' });
+              break;
+            }
+            const res = await handleQueueActionCommand(this.queueManager, activeSess.id, data);
+            this.postMessageSafe({ type: 'queueUpdated', snapshot: res.snapshot });
+            if (!res.ok && res.error) {
+              this.postMessageSafe({ type: 'queueActionError', error: res.error });
+            }
+            break;
+          }
 
           case 'resolveApproval':
           case 'approveTool':
@@ -766,6 +807,11 @@ export class AgentWorkspaceEditorPanel {
               }
               reg.setCriticConfig(updates);
             }
+            if (typeof data.maxCycles === 'number' && !Number.isNaN(data.maxCycles)) {
+              const cfg = vscode.workspace.getConfiguration('localcoders');
+              const val = Math.max(0, Math.floor(data.maxCycles));
+              await cfg.update('maxCriticCycles', val, vscode.ConfigurationTarget.Global);
+            }
             await this.openCockpitModal('agents', 'Critic Agent configuration updated.');
             break;
           }
@@ -777,21 +823,66 @@ export class AgentWorkspaceEditorPanel {
               const roleName = String(data.role || 'Backend Developer');
               const roles = AgentRegistry.getPredefinedRoles();
               const matched = roles.find((r) => r.role === roleName);
-              const session = this.sessionManager.getActiveSession();
-              const model = String(data.model || '').trim() || session?.config?.modelId || reg.getMainAgent()?.model || '';
+              const model = typeof data.model === 'string' ? data.model.trim() : '';
+              const customPrompt = typeof data.systemPrompt === 'string' ? data.systemPrompt.trim() : '';
               reg.addSubagent({
                 id: `sub_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
                 name,
                 role: roleName as any,
                 model,
-                systemPrompt: matched?.defaultPrompt || `You are ${name}, specializing in ${roleName}.`,
+                systemPrompt: customPrompt || matched?.defaultPrompt || `You are ${name}, specializing in ${roleName}.`,
                 enabled: true,
                 maxConcurrency: 1,
                 temperature: 0.2,
                 contextWindow: 32768,
               });
             }
+            await this.openCockpitModal('agents', name ? `Subagent "${name}" added.` : undefined);
+            break;
+          }
+
+          case 'cockpitUpdateSubagent': {
+            const reg = AgentWorkspaceEditorPanel._registry;
+            const id = String(data.id || '').trim();
+            if (reg && id) {
+              const updates: any = {};
+              if (typeof data.model === 'string') {
+                updates.model = data.model.trim();
+              }
+              if (typeof data.systemPrompt === 'string') {
+                const promptText = data.systemPrompt.trim();
+                const current = reg.getManageableSubagents(true).find((s) => s.id === id);
+                const roleDefault = current
+                  ? AgentRegistry.getPredefinedRoles().find((r) => r.role === current.role)?.defaultPrompt
+                  : undefined;
+                updates.systemPrompt = promptText || roleDefault || `You are a specialized ${current?.role || 'Subagent'}.`;
+              }
+              reg.updateSubagent(id, updates);
+            }
+            await this.openCockpitModal('agents', 'Subagent configuration updated.');
+            break;
+          }
+
+          case 'cockpitToggleSubagent': {
+            const reg = AgentWorkspaceEditorPanel._registry;
+            const id = String(data.id || '').trim();
+            if (reg && id) {
+              const current = reg.getManageableSubagents(true).find((s) => s.id === id);
+              if (current) {
+                reg.updateSubagent(id, { enabled: !current.enabled });
+              }
+            }
             await this.openCockpitModal('agents');
+            break;
+          }
+
+          case 'cockpitRemoveSubagent': {
+            const reg = AgentWorkspaceEditorPanel._registry;
+            const id = String(data.id || '').trim();
+            if (reg && id) {
+              reg.removeSubagent(id);
+            }
+            await this.openCockpitModal('agents', 'Subagent updated.');
             break;
           }
 
@@ -947,6 +1038,7 @@ export class AgentWorkspaceEditorPanel {
       mcpHost: AgentWorkspaceEditorPanel._mcpHost,
       registry: AgentWorkspaceEditorPanel._registry,
       ollama: this.ollama,
+      queueManager: this.queueManager,
       ui: {
         openCockpitModal: async (modal, statusText) => {
           await this.openCockpitModal(modal, statusText);
@@ -982,6 +1074,7 @@ export class AgentWorkspaceEditorPanel {
     const session = this.sessionManager.getActiveSession();
     const allSessions = this.sessionManager.getAllSessions();
     const workspacePath = this.getActiveWorkspaceRoot();
+    this.changesManager.setWorkspace(workspacePath);
     const workspaceName = path.basename(workspacePath) || vscode.workspace.workspaceFolders?.[0]?.name || 'LocalCoders';
     const changesSummary = await this.changesManager.getSummary();
 
@@ -1017,6 +1110,7 @@ export class AgentWorkspaceEditorPanel {
     ).getSerializableCatalog();
 
     const telemetry = await this.collectTelemetrySafe();
+    const queueSnapshot = session ? this.queueManager.getSnapshot(session.id) : undefined;
     this.postMessageSafe({
       type: 'loadSession',
       session,
@@ -1031,6 +1125,7 @@ export class AgentWorkspaceEditorPanel {
       slashCommands,
       terminalTabs: TerminalSessionManager.getInstance().getTabs(),
       systemTelemetry: telemetry,
+      queueSnapshot,
     });
     this.updateTitle();
   }
@@ -1081,16 +1176,26 @@ export class AgentWorkspaceEditorPanel {
 
     if (modalType === 'agents') {
       const reg = AgentWorkspaceEditorPanel._registry;
+      const cfg = vscode.workspace.getConfiguration('localcoders');
       const availableModels = await this.modelRegistry.getAvailableModels({ includeDisabled: false }).catch(() => []);
+      const customSubagents = reg?.getSubagents() || [];
+      const manageableSubagents = reg ? reg.getManageableSubagents(true) : [];
+      const builtinSubagents =
+        customSubagents.length === 0 && reg ? reg.getEffectiveSubagents(activeModelId || 'active model', true) : [];
       this.postMessageSafe({
         type: 'cockpitModalData',
         modalType,
         data: {
           mainAgent: reg?.getMainAgent() || null,
           critic: reg?.getCriticConfig() || { enabled: true },
-          subagents: reg?.getSubagents() || [],
+          maxCriticCycles: cfg.get<number>('maxCriticCycles', 0),
+          subagents: customSubagents,
+          builtinSubagents,
+          manageableSubagents,
+          predefinedRoles: AgentRegistry.getPredefinedRoles(),
           availableModels,
           activeModelId,
+          statusText,
         },
       });
       return;
@@ -1297,6 +1402,7 @@ export class AgentWorkspaceEditorPanel {
     }
 
     /* Devin 3-Column Workspace Layout */
+    ${getQueuePanelStyles({ compact: false })}
     .devin-workspace-layout {
       display: flex;
       width: 100vw;
@@ -1332,16 +1438,8 @@ export class AgentWorkspaceEditorPanel {
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 8px;
       border-bottom: 1px solid var(--border);
-    }
-    .sidebar-brand-title {
-      font-size: 12px;
-      font-weight: 600;
-      color: var(--fg);
-      letter-spacing: 0.01em;
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
     }
     .user-header-icons {
       display: flex;
@@ -2472,7 +2570,7 @@ export class AgentWorkspaceEditorPanel {
     <!-- 1. LEFT SESSIONS SIDEBAR -->
     <aside class="devin-sidebar" id="devinSidebar">
       <div class="sidebar-brand-header">
-        <span class="sidebar-brand-title">${getLocalCodersLogoSvg(18)}<span>LocalCoders</span></span>
+        ${getUserProfileBadgeMarkup()}
         <div class="user-header-icons">
           <button class="icon-btn-xs" id="btnSettingsHeader" title="Settings">${lucideSvg('settings', 14)}</button>
         </div>
@@ -2546,6 +2644,8 @@ export class AgentWorkspaceEditorPanel {
           <!-- Messages, execution cards, plans -->
         </div>
       </div>
+
+      ${getQueuePanelMarkup()}
 
       <!-- Floating Bottom Prompt Bar with Popovers -->
       <div class="floating-prompt-bar">
@@ -2678,11 +2778,6 @@ export class AgentWorkspaceEditorPanel {
 
         <!-- Attached Chips Row -->
         <div class="composer-attached-row" id="attachedChipsRow" style="display:none;"></div>
-
-        <div class="lc-bypass-indicator" id="bypassModeBanner">
-          <span class="lc-bypass-indicator-left">${lucideSvg('shield-alert', 12)}<span>Bypass Permissions Active — Supported actions auto-approved (core security enforced)</span></span>
-          <button type="button" class="lc-bypass-reset-btn" id="btnResetBypass">Return to Normal</button>
-        </div>
 
         <div class="composer-modes-row">
           <button class="mode-tab active" data-mode="agent">Agent</button>
@@ -2828,6 +2923,7 @@ export class AgentWorkspaceEditorPanel {
     ${getActivityClientScript()}
     ${getSlashCommandClientScript()}
     ${getSessionsBarClientScript()}
+    ${getQueuePanelClientScript()}
     let sessionSortMode = 'recent';
     let groupSessionsByFolder = false;
     let sessionsRecentCollapsed = false;
@@ -2841,13 +2937,14 @@ export class AgentWorkspaceEditorPanel {
         chatPinnedToBottom = gap <= 32;
       });
     }
-    if (floatingPromptBar && scrollContainer && typeof ResizeObserver !== 'undefined') {
+    if ((floatingPromptBar || lcQueueDock) && scrollContainer && typeof ResizeObserver !== 'undefined') {
       const promptBarResizeObserver = new ResizeObserver(() => {
         if (chatPinnedToBottom) {
           scrollContainer.scrollTop = scrollContainer.scrollHeight;
         }
       });
-      promptBarResizeObserver.observe(floatingPromptBar);
+      if (floatingPromptBar) promptBarResizeObserver.observe(floatingPromptBar);
+      if (lcQueueDock) promptBarResizeObserver.observe(lcQueueDock);
     }
     const promptInput = document.getElementById('promptInput');
     const btnSend = document.getElementById('btnSend');
@@ -3175,7 +3272,13 @@ export class AgentWorkspaceEditorPanel {
       if (slashCtrl) slashCtrl.close();
       promptInput.value = '';
       promptInput.style.height = 'auto';
-      vscode.postMessage({ command: 'runSlashCommand', text: rawCmd });
+      const subId = 'sub_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+      vscode.postMessage({
+        command: 'runSlashCommand',
+        text: rawCmd,
+        attachments: Array.isArray(cachedConfig?.attachedFiles) ? cachedConfig.attachedFiles.slice() : [],
+        clientSubmissionId: subId,
+      });
     }
 
     const slashCtrl = lcCreateSlashController({
@@ -3184,11 +3287,6 @@ export class AgentWorkspaceEditorPanel {
       getCatalog: () => slashCommandsCatalog,
       getModels: () => (typeof cachedAllModelsList !== 'undefined' ? cachedAllModelsList : []),
       onSubmitSlash: (cmdLine) => dispatchSlashCommand(cmdLine),
-    });
-
-    document.getElementById('btnResetBypass')?.addEventListener('click', (e) => {
-      e.stopPropagation();
-      dispatchSlashCommand('/normal');
     });
 
     document.addEventListener('click', (e) => {
@@ -3223,6 +3321,9 @@ export class AgentWorkspaceEditorPanel {
       vscode.postMessage({ command: 'selectModel' });
     });
 
+    let lastPromptSentSig = '';
+    let lastPromptSentAt = 0;
+
     function submitPrompt() {
       const text = promptInput.value.trim();
       if (!text) return;
@@ -3230,24 +3331,43 @@ export class AgentWorkspaceEditorPanel {
         dispatchSlashCommand(text);
         return;
       }
-      if (isWorking) return;
+      const now = Date.now();
+      const attachedSnapshot = Array.isArray(cachedConfig?.attachedFiles) ? cachedConfig.attachedFiles.slice() : [];
+      const sig = text + '::' + attachedSnapshot.join('|');
+      if (sig === lastPromptSentSig && now - lastPromptSentAt < 300) {
+        return;
+      }
+      lastPromptSentSig = sig;
+      lastPromptSentAt = now;
+
       slashCtrl.close();
       promptInput.value = '';
       promptInput.style.height = 'auto';
-      isWorking = true;
-      liveStatusState = { active: true, phase: 'analyzing', summary: 'Analyzing the task' };
-      updateStatusUI();
-      vscode.postMessage({ command: 'sendMessage', text });
+
+      if (!isWorking) {
+        isWorking = true;
+        liveStatusState = { active: true, phase: 'analyzing', summary: 'Analyzing the task' };
+        updateStatusUI();
+      }
+      const clientSubmissionId = 'sub_' + now + '_' + Math.random().toString(36).slice(2, 7);
+      vscode.postMessage({
+        command: 'sendMessage',
+        text,
+        attachments: attachedSnapshot,
+        clientSubmissionId,
+      });
     }
 
     function updateStatusUI() {
+      btnSend.style.display = 'flex';
+      btnSend.disabled = false;
       if (isWorking) {
-        btnSend.style.display = 'none';
+        btnSend.title = 'Add to Queue (Enter)';
         btnStop.style.display = 'flex';
         topStatusBadge.className = 'status-badge status-running';
         topStatusBadge.textContent = 'Running';
       } else {
-        btnSend.style.display = 'flex';
+        btnSend.title = 'Send Prompt (Enter)';
         btnStop.style.display = 'none';
         topStatusBadge.className = 'status-badge status-ready';
         topStatusBadge.textContent = 'Ready';
@@ -3308,7 +3428,6 @@ export class AgentWorkspaceEditorPanel {
             '<div class="lc-sess-row-actions">' + actionsHtml + '</div>' +
           '</div>' +
           '<div class="lc-sess-meta">' +
-            '<span class="lc-sess-meta-icon">' + lcIcon('session-node', 11) + '</span>' +
             '<span class="lc-sess-time">' + escapeHtml(formatTimeAgo(s.updatedAt || s.createdAt)) + '</span>' +
           '</div>' +
         '</div>';
@@ -3421,7 +3540,7 @@ export class AgentWorkspaceEditorPanel {
             '<span class="lc-sess-gutter">' + lcIcon(isCollapsed ? 'chevron-right' : 'chevron-down', 12) + '</span>' +
             '<div class="lc-sess-main">' +
               '<div class="lc-sess-top"><div class="lc-sess-name">' + escapeHtml(folderName) + ' (' + groupItems.length + ')</div></div>' +
-              '<div class="lc-sess-meta"><span class="lc-sess-meta-icon">' + lcIcon('session-node', 11) + '</span><span class="lc-sess-time">' + escapeHtml(formatTimeAgo(latestTs)) + '</span></div>' +
+              '<div class="lc-sess-meta"><span class="lc-sess-time">' + escapeHtml(formatTimeAgo(latestTs)) + '</span></div>' +
             '</div>';
           groupHdr.addEventListener('click', () => {
             if (collapsedFolderGroups.has(folderName)) collapsedFolderGroups.delete(folderName);
@@ -4092,10 +4211,6 @@ export class AgentWorkspaceEditorPanel {
       if (btnPerm) {
         btnPerm.classList.toggle('bypass-active', mode === 'bypass');
       }
-      const bypassBanner = document.getElementById('bypassModeBanner');
-      if (bypassBanner) {
-        bypassBanner.classList.toggle('active', mode === 'bypass');
-      }
       const labels = {
         ask: lcIcon('shield', 13) + '<span>Ask Before Actions</span>',
         smart: lcIcon('shield-check', 13) + '<span>Smart Approval</span>',
@@ -4216,12 +4331,14 @@ export class AgentWorkspaceEditorPanel {
             const nextSessionId = currentSession ? currentSession.id : null;
             if (lastLoadedSessionId !== nextSessionId) {
               ephemeralCommandResults = [];
+              lcQueueUserToggled = false;
+              lcQueueEditingId = null;
               lastLoadedSessionId = nextSessionId;
             }
           }
           if (currentSession) {
             topSessionTitle.textContent = currentSession.title;
-            isWorking = currentSession.status === 'running';
+            isWorking = Boolean(currentSession.status === 'running' || (msg.queueSnapshot && msg.queueSnapshot.isBusy));
             activePlan = currentSession.plan || [];
             planExplicit = !!currentSession.planExplicit;
             currentActivities = Array.isArray(currentSession.activities) ? currentSession.activities : [];
@@ -4243,6 +4360,24 @@ export class AgentWorkspaceEditorPanel {
             liveStatusState = { active: false, phase: 'idle', summary: '' };
             renderFullConversation();
             renderActivityPane();
+          }
+          if (msg.queueSnapshot) {
+            lcSetQueueSnapshot(msg.queueSnapshot);
+          } else {
+            lcSetQueueSnapshot({
+              sessionId: currentSession ? currentSession.id : '',
+              state: isWorking ? 'running' : 'idle',
+              paused: false,
+              activeItemId: null,
+              activeExecutionId: null,
+              isBusy: isWorking,
+              capacity: 200,
+              queuedCount: 0,
+              failedCount: 0,
+              completedCount: 0,
+              lastError: '',
+              items: [],
+            });
           }
           if (Array.isArray(msg.terminalTabs)) {
             updateTerminalTabs(msg.terminalTabs);
@@ -4344,6 +4479,29 @@ export class AgentWorkspaceEditorPanel {
             if (currentSession) currentSession.activities = currentActivities;
             renderFullConversation();
           }
+          break;
+
+        case 'queueUpdated':
+          if (msg.snapshot) {
+            isWorking = Boolean(msg.snapshot.isBusy);
+            updateStatusUI();
+            lcSetQueueSnapshot(msg.snapshot);
+          }
+          break;
+
+        case 'queueActionError':
+          if (msg.error) {
+            lcQueueUserToggled = true;
+            lcQueueExpanded = true;
+            lcSetQueueSnapshot(Object.assign({}, lcGetQueueSnapshot(), { lastError: msg.error }));
+          }
+          break;
+
+        case 'runFinished':
+          isWorking = Boolean(lcGetQueueSnapshot()?.isBusy);
+          liveStatusState = { active: isWorking, phase: msg.status || 'completed', summary: '' };
+          updateStatusUI();
+          renderFullConversation();
           break;
 
         case 'terminalTabs':

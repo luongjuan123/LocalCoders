@@ -89,4 +89,65 @@ describe('AgentRegistry — Agent Team Configuration & Mandatory Validation', ()
     assert.strictEqual(critic.model, 'deepseek-r1:8b');
     assert.strictEqual(critic.strictness, 'paranoid');
   });
+
+  it('should customize built-in and custom subagent models and instructions without losing defaults', () => {
+    const fs = require('fs');
+    const os = require('os');
+    const path = require('path');
+    const vscode = require('vscode');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-reg-sub-'));
+    const origFolders = vscode.workspace.workspaceFolders;
+    vscode.workspace.workspaceFolders = [{ uri: { fsPath: tmpDir } }];
+    try {
+      const data = new Map();
+      const isoCtx = {
+        globalState: {
+          get(k) { return data.get(k); },
+          update(k, v) { data.set(k, v); return Promise.resolve(); },
+        },
+      };
+      const reg = new AgentRegistry(isoCtx);
+
+      // Update a built-in subagent model & custom instructions
+      reg.updateSubagent('builtin_test', {
+        model: 'qwen3.8:27b',
+        systemPrompt: 'Use pytest with isolated tmp_path fixtures only.',
+      });
+
+      // Add a custom subagent inheriting the active coding model ('') with custom instructions
+      reg.addSubagent({
+        id: 'sub_sec',
+        name: 'Security Reviewer',
+        role: 'Security Auditor',
+        model: '',
+        systemPrompt: 'Check every input path for traversal and command injection.',
+        enabled: true,
+        maxConcurrency: 1,
+        temperature: 0.1,
+        contextWindow: 32768,
+      });
+
+      const effective = reg.getEffectiveSubagents('qwen2.5-coder:7b', true);
+      const testSub = effective.find((s) => s.id === 'builtin_test');
+      const frontSub = effective.find((s) => s.id === 'builtin_frontend');
+      const secSub = effective.find((s) => s.id === 'sub_sec');
+
+      assert.strictEqual(testSub?.model, 'qwen3.8:27b');
+      assert.match(testSub?.systemPrompt || '', /pytest with isolated tmp_path/);
+      assert.strictEqual(frontSub?.model, 'qwen2.5-coder:7b', 'Uncustomized built-ins remain active & inherit active model');
+      assert.strictEqual(secSub?.model, 'qwen2.5-coder:7b', 'Blank subagent model inherits active coding model dynamically');
+
+      // Reset built-in override and remove custom subagent cleanly
+      reg.removeSubagent('builtin_test');
+      reg.removeSubagent('sub_sec');
+      const afterReset = reg.getManageableSubagents(true);
+      const resetTest = afterReset.find((s) => s.id === 'builtin_test');
+      assert.strictEqual(resetTest?.isCustomized, false);
+      assert.strictEqual(resetTest?.model, '');
+      assert.strictEqual(afterReset.some((s) => s.id === 'sub_sec'), false);
+    } finally {
+      vscode.workspace.workspaceFolders = origFolders;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

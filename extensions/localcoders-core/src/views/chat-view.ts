@@ -3,22 +3,24 @@ import { getLucideCss, getLucideClientScript, lucideSvg } from './lucide-icons';
 import * as path from 'path';
 import { AgentOrchestrator } from '../agents/orchestrator';
 import { AgentMessage, TaskPlanItem, ToolApprovalRequest } from '../agents/types';
-import {
-  AgentStreamEvent,
-  finalizeRunningActivities,
-  upsertActivityItem,
-} from '../agents/events';
 import { SessionManager, SessionData, ExecutionGroup, AgentSessionConfig, ExecutionMode, PermissionMode } from '../sessions/session-manager';
 import { OllamaClient } from '../ollama/client';
 import { ModelProviderRegistry, ModelMetadata, ReasoningEffort } from '../models/model-provider-registry';
 import { getModelSelectorStyles, getModelSelectorMarkup, getModelSelectorScript } from './model-selector-ui';
 import { getActivityStreamStyles, getActivityClientScript } from './activity-stream-ui';
 import { getSessionsBarStyles, getSessionsBarClientScript } from './sessions-bar-ui';
+import { getQueuePanelStyles, getQueuePanelMarkup, getQueuePanelClientScript } from './queue-panel-ui';
 import { ToolManager } from '../tools/tool-manager';
 import { PermissionManager, SecurityMode } from '../security/permission-manager';
 import { AgentRegistry } from '../agents/agent-registry';
 import { McpHost } from '../mcp/mcp-host';
 import { ChangesManager } from '../context/changes-manager';
+import {
+  MessageQueueManager,
+  handleQueueActionCommand,
+  isQueueControlSlashCommand,
+  isQueueableSlashCommand,
+} from '../sessions/message-queue';
 import {
   SlashCommandRegistry,
   ensureBuiltinSlashCommandsRegistered,
@@ -33,8 +35,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'localcoders.chatView';
   private _view?: vscode.WebviewView;
   private _isDisposed = false;
-  private activeRunId: string | null = null;
   private _slashAbortController?: AbortController;
+  private readonly queueManager?: MessageQueueManager;
 
   private postMessageSafe(data: any): void {
     if (this._isDisposed || !this._view) return;
@@ -72,6 +74,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       mcpHost: this.mcpHost,
       registry: this.registry,
       ollama: this.ollama,
+      queueManager: this.queueManager,
       ui: {
         openCockpitModal: async (modal) => {
           if (modal === 'models') {
@@ -122,62 +125,67 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly toolManager?: ToolManager,
     private readonly registry?: AgentRegistry,
     private readonly mcpHost?: McpHost,
-    private readonly changesManager?: ChangesManager
+    private readonly changesManager?: ChangesManager,
+    queueManager?: MessageQueueManager
   ) {
-    // Listen for structured stream events from orchestrator
-    this.orchestrator.onMessage((msg) => {
-      if (msg.senderRole === 'user') return;
-      this.postMessageSafe({ type: 'addMessage', message: msg });
-      this.sessionManager.updateActiveSession((s) => {
-        if (!s.messages.some((m) => m.id === msg.id)) {
-          s.messages.push(msg);
+    const canAttachQueue =
+      Boolean(queueManager) ||
+      typeof this.sessionManager?.saveQueueState === 'function';
+
+    if (canAttachQueue) {
+      this.queueManager =
+        queueManager ||
+        MessageQueueManager.getOrCreateShared({
+          sessionManager: this.sessionManager,
+          orchestrator: this.orchestrator,
+          modelRegistry: this.modelRegistry,
+          changesManager: this.changesManager,
+          permissionManager: this.permissionManager,
+          toolManager: this.toolManager,
+          mcpHost: this.mcpHost,
+          registry: this.registry,
+          ollama: this.ollama,
+        });
+
+      this.queueManager.onDidSessionEvent((ev) => {
+        const activeId = this.sessionManager.getActiveSession()?.id;
+        if (activeId && ev.sessionId !== activeId) {
+          return;
+        }
+        switch (ev.type) {
+          case 'queueUpdated':
+            this.postMessageSafe({ type: 'queueUpdated', snapshot: ev.payload });
+            break;
+          case 'addMessage':
+            this.postMessageSafe({ type: 'addMessage', message: ev.payload });
+            break;
+          case 'messageDelta':
+            this.postMessageSafe({ type: 'messageDelta', event: ev.payload });
+            break;
+          case 'streamStatus':
+            this.postMessageSafe({ type: 'statusUpdate', event: ev.payload });
+            break;
+          case 'activityUpsert':
+            this.postMessageSafe({ type: 'activityUpsert', item: ev.payload });
+            break;
+          case 'planUpdate':
+            this.postMessageSafe({
+              type: 'planUpdate',
+              plan: ev.payload?.plan || [],
+              explicit: Boolean(ev.payload?.explicit),
+            });
+            break;
+          case 'runFinished':
+            this.postMessageSafe({ type: 'runFinished', status: ev.payload?.status || 'completed' });
+            this.syncActiveSession();
+            break;
+          case 'slashCommandResult':
+            this.postMessageSafe({ type: 'slashCommandResult', result: ev.payload });
+            this.syncActiveSession();
+            break;
         }
       });
-    });
-
-    this.orchestrator.onStreamEvent((ev: AgentStreamEvent) => {
-      this.activeRunId = ev.runId;
-      switch (ev.kind) {
-        case 'status': {
-          const isTerminal = ev.phase === 'completed' || ev.phase === 'failed' || ev.phase === 'cancelled';
-          this.sessionManager.updateActiveSession((s) => {
-            if (isTerminal) {
-              s.activePhase = undefined;
-              s.activePhaseSummary = undefined;
-              s.status = ev.phase as SessionData['status'];
-              s.activities = finalizeRunningActivities(s.activities || [], ev.runId, ev.phase as any);
-            } else {
-              s.activePhase = ev.phase;
-              s.activePhaseSummary = ev.summary;
-            }
-          });
-          this.postMessageSafe({ type: 'statusUpdate', event: ev });
-          break;
-        }
-        case 'message_delta': {
-          this.postMessageSafe({ type: 'messageDelta', event: ev });
-          break;
-        }
-        case 'activity_upsert': {
-          this.sessionManager.updateActiveSession((s) => {
-            s.activities = upsertActivityItem(s.activities || [], ev.item);
-          });
-          this.postMessageSafe({ type: 'activityUpsert', item: ev.item });
-          if (ev.item.category === 'file' && ev.item.status === 'completed') {
-            this.changesManager?.refresh().catch(() => {});
-          }
-          break;
-        }
-        case 'plan': {
-          this.sessionManager.updateActiveSession((s) => {
-            s.plan = ev.plan;
-            s.planExplicit = ev.explicit;
-          });
-          this.postMessageSafe({ type: 'planUpdate', plan: ev.plan, explicit: ev.explicit });
-          break;
-        }
-      }
-    });
+    }
 
     this.orchestrator.onApproval((req) => {
       this.postMessageSafe({ type: 'approvalRequest', request: req });
@@ -216,6 +224,45 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           const rawCmd = String(data.text || '').trim();
           if (!rawCmd) return;
           const confirmed = data.command === 'confirmSlashCommand' || !!data.confirmed;
+          const activeSess = this.sessionManager.getActiveSession();
+          if (
+            this.queueManager &&
+            !confirmed &&
+            !isQueueControlSlashCommand(rawCmd) &&
+            isQueueableSlashCommand(rawCmd) &&
+            activeSess &&
+            this.queueManager.isSessionBusy(activeSess.id)
+          ) {
+            const qRes = await this.queueManager.submitMessage({
+              sessionId: activeSess.id,
+              content: rawCmd,
+              kind: 'slash_command',
+              attachments: Array.isArray(data.attachments) ? data.attachments : undefined,
+              clientSubmissionId: data.clientSubmissionId,
+              dedupeDoubleClick: true,
+            });
+            if (!qRes.ok) {
+              this.postMessageSafe({ type: 'queueActionError', error: qRes.error || 'Unable to queue command.' });
+              return;
+            }
+            if (qRes.snapshot) {
+              this.postMessageSafe({ type: 'queueUpdated', snapshot: qRes.snapshot });
+              this.postMessageSafe({
+                type: 'slashCommandResult',
+                result: {
+                  id: `cmd_q_${Date.now()}`,
+                  command: 'queue',
+                  rawInput: rawCmd,
+                  ok: true,
+                  status: 'info',
+                  title: `Queued ${rawCmd}`,
+                  message: `Added '${rawCmd}' to the queue at position #${qRes.snapshot.queuedCount}.`,
+                  timestamp: Date.now(),
+                },
+              });
+            }
+            return;
+          }
           await this.executeSlashCommand(rawCmd, confirmed);
           return;
         }
@@ -223,81 +270,77 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case 'sendMessage': {
           const text = data.text?.trim();
           if (!text) return;
+          const activeSess = this.sessionManager.getActiveSession();
+          if (isQueueControlSlashCommand(text)) {
+            await this.executeSlashCommand(text, false);
+            return;
+          }
           if (isSlashCommandInput(text)) {
+            if (
+              this.queueManager &&
+              activeSess &&
+              this.queueManager.isSessionBusy(activeSess.id) &&
+              isQueueableSlashCommand(text)
+            ) {
+              const qRes = await this.queueManager.submitMessage({
+                sessionId: activeSess.id,
+                content: text,
+                kind: 'slash_command',
+                attachments: Array.isArray(data.attachments) ? data.attachments : undefined,
+                clientSubmissionId: data.clientSubmissionId,
+                dedupeDoubleClick: true,
+              });
+              if (!qRes.ok) {
+                this.postMessageSafe({ type: 'queueActionError', error: qRes.error || 'Unable to queue command.' });
+              } else if (qRes.snapshot) {
+                this.postMessageSafe({ type: 'queueUpdated', snapshot: qRes.snapshot });
+              }
+              return;
+            }
             await this.executeSlashCommand(text, false);
             return;
           }
 
-          // If no active session, create one
-          let active = this.sessionManager.getActiveSession();
-          if (!active) {
-            const firstAvailable = await this.modelRegistry.getDefaultOrFirstAvailableModel();
-            const model = firstAvailable?.id || '';
-            active = this.sessionManager.createSession(text, model, {
-              providerId: firstAvailable?.providerId || 'ollama',
-              modelId: model,
-              modelName: firstAvailable?.displayName || '',
+          if (this.queueManager) {
+            const prevCount = this.sessionManager.getAllSessions().length;
+            const submitRes = await this.queueManager.submitMessage({
+              sessionId: activeSess?.id,
+              content: text,
+              attachments: Array.isArray(data.attachments) ? data.attachments : undefined,
+              clientSubmissionId: data.clientSubmissionId,
+              dedupeDoubleClick: true,
             });
-          } else if (active.title === 'New Session' || active.title === 'New Section') {
-            const newTitle = text.length > 36 ? text.substring(0, 36).trim() + '...' : text;
-            this.sessionManager.renameSession(active.id, newTitle);
-          }
-
-          const userMsg: AgentMessage = {
-            id: `usr_${Date.now()}`,
-            senderId: 'user',
-            senderName: 'You',
-            senderRole: 'user',
-            content: text,
-            timestamp: Date.now(),
-          };
-
-          this.sessionManager.updateActiveSession((s) => {
-            s.messages.push(userMsg);
-            s.status = 'running';
-            s.activePhase = 'analyzing';
-            s.activePhaseSummary = 'Analyzing the task';
-            s.planExplicit = false;
-          });
-          this.postMessageSafe({ type: 'addMessage', message: userMsg });
-
-          try {
-            const currentSession = this.sessionManager.getActiveSession();
-            const history = currentSession?.messages ? currentSession.messages.map((m) => ({ role: m.senderRole, content: m.content })) : [];
-            await this.orchestrator.submitTask(text, currentSession?.config, history);
-            this.sessionManager.updateActiveSession((s) => {
-              if (s.status !== 'cancelled') {
-                s.status = 'completed';
-              }
-              s.activePhase = undefined;
-              s.activePhaseSummary = undefined;
-              s.activities = finalizeRunningActivities(s.activities || [], this.activeRunId || '', 'completed');
-            });
-            this.postMessageSafe({ type: 'runFinished', status: 'completed' });
-          } catch (err: any) {
-            const isCancelled = /cancel|abort/i.test(err?.message || '');
-            const finalStatus = isCancelled ? 'cancelled' : 'failed';
-            this.sessionManager.updateActiveSession((s) => {
-              s.status = finalStatus;
-              s.activePhase = undefined;
-              s.activePhaseSummary = undefined;
-              s.activities = finalizeRunningActivities(s.activities || [], this.activeRunId || '', finalStatus);
-            });
-            this.postMessageSafe({ type: 'runFinished', status: finalStatus });
-            console.error('[LocalCoders] Task execution error:', err.message);
-            if (!isCancelled) {
+            if (!submitRes.ok) {
               this.postMessageSafe({
-                type: 'addMessage',
-                message: {
-                  id: `err_${Date.now()}`,
-                  senderId: 'system',
-                  senderName: 'System',
-                  senderRole: 'assistant',
-                  content: `**Task Warning / Error**: ${err.message}`,
-                  timestamp: Date.now(),
-                },
+                type: 'queueActionError',
+                error: submitRes.error || 'Failed to add message to queue.',
               });
+              if (submitRes.snapshot) {
+                this.postMessageSafe({ type: 'queueUpdated', snapshot: submitRes.snapshot });
+              }
+              return;
             }
+            if (submitRes.snapshot) {
+              this.postMessageSafe({ type: 'queueUpdated', snapshot: submitRes.snapshot });
+            }
+            if (this.sessionManager.getAllSessions().length !== prevCount || !activeSess) {
+              await this.syncActiveSession();
+            }
+            break;
+          }
+          break;
+        }
+
+        case 'queueAction': {
+          const activeSess = this.sessionManager.getActiveSession();
+          if (!activeSess || !this.queueManager) {
+            this.postMessageSafe({ type: 'queueActionError', error: 'No active session available.' });
+            break;
+          }
+          const res = await handleQueueActionCommand(this.queueManager, activeSess.id, data);
+          this.postMessageSafe({ type: 'queueUpdated', snapshot: res.snapshot });
+          if (!res.ok && res.error) {
+            this.postMessageSafe({ type: 'queueActionError', error: res.error });
           }
           break;
         }
@@ -367,16 +410,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           break;
         }
 
-        case 'cancelTask': {
+        case 'cancelTask':
+        case 'stopTask': {
           this._slashAbortController?.abort();
           this._slashAbortController = undefined;
-          this.orchestrator.cancelTask();
-          this.sessionManager.updateActiveSession((s) => {
-            s.status = 'cancelled';
-            s.activePhase = undefined;
-            s.activePhaseSummary = undefined;
-            s.activities = finalizeRunningActivities(s.activities || [], this.activeRunId || '', 'cancelled');
-          });
+          const activeSess = this.sessionManager.getActiveSession();
+          if (this.queueManager) {
+            this.queueManager.cancelActiveTask(activeSess?.id);
+          } else {
+            this.orchestrator.cancelTask();
+          }
+          await this.syncActiveSession();
           this.postMessageSafe({ type: 'runFinished', status: 'cancelled' });
           break;
         }
@@ -735,6 +779,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       SlashCommandRegistry.getInstance(),
       workspaceRoot
     ).getSerializableCatalog();
+    const queueSnapshot =
+      session && this.queueManager ? this.queueManager.getSnapshot(session.id) : undefined;
 
     this.postMessageSafe({
       type: 'loadSession',
@@ -746,6 +792,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       currentConfig,
       permissionMode,
       slashCommands,
+      queueSnapshot,
     });
   }
 
@@ -1204,6 +1251,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       color: white;
       border-radius: 6px;
     }
+    .btn-stop {
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      background: var(--danger);
+      border: none;
+      color: #ffffff;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    ${getQueuePanelStyles({ compact: true })}
     .header-actions {
       display: flex;
       align-items: center;
@@ -1915,6 +1976,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     <div id="activity-list"></div>
   </div>
 
+  ${getQueuePanelMarkup()}
+
   <!-- 3. Antigravity-style Floating Card Composer -->
   <div class="composer-surface">
     <div class="mode-bar">
@@ -2054,11 +2117,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <!-- Attached Chips Row -->
       <div class="composer-attached-row" id="attachedChipsRow" style="display:none;"></div>
 
-      <div class="lc-bypass-indicator" id="bypassModeBanner">
-        <span class="lc-bypass-indicator-left">${lucideSvg('shield-alert', 12)}<span>Bypass Permissions Active</span></span>
-        <button type="button" class="lc-bypass-reset-btn" id="btnResetBypass">Normal</button>
-      </div>
-
       <div class="composer-top-row">
         <span class="chip-project" id="chip-project" title="Workspace Context">
           ${lucideSvg('folder', 13)}
@@ -2097,6 +2155,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               <polyline points="5 12 12 5 19 12"></polyline>
             </svg>
           </button>
+          <button type="button" class="btn-stop" id="btn-stop" title="Stop Execution">${lucideSvg('square', 11, '', 'currentColor')}</button>
         </div>
       </div>
     </div>
@@ -2119,6 +2178,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     ${getActivityClientScript()}
     ${getSlashCommandClientScript()}
     ${getSessionsBarClientScript()}
+    ${getQueuePanelClientScript()}
     let slashCommandsCatalog = [];
     let currentCommandResults = [];
     let ephemeralCommandResults = [];
@@ -2127,6 +2187,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     let currentSessionPlanCache = [];
     let currentSessionPlanExplicit = false;
     const btnSend = document.getElementById('btn-send');
+    const btnStop = document.getElementById('btn-stop');
     const sessionTitle = document.getElementById('session-title');
     const chipProject = document.getElementById('chip-project');
     const chipProjectName = document.getElementById('chip-project-name');
@@ -2277,7 +2338,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (slashCtrl) slashCtrl.close();
       promptInput.value = '';
       promptInput.style.height = 'auto';
-      vscode.postMessage({ command: 'runSlashCommand', text: rawCmd });
+      const subId = 'sub_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+      vscode.postMessage({
+        command: 'runSlashCommand',
+        text: rawCmd,
+        attachments: Array.isArray(cachedConfig?.attachedFiles) ? cachedConfig.attachedFiles.slice() : [],
+        clientSubmissionId: subId,
+      });
     }
 
     const slashCtrl = lcCreateSlashController({
@@ -2286,11 +2353,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       getCatalog: () => slashCommandsCatalog,
       getModels: () => (typeof cachedAllModelsList !== 'undefined' ? cachedAllModelsList : []),
       onSubmitSlash: (cmdLine) => dispatchSlashCommand(cmdLine),
-    });
-
-    document.getElementById('btnResetBypass')?.addEventListener('click', (e) => {
-      e.stopPropagation();
-      dispatchSlashCommand('/normal');
     });
 
     document.addEventListener('click', (e) => {
@@ -2323,12 +2385,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         dispatchSlashCommand(val);
         return;
       }
-      if (isRunning) {
-        vscode.postMessage({ command: 'cancelTask' });
-      } else {
-        submitMessage();
-      }
+      submitMessage();
     });
+
+    if (btnStop) {
+      btnStop.addEventListener('click', () => {
+        vscode.postMessage({ command: 'cancelTask' });
+      });
+    }
+
+    let lastChatSubmitSig = '';
+    let lastChatSubmitAt = 0;
 
     function submitMessage() {
       const text = promptInput.value.trim();
@@ -2337,24 +2404,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         dispatchSlashCommand(text);
         return;
       }
-      if (isRunning) return;
+      const now = Date.now();
+      const attachedSnapshot = Array.isArray(cachedConfig?.attachedFiles) ? cachedConfig.attachedFiles.slice() : [];
+      const sig = text + '::' + attachedSnapshot.join('|');
+      if (sig === lastChatSubmitSig && now - lastChatSubmitAt < 300) {
+        return;
+      }
+      lastChatSubmitSig = sig;
+      lastChatSubmitAt = now;
+
       slashCtrl.close();
       promptInput.value = '';
       promptInput.style.height = 'auto';
-      setRunningState(true);
-      vscode.postMessage({ command: 'sendMessage', text });
+      if (!isRunning) {
+        setRunningState(true);
+      }
+      const clientSubmissionId = 'sub_' + now + '_' + Math.random().toString(36).slice(2, 7);
+      vscode.postMessage({
+        command: 'sendMessage',
+        text,
+        attachments: attachedSnapshot,
+        clientSubmissionId,
+      });
     }
 
     function setRunningState(running) {
       isRunning = running;
-      if (running) {
-        btnSend.classList.add('stop-mode');
-        btnSend.innerHTML = lcIcon('square', 11, '', 'currentColor');
-        btnSend.title = 'Stop Generation';
-      } else {
-        btnSend.classList.remove('stop-mode');
-        btnSend.innerHTML = lcIcon('arrow-up', 14);
-        btnSend.title = 'Send (Enter)';
+      btnSend.style.display = 'flex';
+      btnSend.disabled = false;
+      btnSend.classList.remove('stop-mode');
+      btnSend.innerHTML = lcIcon('arrow-up', 14);
+      btnSend.title = running ? 'Add to Queue (Enter)' : 'Send (Enter)';
+      if (btnStop) {
+        btnStop.style.display = running ? 'flex' : 'none';
       }
     }
 
@@ -2393,7 +2475,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               '</div>' +
             '</div>' +
             '<div class="lc-sess-meta">' +
-              '<span class="lc-sess-meta-icon">' + lcIcon('session-node', 11) + '</span>' +
               '<span class="lc-sess-time">' + escapeHtml(formatTimeAgo(s.updatedAt || s.createdAt)) + '</span>' +
             '</div>' +
           '</div>';
@@ -2599,10 +2680,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
       if (btnPermMode) {
         btnPermMode.classList.toggle('bypass-active', mode === 'bypass');
-      }
-      const bypassBanner = document.getElementById('bypassModeBanner');
-      if (bypassBanner) {
-        bypassBanner.classList.toggle('active', mode === 'bypass');
       }
       const labels = {
         ask: lcIcon('shield', 13) + '<span>Ask</span>',
@@ -2848,6 +2925,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             const nextId = data.session ? data.session.id : null;
             if (lastLoadedSessionId !== nextId) {
               ephemeralCommandResults = [];
+              lcQueueUserToggled = false;
+              lcQueueEditingId = null;
               lastLoadedSessionId = nextId;
             }
           }
@@ -2899,10 +2978,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           updateActivityCounters();
           renderActivityPanel();
 
-          const sessionRunning = data.session?.status === 'running';
+          const sessionRunning = Boolean(data.session?.status === 'running' || data.queueSnapshot?.isBusy);
           currentStatusSummary = sessionRunning ? (data.session?.activePhaseSummary || 'Agent is working') : '';
           setRunningState(sessionRunning);
           renderLiveStrip();
+
+          if (data.queueSnapshot) {
+            lcSetQueueSnapshot(data.queueSnapshot);
+          } else {
+            lcSetQueueSnapshot({
+              sessionId: data.session ? data.session.id : '',
+              state: sessionRunning ? 'running' : 'idle',
+              paused: false,
+              activeItemId: null,
+              activeExecutionId: null,
+              isBusy: sessionRunning,
+              capacity: 200,
+              queuedCount: 0,
+              failedCount: 0,
+              completedCount: 0,
+              lastError: '',
+              items: [],
+            });
+          }
 
           currentSessionMessagesCache = Array.isArray(data.session?.messages) ? data.session.messages.slice() : [];
           currentCommandResults = Array.isArray(data.session?.commandResults) ? data.session.commandResults.slice() : [];
@@ -2929,7 +3027,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           chatContainer.scrollTop = chatContainer.scrollHeight;
           if (data.message?.senderRole === 'assistant') {
             currentStatusSummary = '';
-            setRunningState(false);
+            setRunningState(Boolean(lcGetQueueSnapshot()?.isBusy));
             renderLiveStrip();
           }
           break;
@@ -2996,6 +3094,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           updateActivityCounters();
           renderLiveStrip();
           renderActivityPanel();
+          break;
+        }
+
+        case 'queueUpdated': {
+          if (data.snapshot) {
+            setRunningState(Boolean(data.snapshot.isBusy));
+            lcSetQueueSnapshot(data.snapshot);
+            renderLiveStrip();
+          }
+          break;
+        }
+
+        case 'queueActionError': {
+          if (data.error) {
+            lcQueueUserToggled = true;
+            lcQueueExpanded = true;
+            lcSetQueueSnapshot(Object.assign({}, lcGetQueueSnapshot(), { lastError: data.error }));
+          }
           break;
         }
 

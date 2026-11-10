@@ -6,6 +6,7 @@ import { promisify } from 'util';
 import { CriticAgent } from '../agents/critic-agent';
 import { MemoryManager } from '../context/memory-manager';
 import { ModelMetadata, ReasoningEffort } from '../models/types';
+import { MessageQueueManager } from '../sessions/message-queue';
 import { PermissionMode } from '../sessions/session-manager';
 import { ToolExecutionContext } from '../tools/types';
 import { inspectDiagnosticsTool, searchCodebaseTool } from '../tools/search-tools';
@@ -1891,6 +1892,141 @@ function registerAgentMcpCommands(registry: SlashCommandRegistry): void {
   });
 }
 
+function registerQueueCommands(registry: SlashCommandRegistry): void {
+  const resolveQueueManager = (ctx: CommandContext): MessageQueueManager => {
+    if (ctx.queueManager) return ctx.queueManager;
+    return new MessageQueueManager({
+      sessionManager: ctx.sessionManager,
+      orchestrator: ctx.orchestrator,
+      modelRegistry: ctx.modelRegistry,
+      changesManager: ctx.changesManager,
+      permissionManager: ctx.permissionManager,
+      toolManager: ctx.toolManager,
+      mcpHost: ctx.mcpHost,
+      registry: ctx.registry,
+      ollama: ctx.ollama,
+    });
+  };
+
+  registry.register({
+    name: 'queue',
+    aliases: ['q'],
+    description: 'Inspect and control the active session multi-message execution queue.',
+    usage: '/queue [status|pause|resume|skip|clear]',
+    category: 'Workflow',
+    source: 'builtin',
+    permissionRequirement: 'safe',
+    autoExecuteOnSelect: false,
+    icon: 'layers',
+    subcommands: [
+      { name: 'status', description: 'Show queue state, pending count, and active task.' },
+      { name: 'pause', description: 'Pause advancing to the next queued message.' },
+      { name: 'resume', description: 'Resume processing pending queued messages.' },
+      { name: 'skip', description: 'Skip the current blocking failed or next queued message.' },
+      { name: 'clear', description: 'Clear pending/failed messages from the queue (requires confirmation).', requiresConfirmation: true },
+    ],
+    autocompleteArgs: (_ctx, partial) => {
+      const q = partial.trim().toLowerCase();
+      return ['status', 'pause', 'resume', 'skip', 'clear'].filter((s) => !q || s.startsWith(q));
+    },
+    execute: async (ctx, args, parsed) => {
+      const sub = (args[0] || 'list').toLowerCase();
+      const session = ctx.sessionManager.getActiveSession();
+      if (!session) {
+        return errResult('queue', parsed, 'No Active Session', 'Open or create a session first to use the message queue.');
+      }
+
+      const qm = resolveQueueManager(ctx);
+      const sid = session.id;
+
+      if (sub === 'pause') {
+        const res = qm.pauseQueue(sid);
+        await ctx.ui?.syncSession?.();
+        return okResult('queue', parsed, 'Queue Paused', res.message || 'Queue paused.', {
+          changesState: true,
+          details: [
+            { label: 'State', value: res.snapshot.state },
+            { label: 'Queued', value: String(res.snapshot.queuedCount) },
+          ],
+        });
+      }
+
+      if (sub === 'resume') {
+        const res = qm.resumeQueue(sid);
+        await ctx.ui?.syncSession?.();
+        return okResult('queue', parsed, 'Queue Resumed', res.message || 'Queue resumed.', {
+          changesState: true,
+          details: [
+            { label: 'State', value: res.snapshot.state },
+            { label: 'Queued', value: String(res.snapshot.queuedCount) },
+          ],
+        });
+      }
+
+      if (sub === 'skip') {
+        const res = qm.skipQueuedMessage(sid);
+        await ctx.ui?.syncSession?.();
+        if (!res.ok) {
+          return errResult('queue', parsed, 'Queue Skip Failed', res.error || 'Unable to skip queued item.');
+        }
+        return okResult('queue', parsed, 'Skipped Queued Message', res.message || 'Skipped queued item.', {
+          changesState: true,
+          details: [
+            { label: 'Skipped', value: res.item?.content.slice(0, 80) || '-' },
+            { label: 'Remaining Queued', value: String(res.snapshot.queuedCount) },
+            { label: 'State', value: res.snapshot.state },
+          ],
+        });
+      }
+
+      if (sub === 'clear') {
+        const res = qm.clearQueue(sid, { includeFailed: true });
+        await ctx.ui?.syncSession?.();
+        return okResult('queue', parsed, 'Queue Cleared', res.message || 'Pending queued messages cleared.', {
+          changesState: true,
+          details: [
+            { label: 'State', value: res.snapshot.state },
+            { label: 'Remaining', value: String(res.snapshot.queuedCount) },
+          ],
+        });
+      }
+
+      if (sub === 'status' || sub === 'list') {
+        const snap = qm.getSnapshot(sid);
+        const lines = snap.items.map((it, idx) => {
+          const preview = it.content.replace(/\s+/g, ' ').slice(0, 80);
+          const att = it.attachments?.length ? ` [${it.attachments.length} attachment(s)]` : '';
+          const err = it.error ? ` — error: ${it.error}` : '';
+          return `${idx + 1}. [${it.status}] ${preview}${att}${err}`;
+        });
+        const title = sub === 'status' ? `Queue Status: ${snap.state}` : `Queued Messages (${snap.queuedCount})`;
+        const summary =
+          lines.length > 0
+            ? `Session '${session.title}' has ${snap.queuedCount} pending message(s)${snap.failedCount > 0 ? ` and ${snap.failedCount} failed item(s)` : ''}.`
+            : `No queued messages in session '${session.title}'. State: ${snap.state}.`;
+        return okResult('queue', parsed, title, summary, {
+          status: 'info',
+          details: [
+            { label: 'State', value: snap.state },
+            { label: 'Queued', value: String(snap.queuedCount) },
+            { label: 'Paused', value: snap.paused ? 'Yes' : 'No' },
+            { label: 'Completed', value: String(snap.completedCount) },
+            { label: 'Capacity', value: `${snap.queuedCount}/${snap.capacity}` },
+          ],
+          codeBlock: lines.length > 0 ? { language: 'text', content: lines.join('\n') } : undefined,
+        });
+      }
+
+      return errResult(
+        'queue',
+        parsed,
+        'Unknown /queue Subcommand',
+        `Unknown subcommand '${sub}'. Use \`/queue\`, \`/queue status\`, \`/queue pause\`, \`/queue resume\`, \`/queue skip\`, or \`/queue clear\`.`
+      );
+    },
+  });
+}
+
 const registeredRegistries = new WeakSet<SlashCommandRegistry>();
 
 export function ensureBuiltinSlashCommandsRegistered(
@@ -1904,6 +2040,7 @@ export function ensureBuiltinSlashCommandsRegistered(
     registerSessionCommands(registry);
     registerWorkspaceCommands(registry);
     registerAgentMcpCommands(registry);
+    registerQueueCommands(registry);
     registeredRegistries.add(registry);
   }
   if (workspaceRoot) {

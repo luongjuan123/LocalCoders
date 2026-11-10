@@ -236,6 +236,7 @@ export class SlashCommandExecutor {
         command.permissionRequirement !== 'restricted' &&
         command.name !== 'clear' &&
         command.name !== 'delete-session' &&
+        !(command.name === 'queue' && parsed.subcommand === 'clear') &&
         context.permissionManager.getNormalizedMode() === 'bypass';
 
       if (!bypassPermitsDirect) {

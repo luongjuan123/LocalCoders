@@ -6,6 +6,7 @@ import { McpHost } from '../mcp/mcp-host';
 import { ModelProviderRegistry } from '../models/model-provider-registry';
 import { OllamaClient } from '../ollama/client';
 import { PermissionManager } from '../security/permission-manager';
+import type { MessageQueueManager } from '../sessions/message-queue';
 import { ExecutionMode, PermissionMode, SessionManager } from '../sessions/session-manager';
 import { TerminalSessionManager } from '../tools/terminal-session-manager';
 import { ToolManager } from '../tools/tool-manager';
@@ -131,6 +132,7 @@ export interface CommandContext {
   registry?: AgentRegistry;
   memoryManager?: MemoryManager;
   ollama?: OllamaClient;
+  queueManager?: MessageQueueManager;
   historyManager: OperationHistoryManager;
   ui?: CommandUIHooks;
 }

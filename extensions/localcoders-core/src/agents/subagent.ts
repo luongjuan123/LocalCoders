@@ -6,7 +6,7 @@ import { ToolExecutionContext } from '../tools/types';
 import { FileLockManager } from './file-lock';
 import { parseToolCallsFromContent, parseCodeBlocksFromContent, RuntimeModelOptions } from './main-agent';
 import { getSafePhaseLabel, sanitizeAssistantContent } from './events';
-import { executeTrackedTool } from './tool-runner';
+import { createTurnProgressGuard, createTurnThoughtTracker, executeTrackedTool } from './tool-runner';
 
 export class Subagent {
   public config: AgentConfig;
@@ -40,7 +40,7 @@ export class Subagent {
     requestApproval: (req: any) => Promise<boolean>,
     abortSignal?: AbortSignal,
     runtimeOptions?: RuntimeModelOptions
-  ): Promise<{ success: boolean; output: string; affectedFiles: string[] }> {
+  ): Promise<{ success: boolean; output: string; affectedFiles: string[]; verificationSummary?: string; verificationFailed?: boolean }> {
     onActivity(`Starting task: ${task.title}`);
 
     // Check file locks for affected files
@@ -53,12 +53,13 @@ export class Subagent {
       }
     }
 
+    const pmMode = this.toolManager.getPermissionManager()?.getNormalizedMode();
     const toolCtx: ToolExecutionContext = {
       workspaceRoot: this.workspaceRoot,
       agentId: this.config.id,
       agentName: this.config.name,
       taskId: task.id,
-      requireApproval: true,
+      requireApproval: pmMode === 'bypass' ? false : true,
       requestApproval,
     };
 
@@ -104,10 +105,13 @@ ${targetFilePrompt}`;
     ];
 
     let turns = 0;
-    const maxTurns = 10;
+    const maxTurns = 8;
     let finalSummary = '';
     const filesWritten: string[] = [];
+    const progressGuard = createTurnProgressGuard({ maxStuckTurns: 2 });
     let toolsExecutedCount = 0;
+    let lastCommandOutput = '';
+    let lastCommandFailed = false;
 
     const isImplementationTask =
       task.affectedFiles.length > 0 ||
@@ -127,6 +131,15 @@ ${targetFilePrompt}`;
         let assistantThinking = '';
         let toolCalls: any = undefined;
         let phaseNotified = false;
+        const turnThought = createTurnThoughtTracker({
+          runId,
+          agentId: this.config.id,
+          agentName: this.config.name,
+          agentRole: this.config.role,
+          title: `${this.config.name} Thinking`,
+          stepKey: `${task.id}_t${turns}`,
+          onStreamEvent: runtimeOptions?.onStreamEvent,
+        });
 
         runtimeOptions?.onStreamEvent?.({
           kind: 'status',
@@ -159,6 +172,7 @@ ${targetFilePrompt}`;
               (chunk) => {
                 assistantContent += chunk.content;
                 if (chunk.thinking) assistantThinking += chunk.thinking;
+                turnThought.updateFromStream(assistantContent, assistantThinking);
                 if (chunk.toolCalls && chunk.toolCalls.length > 0) {
                   toolCalls = [...(toolCalls || []), ...chunk.toolCalls];
                 }
@@ -219,6 +233,12 @@ ${targetFilePrompt}`;
           activeCalls = parseToolCallsFromContent(assistantContent);
         }
 
+        const plannedFallback =
+          activeCalls.length > 0
+            ? `Task "${task.title}": ${activeCalls.map((c) => `${c.name}(${c.args?.path || c.args?.command || ''})`).join(', ')}`
+            : `Completed step "${task.title}"`;
+        turnThought.finalize(assistantContent, assistantThinking, plannedFallback);
+
         // 3. Fallback: Parse code blocks with filenames and automatically persist them via write_file
         if (activeCalls.length === 0) {
           const extractedFiles = parseCodeBlocksFromContent(assistantContent, task.affectedFiles);
@@ -253,11 +273,33 @@ ${targetFilePrompt}`;
 
         // 4. Execute tool calls
         if (activeCalls.length > 0) {
+          let skippedAll = true;
+          let turnMadeProgress = false;
+          let executedReadOnly = false;
           for (const call of activeCalls) {
             if (abortSignal?.aborted) {
               throw new Error('Task was cancelled by user.');
             }
+            const preCheck = progressGuard.checkBeforeCall(call.name, call.args);
+            if (preCheck.skip) {
+              messages.push(
+                toolCalls && toolCalls.length > 0
+                  ? { role: 'tool', tool_name: call.name, content: preCheck.cachedResultJson }
+                  : { role: 'user', content: `[Tool Result for ${call.name}]: ${preCheck.cachedResultJson}` }
+              );
+              continue;
+            }
+
+            skippedAll = false;
             toolsExecutedCount++;
+            if (
+              call.name === 'read_file' ||
+              call.name === 'list_directory' ||
+              call.name === 'search_codebase' ||
+              call.name === 'search_symbols'
+            ) {
+              executedReadOnly = true;
+            }
 
             const { result } = await executeTrackedTool({
               runId,
@@ -276,9 +318,14 @@ ${targetFilePrompt}`;
               throw new Error('Task was cancelled by user.');
             }
 
-            if (result.success && (call.name === 'write_file' || call.name === 'create_file')) {
-              const p = call.args.path || call.args.filePath;
-              if (p) filesWritten.push(p);
+            const outcome = progressGuard.recordOutcome(call.name, call.args, result);
+            if (outcome.modifiedFile) filesWritten.push(outcome.modifiedFile);
+            if (outcome.madeProgress) turnMadeProgress = true;
+
+            if (call.name === 'run_command' || call.name === 'run_tests') {
+              lastCommandFailed = !result.success;
+              const o = result.output || {};
+              lastCommandOutput = [o.stdout, o.stderr || result.error].filter(Boolean).join('\n').slice(0, 3000);
             }
 
             const resStr = JSON.stringify(result);
@@ -296,6 +343,9 @@ ${targetFilePrompt}`;
                 content: `[Tool Result for ${call.name}]: ${boundedStr}\nContinue implementing the task. Use 'write_file' to create or update required source files and test files.`,
               });
             }
+          }
+          if (progressGuard.shouldStopTurn({ skippedAll, turnMadeProgress, executedReadOnly })) {
+            break;
           }
 
           if (toolCalls && toolCalls.length > 0) {
@@ -329,6 +379,8 @@ ${targetFilePrompt}`;
         success: true,
         output: summary,
         affectedFiles: Array.from(new Set([...task.affectedFiles, ...filesWritten])),
+        verificationSummary: lastCommandOutput || undefined,
+        verificationFailed: lastCommandFailed || undefined,
       };
     } finally {
       // Release file locks held for this task

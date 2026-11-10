@@ -176,6 +176,40 @@ export function getCockpitModalStyles(): string {
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       resize: vertical;
       line-height: 1.5;
+      box-sizing: border-box;
+    }
+    .cockpit-textarea.compact {
+      min-height: 62px;
+      font-family: inherit;
+      font-size: 11.5px;
+      line-height: 1.45;
+    }
+    .cockpit-subagent-card {
+      border: 1px solid #1a1f29;
+      border-radius: 6px;
+      background: #0b0e14;
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+    .cockpit-subagent-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .cockpit-subagent-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .cockpit-field-label {
+      font-size: 10.5px;
+      font-weight: 600;
+      color: #94a3b8;
+      letter-spacing: 0.02em;
     }
     .cockpit-btn {
       background: #1a202c;
@@ -377,10 +411,43 @@ export function getCockpitModalScript(): string {
       const main = data.mainAgent || null;
       const critic = data.critic || { enabled: true };
       const subagents = Array.isArray(data.subagents) ? data.subagents : [];
+      const builtinSubagents = Array.isArray(data.builtinSubagents) ? data.builtinSubagents : [];
+      const manageableSubagents = Array.isArray(data.manageableSubagents)
+        ? data.manageableSubagents
+        : (subagents.length > 0 ? subagents : builtinSubagents);
+      const predefinedRoles = Array.isArray(data.predefinedRoles) && data.predefinedRoles.length > 0
+        ? data.predefinedRoles
+        : [
+            { role: 'Backend Developer', defaultPrompt: '' },
+            { role: 'Frontend Developer', defaultPrompt: '' },
+            { role: 'Security Auditor', defaultPrompt: '' },
+            { role: 'Test Engineer', defaultPrompt: '' },
+            { role: 'Debugging Specialist', defaultPrompt: '' },
+            { role: 'Software Architect', defaultPrompt: '' },
+            { role: 'Refactoring Specialist', defaultPrompt: '' },
+          ];
       const availableModels = Array.isArray(data.availableModels) ? data.availableModels : [];
       const activeModelLabel = data.activeModelId || 'active model';
 
+      function renderModelOptionsHtml(selectedModel) {
+        const curr = selectedModel || '';
+        let optHtml = '<option value=""' + (!curr ? ' selected' : '') + '>Same as coding model (' + escapeHtml(activeModelLabel) + ')</option>';
+        availableModels.forEach((m) => {
+          const mid = m.id || m.name || '';
+          if (!mid) return;
+          const selected = curr === mid ? ' selected' : '';
+          optHtml += '<option value="' + escapeHtml(mid) + '"' + selected + '>' + escapeHtml(mid) + '</option>';
+        });
+        if (curr && !availableModels.some((m) => (m.id || m.name) === curr)) {
+          optHtml += '<option value="' + escapeHtml(curr) + '" selected>' + escapeHtml(curr) + ' (unavailable)</option>';
+        }
+        return optHtml;
+      }
+
       let html = '';
+      if (data.statusText) {
+        html += '<div class="cockpit-status-note" id="cmAgentsStatus">' + escapeHtml(data.statusText) + '</div>';
+      }
       html += '<div class="cockpit-section">';
       html += '<div class="cockpit-section-title"><span>Main Coding Agent</span></div>';
       html += '<div class="cockpit-row"><div class="cockpit-row-main"><div class="cockpit-row-title">' + escapeHtml(main ? (main.name || 'Main Agent') : 'Main Agent') + '</div><div class="cockpit-row-sub">Model: ' + escapeHtml((main && main.model) || activeModelLabel) + '</div></div><span class="cockpit-badge ok">Active</span></div>';
@@ -391,17 +458,8 @@ export function getCockpitModalScript(): string {
       html += '<div class="cockpit-row"><div class="cockpit-row-main"><div class="cockpit-row-title">Critic Review Agent</div><div class="cockpit-row-sub">Audits changes & test failures and sends defects back to Main Agent until approved</div></div>';
       html += '<button class="cockpit-btn" id="cmToggleCriticBtn" type="button">' + (critic.enabled ? 'Enabled' : 'Disabled') + '</button></div>';
       html += '<div class="cockpit-input-row" style="margin-top:8px;">';
-      html += '<select class="cockpit-select" id="cmCriticModelSelect" title="Select Critic Model">';
-      html += '<option value=""' + (!critic.model ? ' selected' : '') + '>Same as coding model (' + escapeHtml(activeModelLabel) + ')</option>';
-      availableModels.forEach((m) => {
-        const mid = m.id || m.name || '';
-        if (!mid) return;
-        const selected = critic.model === mid ? ' selected' : '';
-        html += '<option value="' + escapeHtml(mid) + '"' + selected + '>' + escapeHtml(mid) + '</option>';
-      });
-      if (critic.model && !availableModels.some((m) => (m.id || m.name) === critic.model)) {
-        html += '<option value="' + escapeHtml(critic.model) + '" selected>' + escapeHtml(critic.model) + ' (unavailable)</option>';
-      }
+      html += '<select class="cockpit-select" id="cmCriticModelSelect" title="Select Critic Model" style="flex:1; min-width:180px;">';
+      html += renderModelOptionsHtml(critic.model || '');
       html += '</select>';
       const currStrictness = critic.strictness || 'strict';
       html += '<select class="cockpit-select" id="cmCriticStrictnessSelect" title="Review Strictness">' +
@@ -410,17 +468,48 @@ export function getCockpitModalScript(): string {
         '<option value="paranoid"' + (currStrictness === 'paranoid' ? ' selected' : '') + '>Paranoid</option>' +
         '<option value="lenient"' + (currStrictness === 'lenient' ? ' selected' : '') + '>Lenient</option>' +
         '</select>';
+      const currMaxCycles = typeof data.maxCriticCycles === 'number' ? Math.max(0, Math.floor(data.maxCriticCycles)) : 0;
+      const cyclePresets = [0, 2, 4, 8, 12];
+      html += '<select class="cockpit-select" id="cmCriticMaxCyclesSelect" title="Max Review Cycles">';
+      cyclePresets.forEach((n) => {
+        const label = n === 0 ? 'Unlimited (Until Fixed)' : ('Max ' + n + ' cycles');
+        html += '<option value="' + n + '"' + (currMaxCycles === n ? ' selected' : '') + '>' + label + '</option>';
+      });
+      if (!cyclePresets.includes(currMaxCycles)) {
+        html += '<option value="' + currMaxCycles + '" selected>Max ' + currMaxCycles + ' cycles</option>';
+      }
+      html += '</select>';
       html += '<button class="cockpit-btn primary" id="cmSaveCriticBtn" type="button">Apply</button>';
       html += '</div>';
       html += '</div>';
 
       html += '<div class="cockpit-section">';
-      html += '<div class="cockpit-section-title"><span>Specialized Subagents (' + subagents.length + ')</span></div>';
-      if (subagents.length === 0) {
-        html += '<div class="cockpit-status-note">No custom subagents registered.</div>';
+      html += '<div class="cockpit-section-title"><span>Specialized Subagents (' + manageableSubagents.length + ')</span></div>';
+      if (manageableSubagents.length === 0) {
+        html += '<div class="cockpit-status-note">No subagents active.</div>';
       } else {
-        subagents.forEach((s) => {
-          html += '<div class="cockpit-row"><div class="cockpit-row-main"><div class="cockpit-row-title">' + escapeHtml(s.name || s.id) + '</div><div class="cockpit-row-sub">' + escapeHtml(s.role || s.model || 'Subagent') + '</div></div><span class="cockpit-badge">' + escapeHtml(s.model || 'default') + '</span></div>';
+        manageableSubagents.forEach((s) => {
+          const sid = s.id || '';
+          const isEnabled = s.enabled !== false;
+          const kindLabel = s.isBuiltin ? 'Built-in' : 'Custom';
+          html += '<div class="cockpit-subagent-card" data-subagent-card="' + escapeHtml(sid) + '">';
+          html += '<div class="cockpit-subagent-head">';
+          html += '<div class="cockpit-row-main"><div class="cockpit-row-title">' + escapeHtml(s.name || sid) + '</div><div class="cockpit-row-sub">' + escapeHtml(s.role || 'Subagent') + ' · ' + kindLabel + '</div></div>';
+          html += '<div class="cockpit-subagent-actions">';
+          html += '<button class="cockpit-btn" type="button" data-toggle-subagent="' + escapeHtml(sid) + '">' + (isEnabled ? 'Enabled' : 'Disabled') + '</button>';
+          if (!s.isBuiltin || s.isCustomized) {
+            html += '<button class="cockpit-btn danger" type="button" data-remove-subagent="' + escapeHtml(sid) + '">' + (s.isBuiltin ? 'Reset' : 'Remove') + '</button>';
+          }
+          html += '</div></div>';
+          html += '<div class="cockpit-input-row">';
+          html += '<select class="cockpit-select" style="flex:1; min-width:180px;" title="Select Subagent Model" data-subagent-model="' + escapeHtml(sid) + '">';
+          html += renderModelOptionsHtml(s.model || '');
+          html += '</select>';
+          html += '<button class="cockpit-btn primary" type="button" data-save-subagent="' + escapeHtml(sid) + '">Apply</button>';
+          html += '</div>';
+          html += '<div class="cockpit-field-label">Instructions</div>';
+          html += '<textarea class="cockpit-textarea compact" rows="2" placeholder="Write instructions for ' + escapeHtml(s.name || 'this subagent') + '..." data-subagent-prompt="' + escapeHtml(sid) + '">' + escapeHtml(s.systemPrompt || '') + '</textarea>';
+          html += '</div>';
         });
       }
       html += '</div>';
@@ -429,20 +518,22 @@ export function getCockpitModalScript(): string {
       html += '<div class="cockpit-section-title"><span>Create Subagent</span></div>';
       html += '<div class="cockpit-input-row">';
       html += '<input class="cockpit-input" id="cmSubagentName" type="text" placeholder="Subagent name (e.g. Security Reviewer)" />';
-      html += '<select class="cockpit-select" id="cmSubagentRole">' +
-        '<option value="Backend Developer">Backend Developer</option>' +
-        '<option value="Frontend Developer">Frontend Developer</option>' +
-        '<option value="Security Auditor">Security Auditor</option>' +
-        '<option value="Test Engineer">Test Engineer</option>' +
-        '<option value="Debugging Specialist">Debugging Specialist</option>' +
-        '<option value="Software Architect">Software Architect</option>' +
-        '<option value="Refactoring Specialist">Refactoring Specialist</option>' +
-        '</select>';
+      html += '<select class="cockpit-select" id="cmSubagentRole">';
+      predefinedRoles.forEach((r) => {
+        const rName = r.role || '';
+        if (!rName) return;
+        html += '<option value="' + escapeHtml(rName) + '">' + escapeHtml(rName) + '</option>';
+      });
+      html += '</select>';
       html += '</div>';
       html += '<div class="cockpit-input-row">';
-      html += '<input class="cockpit-input" id="cmSubagentModel" type="text" placeholder="Model ID (blank = active session model)" />';
+      html += '<select class="cockpit-select" id="cmSubagentModelSelect" title="Select New Subagent Model" style="flex:1; min-width:180px;">';
+      html += renderModelOptionsHtml('');
+      html += '</select>';
       html += '<button class="cockpit-btn primary" id="cmCreateSubagentBtn" type="button">Add Subagent</button>';
       html += '</div>';
+      html += '<div class="cockpit-field-label">Instructions</div>';
+      html += '<textarea class="cockpit-textarea compact" id="cmSubagentPrompt" rows="2" placeholder="Write instructions for this subagent (leave blank for default role instructions)..."></textarea>';
       html += '</div>';
 
       cockpitModalBody.innerHTML = html;
@@ -452,23 +543,77 @@ export function getCockpitModalScript(): string {
       document.getElementById('cmSaveCriticBtn')?.addEventListener('click', () => {
         const modelSel = document.getElementById('cmCriticModelSelect');
         const strictSel = document.getElementById('cmCriticStrictnessSelect');
+        const cyclesSel = document.getElementById('cmCriticMaxCyclesSelect');
         vscode.postMessage({
           command: 'cockpitUpdateCritic',
           model: modelSel ? modelSel.value : '',
           strictness: strictSel ? strictSel.value : 'strict',
+          maxCycles: cyclesSel ? Number(cyclesSel.value) : 0,
         });
       });
+
+      cockpitModalBody.querySelectorAll('[data-toggle-subagent]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const id = btn.getAttribute('data-toggle-subagent');
+          if (!id) return;
+          vscode.postMessage({ command: 'cockpitToggleSubagent', id });
+        });
+      });
+
+      cockpitModalBody.querySelectorAll('[data-remove-subagent]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const id = btn.getAttribute('data-remove-subagent');
+          if (!id) return;
+          vscode.postMessage({ command: 'cockpitRemoveSubagent', id });
+        });
+      });
+
+      cockpitModalBody.querySelectorAll('[data-save-subagent]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const id = btn.getAttribute('data-save-subagent');
+          if (!id) return;
+          const card = btn.closest('[data-subagent-card]');
+          const modelSel = card ? card.querySelector('[data-subagent-model]') : null;
+          const promptEl = card ? card.querySelector('[data-subagent-prompt]') : null;
+          vscode.postMessage({
+            command: 'cockpitUpdateSubagent',
+            id,
+            model: modelSel ? modelSel.value : '',
+            systemPrompt: promptEl ? promptEl.value : '',
+          });
+        });
+      });
+
+      const newRoleEl = document.getElementById('cmSubagentRole');
+      const newPromptEl = document.getElementById('cmSubagentPrompt');
+      if (newRoleEl && newPromptEl) {
+        let userEditedPrompt = false;
+        const applyRoleTemplate = () => {
+          const match = predefinedRoles.find((r) => r.role === newRoleEl.value);
+          if (match && match.defaultPrompt && !userEditedPrompt) {
+            newPromptEl.value = match.defaultPrompt;
+          }
+        };
+        applyRoleTemplate();
+        newPromptEl.addEventListener('input', () => {
+          userEditedPrompt = newPromptEl.value.trim().length > 0;
+        });
+        newRoleEl.addEventListener('change', applyRoleTemplate);
+      }
+
       document.getElementById('cmCreateSubagentBtn')?.addEventListener('click', () => {
         const nameEl = document.getElementById('cmSubagentName');
         const roleEl = document.getElementById('cmSubagentRole');
-        const modelEl = document.getElementById('cmSubagentModel');
+        const modelEl = document.getElementById('cmSubagentModelSelect');
+        const promptEl = document.getElementById('cmSubagentPrompt');
         const name = nameEl ? nameEl.value.trim() : '';
         if (!name) return;
         vscode.postMessage({
           command: 'cockpitAddSubagent',
           name,
           role: roleEl ? roleEl.value : 'Backend Developer',
-          model: modelEl ? modelEl.value.trim() : '',
+          model: modelEl ? modelEl.value : '',
+          systemPrompt: promptEl ? promptEl.value.trim() : '',
         });
       });
     }

@@ -449,6 +449,9 @@ export class OllamaClient {
         resolve();
       };
 
+      const IDLE_WATCHDOG_MS = 120_000;
+      let idleTimer: NodeJS.Timeout | null = null;
+
       const req = transport.request(
         {
           hostname: parsedUrl.hostname,
@@ -465,7 +468,10 @@ export class OllamaClient {
           const status = res.statusCode || 0;
           if (status < 200 || status >= 300) {
             const errChunks: Buffer[] = [];
-            res.on('data', (d) => errChunks.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));
+            res.on('data', (d) => {
+              resetIdleTimer();
+              errChunks.push(Buffer.isBuffer(d) ? d : Buffer.from(d));
+            });
             res.on('end', () => {
               const errText = Buffer.concat(errChunks).toString('utf-8');
               fail(new Error(`Ollama chat failed (${status}): ${errText}`));
@@ -503,6 +509,7 @@ export class OllamaClient {
           };
 
           res.on('data', (chunk) => {
+            resetIdleTimer();
             try {
               buffer += decoder.decode(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk), { stream: true });
               const lines = buffer.split('\n');
@@ -533,8 +540,19 @@ export class OllamaClient {
         }
       );
 
-      // Disable idle socket timeout so slow initial KV cache eval on large local models never drops
+      const resetIdleTimer = () => {
+        if (settled) return;
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          req.destroy();
+          fail(new Error(`Ollama stream stalled with no response for ${Math.round(IDLE_WATCHDOG_MS / 1000)}s.`));
+        }, IDLE_WATCHDOG_MS);
+      };
+
+      // Activity-resetting watchdog prevents infinite silence if Ollama hangs mid-stream
+      // while allowing legitimate slow prompt evaluations up to 120s between chunks.
       req.setTimeout(0);
+      resetIdleTimer();
 
       const onAbort = () => {
         req.destroy();
@@ -545,6 +563,10 @@ export class OllamaClient {
       }
 
       const cleanup = () => {
+        if (idleTimer) {
+          clearTimeout(idleTimer);
+          idleTimer = null;
+        }
         if (abortSignal) {
           abortSignal.removeEventListener('abort', onAbort);
         }

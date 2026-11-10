@@ -79,7 +79,7 @@ export const SetupWizard: React.FC = () => {
                     : 'bg-[#1e293b] text-[#64748b]'
                 }`}
               >
-                {step > s ? '✓' : s}
+                {step > s ? <Check size={12} strokeWidth={2} /> : s}
               </span>
             ))}
           </div>

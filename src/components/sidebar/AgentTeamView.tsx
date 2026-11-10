@@ -121,7 +121,7 @@ export const AgentTeamView: React.FC = () => {
               <div key={sub.id} className="bg-[#0b0f19] border border-[#1f2937] rounded p-2 flex justify-between items-center">
                 <div>
                   <strong className="text-[#f8fafc]">{sub.name}</strong>
-                  <div className="text-[11px] text-[#64748b]">{sub.role} • {sub.model}</div>
+                  <div className="text-[11px] text-[#64748b]">{sub.role} | {sub.model}</div>
                 </div>
               </div>
             ))}

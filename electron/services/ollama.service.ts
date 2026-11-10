@@ -1,9 +1,11 @@
 import * as os from 'os';
-import { exec } from 'child_process';
+import * as path from 'path';
+import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import { HardwareInfo, OllamaCatalogueItem, OllamaModel } from '../types';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 export class OllamaService {
   private host: string = 'http://127.0.0.1:11434';
@@ -198,15 +200,20 @@ export class OllamaService {
   }
 
   async unloadModel(name: string): Promise<boolean> {
+    if (!name) return false;
     try {
-      const res = await fetch(`${this.host}/api/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: name, keep_alive: 0 }),
-        signal: AbortSignal.timeout(4000),
-      });
-      return res.ok;
+      const [res] = await Promise.allSettled([
+        fetch(`${this.host}/api/generate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: name, keep_alive: 0 }),
+          signal: AbortSignal.timeout(2500),
+        }),
+        execFileAsync('ollama', ['stop', name], { timeout: 2500 }),
+      ]);
+      return res.status === 'fulfilled' && res.value.ok;
     } catch {
+      await execFileAsync('ollama', ['stop', name], { timeout: 2000 }).catch(() => {});
       return false;
     }
   }
@@ -214,13 +221,68 @@ export class OllamaService {
   async unloadAllModels(): Promise<void> {
     try {
       const running = await this.getRunningModels();
-      for (const m of running) {
-        if (m.name) {
-          await this.unloadModel(m.name);
+      await Promise.allSettled(
+        running
+          .map((m) => m.name || m.model)
+          .filter(Boolean)
+          .map((name) => this.unloadModel(name))
+      );
+    } catch (err: any) {
+      console.warn('[OllamaService] unloadAllModels error:', err.message);
+    }
+  }
+
+  async stopServerAndModels(): Promise<void> {
+    await this.unloadAllModels();
+    try {
+      const u = new URL(this.host);
+      const h = u.hostname.toLowerCase();
+      if (h !== '127.0.0.1' && h !== 'localhost' && h !== '::1' && h !== '0.0.0.0' && h !== '[::1]') {
+        return;
+      }
+
+      if (process.platform === 'win32') {
+        for (const exe of ['llama-server.exe', 'ollama.exe', 'ollama app.exe']) {
+          await execFileAsync('taskkill', ['/F', '/IM', exe], { timeout: 2500 }).catch(() => {});
+        }
+        return;
+      }
+
+      try {
+        await execFileAsync('systemctl', ['is-active', '--quiet', 'ollama'], { timeout: 1000 });
+        await execFileAsync('systemctl', ['--no-ask-password', 'stop', 'ollama'], { timeout: 2500 }).catch(() => {});
+      } catch {}
+
+      const uid = typeof process.getuid === 'function' ? String(process.getuid()) : '';
+      const psArgs = uid ? ['-u', uid, '-o', 'pid=,comm=,args='] : ['-eo', 'pid=,comm=,args='];
+      const { stdout } = await execFileAsync('ps', psArgs, { timeout: 2000 }).catch(() => ({ stdout: '', stderr: '' }));
+      const pids: number[] = [];
+      for (const raw of (stdout || '').split(/\r?\n/)) {
+        const m = raw.trim().match(/^(\d+)\s+(\S+)\s+([\s\S]+)$/);
+        if (!m) continue;
+        const pid = parseInt(m[1], 10);
+        if (!Number.isFinite(pid) || pid <= 1 || pid === process.pid || pid === process.ppid) continue;
+        const bin = path.basename((m[3].split(/\s+/)[0] || '')).toLowerCase();
+        const comm = path.basename(m[2]).toLowerCase();
+        const isOllama = (bin === 'ollama' || comm === 'ollama') && /\b(serve|runner)\b/i.test(m[3]);
+        const isRunner = (bin === 'llama-server' || comm === 'llama-server') && /ollama/i.test(m[3]);
+        if (isOllama || isRunner) pids.push(pid);
+      }
+
+      for (const pid of pids) {
+        try { process.kill(pid, 'SIGTERM'); } catch {}
+      }
+      if (pids.length > 0) {
+        await new Promise((r) => setTimeout(r, 350));
+        for (const pid of pids) {
+          try {
+            process.kill(pid, 0);
+            process.kill(pid, 'SIGKILL');
+          } catch {}
         }
       }
     } catch (err: any) {
-      console.warn('[OllamaService] unloadAllModels error:', err.message);
+      console.warn('[OllamaService] stopServerAndModels error:', err.message);
     }
   }
 }

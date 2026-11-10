@@ -4,13 +4,23 @@ node_modules/
 # Production builds
 dist/
 dist-electron/
+*.tsbuildinfo
 
-# Environment and logs
+# Environment, OS, and editor scratch files
+.env
+.env.*
 *.log
 .DS_Store
+.Rhistory
 
-# Temporary local storage
+# Temporary local storage & runtime session logs
 .localcoders/*.sqlite*
+.localcoders/audit.log
+.localcoders/pending-changes.json
+.localcoders/sessions/
+test/mock-workspace/.localcoders/audit.log
+test/mock-workspace/.localcoders/pending-changes.json
+test/mock-workspace/.localcoders/sessions/
 
-# Upstream submodule/clone
+# Upstream Code - OSS runtime checkout (custom patches stored in patches/vscode-workbench.patch)
 vscode-src/

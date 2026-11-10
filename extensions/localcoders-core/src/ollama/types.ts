@@ -67,9 +67,23 @@ export interface HardwareInfo {
   ollamaVersion?: string;
 }
 
+export interface OllamaShowResponse {
+  thinking?: {
+    values?: Array<boolean | string>;
+    default?: boolean | string;
+  };
+  capabilities?: string[];
+  parameters?: string;
+  details?: Partial<OllamaModelDetails>;
+  model_info?: Record<string, any>;
+  projector_info?: Record<string, any>;
+  modified_at?: string;
+}
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
   content: string;
   thinking?: string;
   tool_calls?: any[];
+  tool_name?: string;
 }

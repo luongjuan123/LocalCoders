@@ -26,13 +26,18 @@ export class PermissionManager {
 
   // Commands or patterns strictly prohibited even under Bypass Permissions mode (hard safety boundaries)
   private readonly dangerousPatterns: RegExp[] = [
-    /rm\s+-rf\s+(\/|~|\$HOME|\.\.)/i,
+    /rm\s+(-[a-z]*[rf][a-z]*\s+)+(\/|~|\$HOME|\.\.|\/etc|\/usr|\/var)/i,
     /mkfs(\.[a-z0-9]+)?\s+/i,
     /dd\s+if=.*of=\/dev\/(sd[a-z]|nvme)/i,
     /:(){ :\|:& };:/, // Fork bomb
     /DROP\s+(DATABASE|SCHEMA)\s+/i,
     />\s*\/dev\/(sd[a-z]|nvme)/i,
     /chmod\s+-R\s+777\s+\//i,
+    /(?:cat|less|head|tail|cp|mv|scp|curl|wget)[^;\n]*(?:\/etc\/shadow|\/etc\/sudoers|~\/\.ssh\/id_|\/\.ssh\/id_)/i,
+    /(?:^|["'\/\s])(?:\.env(?:\.(?:local|prod|production|staging|dev|development))?|\.ssh\/id_[a-z0-9_.-]+|\.aws\/credentials)(?:$|["'\s])/i,
+    /\bsudo\s+/i,
+    /(?:curl|wget)\s+[^\n|]+\|\s*(?:sh|bash|zsh)\b/i,
+    /(?:ghp_[a-zA-Z0-9]{20,}|glpat-[a-zA-Z0-9\-]{15,}|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)/i,
   ];
 
   constructor(workspaceRoot: string) {
@@ -86,14 +91,60 @@ export class PermissionManager {
       return tool.permissionLevel === 'destructive';
     }
 
-    // 5. Smart Approval mode (default):
-    // - Read / search / safe inspections: auto-approved
+    // 5. Smart Approval mode (default / auto-approve safe policy):
+    // - Read / search / safe diagnostic inspections: auto-approved
     // - Write / execute / network / destructive: require approval according to policy
-    if (tool.permissionLevel === 'read') {
+    if (tool.permissionLevel === 'read' || this.isSafePolicyTool(tool)) {
       return false;
     }
 
     return true;
+  }
+
+  public isSafePolicyTool(tool: ToolDefinition): boolean {
+    if (tool.permissionLevel === 'read') return true;
+    const safeNames = new Set([
+      'search_codebase',
+      'search_symbols',
+      'inspect_diagnostics',
+      'read_file',
+      'read_lines',
+      'list_directory',
+      'get_metadata',
+      'get_project_structure',
+      'git_status',
+      'read_git_diff',
+      'git_log',
+      'git_show',
+      'create_checkpoint',
+    ]);
+    return safeNames.has(tool.name);
+  }
+
+  public getModeSummary(): { rawMode: SecurityMode; normalizedMode: 'ask' | 'smart' | 'bypass'; label: string; policy: string } {
+    const norm = this.getNormalizedMode();
+    if (norm === 'bypass') {
+      return {
+        rawMode: this.mode,
+        normalizedMode: 'bypass',
+        label: 'Bypass Permissions',
+        policy: 'Supported file edits, tool calls, and terminal commands auto-approve; hard safety rules still guard secrets, OS paths, and destructive actions.',
+      };
+    }
+    if (norm === 'ask') {
+      return {
+        rawMode: this.mode,
+        normalizedMode: 'ask',
+        label: 'Normal (Ask Before Actions)',
+        policy: 'Harmless reads auto-approve; file writes, terminal commands, network calls, and destructive actions require confirmation.',
+      };
+    }
+    return {
+      rawMode: this.mode,
+      normalizedMode: 'smart',
+      label: 'Smart Approval (Safe Policy)',
+      policy: 'Safe inspections and read-only operations auto-approve; modifications and command executions require approval.',
+    };
   }
 
   public isStrictlyProhibited(payload?: any): boolean {

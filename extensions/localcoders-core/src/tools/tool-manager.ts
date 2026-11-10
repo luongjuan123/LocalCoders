@@ -275,12 +275,18 @@ export class ToolManager {
       name: 'run_command',
       category: 'terminal',
       permissionLevel: 'execute',
-      description: 'Execute a terminal shell command synchronously and capture output.',
+      description:
+        'Execute a terminal shell command synchronously and capture output. Pass optional `stdin` text (newline-delimited) for interactive CLI scripts that call input()/readline(). For long-running GUIs or servers, use start_process.',
       parameters: {
         type: 'object',
         properties: {
           command: { type: 'string', description: 'Shell command string.' },
-          timeoutMs: { type: 'number', description: 'Timeout in milliseconds.' },
+          stdin: {
+            type: 'string',
+            description: 'Optional input text sent to standard input (stdin), separated by newlines for sequential prompts.',
+          },
+          timeoutMs: { type: 'number', description: 'Timeout in milliseconds (default 45000).' },
+          cwd: { type: 'string', description: 'Optional working directory.' },
         },
         required: ['command'],
       },
@@ -289,7 +295,7 @@ export class ToolManager {
       name: 'start_process',
       category: 'terminal',
       permissionLevel: 'execute',
-      description: 'Start a long-running background process (e.g. dev server, background service).',
+      description: 'Start a long-running background or interactive process (e.g. GUI app, dev server, interactive CLI session). Use write_stdin to send input and read_output to inspect logs.',
       parameters: {
         type: 'object',
         properties: {
@@ -1141,8 +1147,18 @@ export class ToolManager {
       const needsMcp =
         /\bmcp\b/i.test(text) || (mcpTools.length > 0 && !roleFilter);
 
+      const needsInteractiveProcess =
+        /\b(run|start|launch|serve|interactive|input|prompt|ui|gui|window|server|watch|daemon)\b/i.test(text);
+      const INTERACTIVE_PROCESS_TOOLS = new Set([
+        'start_process',
+        'read_output',
+        'write_stdin',
+        'terminate_process',
+      ]);
+
       return all.filter((t) => {
         if (CORE_TOOL_NAMES.has(t.name)) return true;
+        if (needsInteractiveProcess && INTERACTIVE_PROCESS_TOOLS.has(t.name)) return true;
         if (needsBrowser && (t.category === 'browser' || t.category === 'app')) return true;
         if (needsDocker && t.category === 'docker') return true;
         if (needsDatabase && t.category === 'database') return true;
@@ -1285,7 +1301,10 @@ export class ToolManager {
 
         // Terminal
         case 'run_command':
-          result = await runCommandTool(args as { command: string; timeoutMs?: number }, ctx);
+          result = await runCommandTool(
+            args as { command: string; stdin?: string; input?: string; timeoutMs?: number; cwd?: string },
+            ctx
+          );
           break;
         case 'start_process':
           result = await startProcessTool(args as { processId?: string; command: string; cwd?: string }, ctx);

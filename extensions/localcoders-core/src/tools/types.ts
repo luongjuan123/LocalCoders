@@ -44,12 +44,15 @@ export interface ToolExecutionContext {
   requestApproval: (req: ToolApprovalRequest) => Promise<boolean>;
   logEvent?: (event: ToolAuditEvent) => void;
   redactSecrets?: (input: string) => string;
+  abortSignal?: AbortSignal;
+  onOutput?: (stream: 'stdout' | 'stderr', chunk: string) => void;
 }
 
 export interface ToolResult {
   success: boolean;
   output?: any;
   error?: string;
+  cancelled?: boolean;
   diffPreview?: string;
   metadata?: Record<string, any>;
 }

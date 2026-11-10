@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useAppStore } from '../../store/useAppStore';
-import { Send, Square, Bot, Sparkles, CheckCircle2, AlertTriangle, Shield, Check, X } from 'lucide-react';
+import { Send, Square, AlertTriangle, Check, X } from 'lucide-react';
 
 export const AiPanel: React.FC = () => {
   const {
@@ -30,37 +30,34 @@ export const AiPanel: React.FC = () => {
   };
 
   return (
-    <div className="w-80 bg-[#111827] border-l border-[#1f2937] flex flex-col h-full overflow-hidden select-none">
+    <div className="w-80 bg-[#16171a] border-l border-[#27272a] flex flex-col h-full overflow-hidden select-none">
       {/* Top Mode Selector Bar */}
-      <div className="p-2 border-b border-[#1f2937] bg-[#0b0f19] flex justify-between items-center text-xs">
+      <div className="p-2 border-b border-[#27272a] bg-[#111214] flex justify-between items-center text-xs">
         <div className="flex space-x-1">
           {(['agent', 'plan', 'ask', 'review'] as const).map((m) => (
             <button
               key={m}
               onClick={() => setMode(m)}
-              className={`px-2 py-1 rounded text-[11px] font-semibold uppercase transition-colors ${
-                mode === m ? 'bg-sky-500/20 text-sky-400 border border-sky-500/40' : 'text-[#64748b] hover:text-[#cbd5e1]'
+              className={`px-2 py-1 rounded text-[11px] font-medium capitalize transition-colors ${
+                mode === m ? 'bg-[#27272a] text-[#f4f4f5]' : 'text-[#71717a] hover:text-[#e4e4e7]'
               }`}
             >
               {m}
             </button>
           ))}
         </div>
-        <div className="flex items-center space-x-1">
-          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-          <span className="text-[10px] text-[#94a3b8] font-bold uppercase">{agentStatus}</span>
+        <div className="flex items-center space-x-1.5">
+          <span className={`w-1.5 h-1.5 rounded-full ${agentStatus === 'working' ? 'bg-zinc-200' : 'bg-emerald-500'}`} />
+          <span className="text-[11px] text-[#8b8f98] capitalize">{agentStatus}</span>
         </div>
       </div>
 
       {/* Messages Stream */}
       <div className="flex-1 overflow-y-auto p-3 space-y-3 text-xs">
         {agentMessages.length === 0 && (
-          <div className="p-4 text-center text-[#64748b] space-y-2 mt-4">
-            <Bot size={28} className="mx-auto text-sky-400" />
-            <p className="font-semibold text-[#f8fafc]">LocalCoders AI Orchestration</p>
-            <p className="text-[11px]">
-              Submit a task. The Main Agent will create a plan, delegate tasks to subagents, call tools, and invoke the Critic Agent.
-            </p>
+          <div className="p-4 text-center text-[#71717a] space-y-1 mt-8">
+            <p className="font-medium text-[#e4e4e7]">New session</p>
+            <p className="text-[11px]">Type a task or question below.</p>
           </div>
         )}
 
@@ -69,35 +66,25 @@ export const AiPanel: React.FC = () => {
             key={msg.id}
             className={`p-3 rounded-lg border leading-relaxed ${
               msg.senderRole === 'user'
-                ? 'bg-sky-500/10 border-sky-500/30 text-[#f8fafc]'
-                : 'bg-[#0b0f19] border-[#1f2937] text-[#cbd5e1]'
+                ? 'bg-[#1e2025] border-[#2e3138] text-[#f4f4f5]'
+                : 'bg-transparent border-[#27272a] text-[#d4d4d8]'
             }`}
           >
-            <div className="flex items-center justify-between mb-1 font-semibold text-[11px]">
-              <span className={msg.senderRole === 'user' ? 'text-sky-300' : 'text-indigo-400'}>
-                {msg.senderName}
-              </span>
-              <span className="text-[10px] text-[#64748b]">
+            <div className="flex items-center justify-between mb-1 font-medium text-[11px]">
+              <span className="text-[#a1a1aa]">{msg.senderName}</span>
+              <span className="text-[10px] text-[#71717a]">
                 {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
               </span>
             </div>
-
-            {msg.thinking && (
-              <div className="bg-[#1e293b]/50 border-l-2 border-indigo-400 p-2 rounded text-[11px] text-[#94a3b8] font-mono mb-2 whitespace-pre-wrap">
-                {msg.thinking}
-              </div>
-            )}
 
             <div className="whitespace-pre-wrap">{msg.content}</div>
           </div>
         ))}
 
-        {/* Live Multi-Agent Plan Checklist */}
         {currentPlan.length > 0 && (
-          <div className="bg-[#0b0f19] border border-sky-500/30 rounded-lg p-3 space-y-2">
-            <div className="flex items-center justify-between text-sky-400 font-bold text-[11px] uppercase tracking-wider">
-              <span>Live Execution Plan</span>
-              <Sparkles size={13} />
+          <div className="bg-[#111214] border border-[#27272a] rounded-lg p-3 space-y-2">
+            <div className="flex items-center justify-between text-[#a1a1aa] font-medium text-[11px]">
+              <span>Execution Plan</span>
             </div>
             <div className="space-y-1.5">
               {currentPlan.map((p, i) => (
@@ -158,7 +145,7 @@ export const AiPanel: React.FC = () => {
       </div>
 
       {/* Input Area */}
-      <div className="p-3 border-t border-[#1f2937] bg-[#0b0f19] space-y-2">
+      <div className="p-3 border-t border-[#27272a] bg-[#111214] space-y-2">
         <textarea
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
@@ -168,15 +155,15 @@ export const AiPanel: React.FC = () => {
               handleSend();
             }
           }}
-          placeholder="Ask Main Agent or delegate coding task..."
+          placeholder="Type a task or question..."
           rows={3}
-          className="w-full bg-[#1e293b] border border-[#334155] rounded-lg p-2.5 text-xs text-[#f8fafc] resize-none outline-none focus:border-sky-400"
+          className="w-full bg-[#18191d] border border-[#27272a] rounded-lg p-2.5 text-xs text-[#e4e4e7] resize-none outline-none focus:border-[#52525b]"
         />
         <div className="flex justify-between items-center">
           <button
             onClick={cancelAiTask}
             disabled={agentStatus === 'idle'}
-            className="px-2.5 py-1 bg-rose-500/20 hover:bg-rose-500/30 text-rose-400 rounded text-[11px] font-semibold flex items-center space-x-1 disabled:opacity-40"
+            className="px-2.5 py-1 border border-[#27272a] hover:bg-[#1e2025] text-[#a1a1aa] rounded text-[11px] font-medium flex items-center space-x-1 disabled:opacity-40"
           >
             <Square size={11} />
             <span>Stop</span>
@@ -184,7 +171,7 @@ export const AiPanel: React.FC = () => {
           <button
             onClick={handleSend}
             disabled={!prompt.trim() || agentStatus === 'working'}
-            className="px-3.5 py-1 bg-sky-500 hover:bg-sky-600 disabled:opacity-50 text-[#0f172a] font-bold rounded text-xs flex items-center space-x-1"
+            className="px-3 py-1 bg-[#e4e4e7] hover:bg-white disabled:opacity-40 text-[#111214] font-medium rounded text-xs flex items-center space-x-1"
           >
             <Send size={12} />
             <span>Send</span>

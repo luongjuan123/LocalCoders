@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { AgentOrchestrator } from '../agents/orchestrator';
 import { CriticFinding, CriticReport } from '../agents/types';
+import { getLucideCss, lucideSvg } from './lucide-icons';
 
 export class CriticFindingsViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'localcoders.criticFindingsPanel';
@@ -94,6 +95,7 @@ Recommended Fix: ${finding.recommendedFix}`;
       --accent: #38bdf8;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    ${getLucideCss()}
     body {
       background-color: var(--bg);
       color: var(--fg);
@@ -213,7 +215,7 @@ Recommended Fix: ${finding.recommendedFix}`;
         verdictTag.style.color = (r.verdict === 'approved') ? '#10b981' : (r.verdict === 'blocker') ? '#ef4444' : '#f59e0b';
 
         if (!r.findings || r.findings.length === 0) {
-          container.innerHTML = '<div style="color: #10b981; font-weight: 600; padding: 16px;">✓ Critic verified: 0 defects discovered. Code is approved.</div>';
+          container.innerHTML = '<div style="color: #10b981; font-weight: 600; padding: 16px; display: flex; align-items: center; gap: 8px;">${lucideSvg('circle-check', 16)}<span>Critic verified: 0 defects discovered. Code is approved.</span></div>';
           return;
         }
 

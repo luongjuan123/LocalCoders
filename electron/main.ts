@@ -158,16 +158,27 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-app.on('before-quit', async (e) => {
-  console.log('[LocalCoders Electron] Quitting application: Stopping tasks and unloading Ollama models...');
-  try {
-    if (activeOrchestrator) {
-      activeOrchestrator.cancelTask();
+let isQuitting = false;
+app.on('before-quit', (e) => {
+  if (isQuitting) return;
+  e.preventDefault();
+  isQuitting = true;
+  console.log('[LocalCoders Electron] Quitting application: Stopping tasks, unloading Ollama models, and stopping Ollama server...');
+  (async () => {
+    try {
+      if (activeOrchestrator) {
+        activeOrchestrator.cancelTask();
+      }
+      if (activeOllamaService) {
+        await Promise.race([
+          activeOllamaService.stopServerAndModels(),
+          new Promise((r) => setTimeout(r, 4000)),
+        ]);
+      }
+    } catch (err: any) {
+      console.warn('[LocalCoders Electron] Error during quit cleanup:', err.message);
+    } finally {
+      app.quit();
     }
-    if (activeOllamaService) {
-      await activeOllamaService.unloadAllModels();
-    }
-  } catch (err: any) {
-    console.warn('[LocalCoders Electron] Error during quit cleanup:', err.message);
-  }
+  })();
 });

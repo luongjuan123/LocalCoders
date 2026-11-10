@@ -2,17 +2,22 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import { AgentMessage, TaskPlanItem, CriticReport } from '../agents/types';
+import { ExecutionActivityItem, SafeAgentPhase } from '../agents/events';
 import { ReasoningEffort } from '../models/model-provider-registry';
+import type { CommandResult } from '../commands/types';
 
 export type ExecutionMode = 'code' | 'smart' | 'ask' | 'plan';
 export type PermissionMode = 'ask' | 'smart' | 'bypass';
 
 export interface AgentSessionConfig {
-  providerId: string; // 'ollama' | 'openai' | 'anthropic' | 'gemini' | 'custom'
-  modelId: string; // e.g. "ollama/qwen3.8:27b", "anthropic/claude-3-7-sonnet"
+  providerId: string; // 'ollama' | 'openai' | 'anthropic' | 'gemini' | 'openrouter' | 'custom'
+  modelId: string; // Canonical ID e.g. "ollama/qwen3:8b", "openai/gpt-4o"
   modelName?: string;
   reasoningEffort: ReasoningEffort;
   fastMode: boolean;
+  temperature?: number;
+  maxOutputTokens?: number;
+  contextLimit?: number;
   executionMode: ExecutionMode;
   permissionMode: PermissionMode;
   enabledMcpServers?: string[];
@@ -38,7 +43,10 @@ export interface SessionData {
   id: string;
   title: string;
   userGoal: string;
-  status: 'running' | 'waiting_approval' | 'completed' | 'failed' | 'idle';
+  status: 'running' | 'waiting_approval' | 'completed' | 'failed' | 'cancelled' | 'idle';
+  activePhase?: SafeAgentPhase;
+  activePhaseSummary?: string;
+  planExplicit?: boolean;
   createdAt: number;
   updatedAt: number;
   workspaceRoot: string;
@@ -48,6 +56,8 @@ export interface SessionData {
   messages: AgentMessage[];
   plan: TaskPlanItem[];
   executionGroups: ExecutionGroup[];
+  activities?: ExecutionActivityItem[];
+  commandResults?: CommandResult[];
   criticReport?: CriticReport | null;
   archived: boolean;
 }
@@ -81,6 +91,25 @@ export class SessionManager {
     this._onDidChangeSessions.fire();
   }
 
+  /**
+   * Updates the target working folder for the agent (and current section) without
+   * switching session storage directories or jumping into past sessions from that folder.
+   */
+  public setTargetWorkspaceRoot(root: string): void {
+    this.workspaceRoot = root;
+    const active = this.getActiveSession();
+    if (active) {
+      active.workspaceRoot = root;
+      active.updatedAt = Date.now();
+      this.saveSession(active);
+      this._onDidChangeSessions.fire();
+    }
+  }
+
+  public getTargetWorkspaceRoot(): string {
+    return this.getActiveSession()?.workspaceRoot || this.workspaceRoot;
+  }
+
   private ensureStorage() {
     try {
       if (!fs.existsSync(this.storageDir)) {
@@ -104,8 +133,9 @@ export class SessionManager {
           // Backfill config if legacy session
           if (!session.config) {
             session.config = {
-              providerId: 'ollama',
-              modelId: session.model || 'qwen3.8:27b',
+              providerId: session.model && session.model.includes('/') ? session.model.split('/')[0] : 'ollama',
+              modelId: session.model || '',
+              modelName: session.model || '',
               reasoningEffort: 'medium',
               fastMode: false,
               executionMode: 'code',
@@ -148,7 +178,7 @@ export class SessionManager {
 
   public createSession(
     goal: string,
-    model: string = 'qwen3.8:27b',
+    model: string = '',
     initialConfig?: Partial<AgentSessionConfig>
   ): SessionData {
     const id = `session_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -183,6 +213,7 @@ export class SessionManager {
       messages: [],
       plan: [],
       executionGroups: [],
+      activities: [],
       archived: false,
     };
 
@@ -250,14 +281,21 @@ export class SessionManager {
       const seen = new Set<string>();
       const deduped: AgentMessage[] = [];
       for (const m of session.messages) {
-        if (!m.id) {
-          deduped.push(m);
+        if (m.id && seen.has(m.id)) {
           continue;
         }
-        if (!seen.has(m.id)) {
-          seen.add(m.id);
-          deduped.push(m);
+        if (deduped.length > 0) {
+          const prev = deduped[deduped.length - 1];
+          if (
+            prev.senderRole === m.senderRole &&
+            prev.content.trim() === m.content.trim() &&
+            Math.abs((prev.timestamp || 0) - (m.timestamp || 0)) < 20000
+          ) {
+            continue; // Deduplicate identical consecutive messages
+          }
         }
+        if (m.id) seen.add(m.id);
+        deduped.push(m);
       }
       session.messages = deduped;
     }
@@ -271,8 +309,8 @@ export class SessionManager {
     if (!session) return undefined;
     if (!session.config) {
       session.config = {
-        providerId: 'ollama',
-        modelId: session.model || 'qwen3.8:27b',
+        providerId: session.model && session.model.includes('/') ? session.model.split('/')[0] : 'ollama',
+        modelId: session.model || '',
         reasoningEffort: 'medium',
         fastMode: false,
         executionMode: 'code',

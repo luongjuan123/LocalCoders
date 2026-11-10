@@ -1,21 +1,121 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { exec } from 'child_process';
-import { promisify } from 'util';
+import { spawn } from 'child_process';
 import { ToolExecutionContext, ToolResult } from './types';
 import { ProcessManager } from './process-manager';
 
-const execAsync = promisify(exec);
+export function getPreferredShell(): string | boolean {
+  if (process.platform === 'win32') return true;
+  if (fs.existsSync('/bin/bash')) return '/bin/bash';
+  if (process.env.SHELL && fs.existsSync(process.env.SHELL)) return process.env.SHELL;
+  return true;
+}
+
+export function buildWorkspaceCommandEnv(cwd: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  const pathKey = Object.keys(env).find((k) => k.toLowerCase() === 'path') || 'PATH';
+  const currentPath = env[pathKey] || '';
+  const extraBins: string[] = [];
+
+  if (cwd) {
+    for (const venvName of ['.venv', 'venv']) {
+      const venvDir = path.join(cwd, venvName);
+      const binDir = path.join(venvDir, process.platform === 'win32' ? 'Scripts' : 'bin');
+      if (fs.existsSync(binDir)) {
+        extraBins.push(binDir);
+        if (!env.VIRTUAL_ENV) env.VIRTUAL_ENV = venvDir;
+      }
+    }
+    const nodeBin = path.join(cwd, 'node_modules', '.bin');
+    if (fs.existsSync(nodeBin)) {
+      extraBins.push(nodeBin);
+    }
+  }
+
+  if (extraBins.length > 0) {
+    env[pathKey] = [...extraBins, currentPath].filter(Boolean).join(path.delimiter);
+  }
+  return env;
+}
+
+export function extractInteractivePromptTail(stdout: string, stderr: string): string | undefined {
+  const combined = `${stdout || ''}\n${stderr || ''}`.trimEnd();
+  if (!combined) return undefined;
+  const lines = combined.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  if (lines.length === 0) return undefined;
+  // Walk back up to 3 lines to catch prompt before Python EOFError traceback
+  for (let i = lines.length - 1; i >= Math.max(0, lines.length - 3); i--) {
+    const line = lines[i].trim();
+    if (/EOFError:\s*EOF when reading a line/i.test(stderr) && i < lines.length - 1) {
+      if (line.endsWith(':') || line.endsWith('?') || /\b(enter|input|select|choose)\b/i.test(line)) {
+        return line;
+      }
+    }
+    if (
+      /^(?:enter|please\s+enter|input|type|password|passphrase|confirm|choose|select)\b.*[:?\]]\s*$/i.test(line) ||
+      /(?:\[y\/n\]|\(y\/n\)|\[yes\/no\]|\(HH:MM(?::SS)?\))\s*[:?]?\s*$/i.test(line)
+    ) {
+      return line;
+    }
+  }
+  if (/EOFError:\s*EOF when reading a line/i.test(stderr)) {
+    return lines[0]?.trim() || 'stdin requested';
+  }
+  return undefined;
+}
 
 export async function runCommandTool(
-  args: { command: string; timeoutMs?: number },
+  args: { command: string; stdin?: string; input?: string; timeoutMs?: number; cwd?: string },
   ctx: ToolExecutionContext
 ): Promise<ToolResult> {
-  const rawCmd = args.command || (args as any).cmd || (args as any).script || (args as any).input || (args as any).commandLine || '';
+  const explicitCmd = args.command || (args as any).cmd || (args as any).script || (args as any).commandLine;
+  const rawCmd = explicitCmd || (args as any).input || '';
   if (!rawCmd) {
     return { success: false, error: 'runCommandTool: Missing required argument "command"' };
   }
+  const stdinPayload =
+    typeof args.stdin === 'string'
+      ? args.stdin
+      : explicitCmd && typeof args.input === 'string'
+      ? args.input
+      : undefined;
   const timeout = args.timeoutMs || 45000;
+  const cwd = args.cwd || ctx.workspaceRoot;
+
+  if (ctx.abortSignal?.aborted) {
+    return {
+      success: false,
+      cancelled: true,
+      error: 'Command cancelled before start.',
+      output: { command: rawCmd, cwd, stdout: '', stderr: '', exitCode: null, cancelled: true, durationMs: 0 },
+    };
+  }
+
+  // Handle standalone venv activation calls cleanly without failing with OS Permission denied (exit 126) on non-executable activate scripts
+  const trimmedCmd = rawCmd.trim();
+  const venvActivateMatch = trimmedCmd.match(/^(?:(?:source|\.)\s+|(?:\.\/)?)(\.?venv)\/bin\/activate\s*$/);
+  if (venvActivateMatch) {
+    const venvName = venvActivateMatch[1];
+    const venvPython = path.join(cwd, venvName, 'bin', 'python');
+    if (fs.existsSync(venvPython)) {
+      return {
+        success: true,
+        output: {
+          command: rawCmd,
+          cwd,
+          stdout: `Workspace virtual environment '${venvName}' is automatically on PATH for run_command. Call python3, python, pip, or pytest directly.`,
+          stderr: '',
+          exitCode: 0,
+          durationMs: 0,
+        },
+      };
+    }
+    return {
+      success: false,
+      error: `Virtual environment '${venvName}' was not found in ${cwd}. Run 'python3 -m venv ${venvName}' first.`,
+      output: { command: rawCmd, cwd, stdout: '', stderr: `Missing virtual environment: ${venvName}`, exitCode: 1, durationMs: 0 },
+    };
+  }
 
   if (ctx.requireApproval) {
     const isDestructive =
@@ -37,38 +137,211 @@ export async function runCommandTool(
     });
 
     if (!approved) {
-      return { success: false, error: 'User rejected command execution.' };
+      return {
+        success: false,
+        cancelled: true,
+        error: 'User rejected command execution.',
+        output: { command: rawCmd, cwd, stdout: '', stderr: '', exitCode: null, cancelled: true, durationMs: 0 },
+      };
     }
   }
 
-  try {
-    const { stdout, stderr } = await execAsync(rawCmd, {
-      cwd: ctx.workspaceRoot,
-      timeout,
-      maxBuffer: 4 * 1024 * 1024,
+  const startTime = Date.now();
+  return new Promise<ToolResult>((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let cancelled = false;
+    let timedOut = false;
+    let promptStalled = false;
+    let detectedPromptText: string | undefined;
+    let lastOutputAt = startTime;
+
+    const child = spawn(rawCmd, {
+      cwd,
+      shell: getPreferredShell(),
+      detached: process.platform !== 'win32',
+      env: buildWorkspaceCommandEnv(cwd),
     });
 
-    return {
-      success: true,
-      output: {
-        command: rawCmd,
-        stdout: stdout.trim(),
-        stderr: stderr.trim(),
-        exitCode: 0,
-      },
+    // Feed provided stdin or close stdin immediately (EOF) so synchronous commands waiting for input never hang 45s
+    if (child.stdin) {
+      if (stdinPayload !== undefined) {
+        if (stdinPayload.length > 0) {
+          child.stdin.write(stdinPayload.endsWith('\n') ? stdinPayload : `${stdinPayload}\n`);
+        }
+        child.stdin.end();
+      } else {
+        child.stdin.end();
+      }
+    }
+
+    const killChildTree = () => {
+      try {
+        if (child.pid && process.platform !== 'win32') {
+          try {
+            process.kill(-child.pid, 'SIGKILL');
+          } catch {
+            child.kill('SIGKILL');
+          }
+        } else {
+          child.kill('SIGKILL');
+        }
+      } catch {
+        // Ignore already-exited child errors
+      }
     };
-  } catch (err: any) {
-    return {
-      success: false,
-      error: err.message,
-      output: {
-        command: rawCmd,
-        stdout: err.stdout ? err.stdout.trim() : '',
-        stderr: err.stderr ? err.stderr.trim() : '',
-        exitCode: err.code || 1,
-      },
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killChildTree();
+    }, timeout);
+
+    // Secondary guard for prompts reading /dev/tty or ignoring EOF without exiting
+    const promptPollInterval =
+      stdinPayload === undefined
+        ? setInterval(() => {
+            if (settled) return;
+            const idleMs = Date.now() - lastOutputAt;
+            if (idleMs >= 5000) {
+              const tailPrompt = extractInteractivePromptTail(stdout, '');
+              if (tailPrompt) {
+                promptStalled = true;
+                detectedPromptText = tailPrompt;
+                killChildTree();
+              }
+            }
+          }, 500)
+        : undefined;
+
+    const onAbort = () => {
+      cancelled = true;
+      killChildTree();
     };
-  }
+    ctx.abortSignal?.addEventListener('abort', onAbort, { once: true });
+
+    const appendBounded = (prev: string, chunk: string) => {
+      const next = prev + chunk;
+      const maxLen = 2 * 1024 * 1024;
+      return next.length > maxLen ? next.slice(next.length - maxLen) : next;
+    };
+
+    child.stdout?.on('data', (d: Buffer) => {
+      lastOutputAt = Date.now();
+      const text = d.toString('utf-8');
+      stdout = appendBounded(stdout, text);
+      ctx.onOutput?.('stdout', text);
+    });
+
+    child.stderr?.on('data', (d: Buffer) => {
+      lastOutputAt = Date.now();
+      const text = d.toString('utf-8');
+      stderr = appendBounded(stderr, text);
+      ctx.onOutput?.('stderr', text);
+    });
+
+    const finalize = (code: number | null, errMsg?: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (promptPollInterval) clearInterval(promptPollInterval);
+      ctx.abortSignal?.removeEventListener('abort', onAbort);
+      const durationMs = Date.now() - startTime;
+      const outTrim = stdout.trim();
+      const errTrim = stderr.trim();
+      const interactivePrompt = detectedPromptText || extractInteractivePromptTail(outTrim, errTrim);
+      const eofInteractive = Boolean(
+        promptStalled ||
+          (stdinPayload === undefined &&
+            (/EOFError:\s*EOF when reading a line/i.test(errTrim) ||
+              (timedOut && interactivePrompt)))
+      );
+      const interactiveHint =
+        'Process expects interactive input' +
+        (interactivePrompt ? ` (prompt: "${interactivePrompt}")` : '') +
+        `. Re-run run_command with 'stdin' (e.g. stdin: "...\\n"), pass CLI arguments/tests, or use start_process + write_stdin for multi-step interaction.`;
+
+      if (cancelled) {
+        resolve({
+          success: false,
+          cancelled: true,
+          error: 'Command cancelled by user.',
+          output: { command: rawCmd, cwd, stdout: outTrim, stderr: errTrim, exitCode: null, cancelled: true, durationMs },
+        });
+        return;
+      }
+
+      if (promptStalled || (timedOut && eofInteractive)) {
+        resolve({
+          success: false,
+          error: interactiveHint,
+          output: {
+            command: rawCmd,
+            cwd,
+            stdout: outTrim,
+            stderr: errTrim ? `${errTrim}\n${interactiveHint}` : interactiveHint,
+            exitCode: code ?? 124,
+            timedOut: true,
+            interactiveRequired: true,
+            promptDetected: interactivePrompt,
+            durationMs,
+          },
+        });
+        return;
+      }
+
+      if (timedOut) {
+        const timeoutHint = `Command timed out after ${timeout}ms. For long-running UIs, watch loops, or servers, use 'start_process' instead of blocking 'run_command'.`;
+        resolve({
+          success: false,
+          error: timeoutHint,
+          output: {
+            command: rawCmd,
+            cwd,
+            stdout: outTrim,
+            stderr: errTrim,
+            exitCode: code ?? 124,
+            timedOut: true,
+            durationMs,
+          },
+        });
+        return;
+      }
+
+      if (errMsg) {
+        resolve({
+          success: false,
+          error: errMsg,
+          output: { command: rawCmd, cwd, stdout: outTrim, stderr: errTrim, exitCode: code ?? 1, durationMs },
+        });
+        return;
+      }
+
+      const exitCode = code ?? 0;
+      const permNote =
+        exitCode === 126
+          ? ' (OS file execute permission denied — target script lacks executable +x bit or OS access, unrelated to LocalCoders approval policy)'
+          : '';
+      const extraNote = eofInteractive ? `\n${interactiveHint}` : permNote;
+      resolve({
+        success: exitCode === 0,
+        error: exitCode === 0 ? undefined : eofInteractive ? interactiveHint : `Command exited with code ${exitCode}${permNote}`,
+        output: {
+          command: rawCmd,
+          cwd,
+          stdout: outTrim,
+          stderr: extraNote ? (errTrim ? `${errTrim}\n${extraNote.trim()}` : extraNote.trim()) : errTrim,
+          exitCode,
+          interactiveRequired: eofInteractive || undefined,
+          promptDetected: eofInteractive ? interactivePrompt : undefined,
+          durationMs,
+        },
+      });
+    };
+
+    child.on('error', (err) => finalize(1, err.message));
+    child.on('close', (code) => finalize(code));
+  });
 }
 
 export async function startProcessTool(
@@ -97,7 +370,7 @@ export async function startProcessTool(
   }
 
   try {
-    const proc = pm.startProcess(id, args.command, cwd);
+    const proc = pm.startProcess(id, args.command, cwd, buildWorkspaceCommandEnv(cwd), getPreferredShell());
     return {
       success: true,
       output: {
@@ -141,11 +414,18 @@ export async function writeStdinTool(
 ): Promise<ToolResult> {
   const pm = ProcessManager.getInstance();
   const success = pm.writeStdin(args.processId, args.input);
+  if (success) {
+    await new Promise((r) => setTimeout(r, 120));
+  }
+  const proc = pm.getProcess(args.processId);
+  const recentLines = success ? pm.readOutput(args.processId, 15) : [];
   return {
     success,
     output: {
       processId: args.processId,
       sent: success,
+      status: proc?.status,
+      recentOutput: recentLines.join('\n'),
     },
     error: success ? undefined : `Failed to write stdin to process '${args.processId}' (not running or no stdin).`,
   };

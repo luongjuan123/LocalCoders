@@ -7,6 +7,7 @@ import { AgentOrchestrator } from './agents/orchestrator';
 import { SessionManager } from './sessions/session-manager';
 import { ChangesManager } from './context/changes-manager';
 import { SetupWizardPanel } from './views/wizard-view';
+import { ModelManagerPanel } from './views/model-manager-view';
 import { AgentWorkspaceEditorPanel } from './views/agent-workspace-editor';
 import { ChatViewProvider } from './views/chat-view';
 import { ChangesViewProvider } from './views/changes-view';
@@ -26,28 +27,35 @@ import { McpHost } from './mcp/mcp-host';
 import { ModelProviderRegistry } from './models/model-provider-registry';
 import { PermissionManager, SecurityMode } from './security/permission-manager';
 import { ProcessManager } from './tools/process-manager';
+import { TerminalSessionManager } from './tools/terminal-session-manager';
 import { BrowserManager } from './tools/browser-tools';
+import { collectNonAgentTabsToClose } from './views/agent-mode-lock';
 
 let activeOrchestrator: AgentOrchestrator | null = null;
 let activeOllamaClient: OllamaClient | null = null;
 let activeMcpHost: McpHost | null = null;
 let activePermissionManager: PermissionManager | null = null;
+let isDeactivating = false;
 
 export async function activate(context: vscode.ExtensionContext) {
   console.log('[LocalCoders] Initializing Multi-Agent AI Core...');
 
   const config = vscode.workspace.getConfiguration('localcoders');
-  const ollamaHost = config.get<string>('ollamaHost') || 'http://127.0.0.1:11434';
+  const ollamaHost = config.get<string>('ollamaHost') || 'http://localhost:11434';
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
 
   // Initialize Core Services
   const ollama = new OllamaClient(ollamaHost);
-  const modelRegistry = ModelProviderRegistry.initialize(ollama, context.globalState);
+  const modelRegistry = ModelProviderRegistry.initialize(ollama, context.globalState, context.secrets);
   const registry = new AgentRegistry(context);
   const permissionManager = new PermissionManager(workspaceRoot);
+  const initialPermMode = config.get<'ask' | 'smart' | 'bypass'>('defaultPermissionMode');
+  if (initialPermMode) {
+    permissionManager.setMode(initialPermMode);
+  }
   const mcpHost = new McpHost(workspaceRoot);
   const toolManager = new ToolManager(mcpHost, permissionManager);
-  const orchestrator = new AgentOrchestrator(ollama, registry, toolManager, workspaceRoot);
+  const orchestrator = new AgentOrchestrator(ollama, registry, toolManager, workspaceRoot, modelRegistry);
   const sessionManager = new SessionManager(context, workspaceRoot);
   const changesManager = new ChangesManager(workspaceRoot);
 
@@ -56,13 +64,13 @@ export async function activate(context: vscode.ExtensionContext) {
   activeMcpHost = mcpHost;
   activePermissionManager = permissionManager;
 
-  // Ensure default Main Agent exists
+  // Ensure Main Agent exists without hardcoding unavailable models
   if (!registry.getMainAgent()) {
     registry.setMainAgent({
       id: 'main',
       name: 'Main Agent',
       role: 'Lead Architect & Autonomous Developer',
-      model: 'qwen3.8:27b',
+      model: '',
       systemPrompt: 'Lead autonomous developer and orchestrator. Directs implementation, creates files, writes code, and executes tests.',
       enabled: true,
       maxConcurrency: 1,
@@ -92,24 +100,54 @@ export async function activate(context: vscode.ExtensionContext) {
 
   // Status Bar Indicator
   const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-  statusBarItem.command = 'localcoders.openChat';
-  statusBarItem.tooltip = 'LocalCoders Multi-Agent AI Status';
+  statusBarItem.command = 'localcoders.manageModels';
+  statusBarItem.tooltip = 'LocalCoders Multi-Agent AI — Click to open Model & Provider Manager';
   statusBarItem.text = '$(hubot) LocalCoders';
   statusBarItem.show();
   context.subscriptions.push(statusBarItem);
 
-  // Update status bar with Ollama connection
-  ollama.checkConnection().then((conn) => {
-    if (conn.connected) {
-      const main = registry.getMainAgent();
-      statusBarItem.text = `$(pass) LocalCoders: ${main ? main.model : 'Ready'}`;
-    } else {
+  const updateStatusBar = async () => {
+    const statuses = await modelRegistry.getProviderStatuses(false);
+    const ollamaStatus = statuses.find((s) => s.providerId === 'ollama');
+    const available = await modelRegistry.getAvailableModels({ includeDisabled: false });
+    const main = registry.getMainAgent();
+    const activeSession = sessionManager.getActiveSession();
+    const activeModel = activeSession?.config?.modelName || main?.model || available[0]?.displayName;
+
+    if (available.length > 0 && activeModel) {
+      statusBarItem.text = `$(pass) LocalCoders: ${activeModel}`;
+    } else if (ollamaStatus && ollamaStatus.status !== 'connected') {
       statusBarItem.text = '$(warning) LocalCoders: Ollama Disconnected';
+    } else {
+      statusBarItem.text = '$(warning) LocalCoders: No Model Selected';
     }
+  };
+
+  // Auto-start local Ollama if configured & installed, then run initial discovery
+  const autoStartOllama = config.get<boolean>('autoStartOllamaOnStartup', true);
+  (async () => {
+    if (autoStartOllama) {
+      await ollama.ensureServerRunning().catch(() => {});
+    }
+    await modelRegistry.refreshAll(true);
+    const main = registry.getMainAgent();
+    if (main && !main.model) {
+      const first = await modelRegistry.getDefaultOrFirstAvailableModel();
+      if (first) {
+        registry.setMainAgent({ ...main, model: first.id });
+      }
+    }
+    await updateStatusBar();
+    await AgentWorkspaceEditorPanel.currentPanel?.syncActiveSession();
+  })().catch(() => {});
+
+  modelRegistry.onDidChangeModels(() => {
+    updateStatusBar().catch(() => {});
+    AgentWorkspaceEditorPanel.currentPanel?.syncActiveSession().catch(() => {});
   });
 
   // 1. Register Webview Providers
-  const navigationViewProvider = new NavigationViewProvider(context.extensionUri, sessionManager, ollama);
+  const navigationViewProvider = new NavigationViewProvider(context.extensionUri, sessionManager, ollama, modelRegistry);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(NavigationViewProvider.viewType, navigationViewProvider)
   );
@@ -121,7 +159,10 @@ export async function activate(context: vscode.ExtensionContext) {
     ollama,
     modelRegistry,
     permissionManager,
-    toolManager
+    toolManager,
+    registry,
+    mcpHost,
+    changesManager
   );
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(ChatViewProvider.viewType, chatViewProvider)
@@ -153,7 +194,7 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.window.registerTreeDataProvider('localcoders.taskMonitorView', taskMonitorTreeProvider)
   );
 
-  const modelManagerTreeProvider = new ModelManagerTreeProvider(ollama);
+  const modelManagerTreeProvider = new ModelManagerTreeProvider(ollama, modelRegistry);
   context.subscriptions.push(
     vscode.window.registerTreeDataProvider('localcoders.modelManagerView', modelManagerTreeProvider)
   );
@@ -179,13 +220,84 @@ export async function activate(context: vscode.ExtensionContext) {
   );
 
   // 3. Mode State & Commands
-  let currentMode: 'agent' | 'ide' = 'agent';
+  AgentWorkspaceEditorPanel.configureServices(registry, mcpHost);
+  let currentMode: 'agent' | 'ide' = config.get<'agent' | 'ide'>('defaultView', 'agent') === 'ide' ? 'ide' : 'agent';
+  let isEnforcingSingleAgentTab = false;
+
+  const ensureAgentPanelOpen = () =>
+    AgentWorkspaceEditorPanel.createOrShow(
+      context.extensionUri,
+      orchestrator,
+      sessionManager,
+      ollama,
+      changesManager,
+      modelRegistry,
+      toolManager,
+      permissionManager
+    );
+
+  const enforceSingleAgentTab = async () => {
+    if (currentMode !== 'agent' || isDeactivating || isEnforcingSingleAgentTab) {
+      return;
+    }
+    isEnforcingSingleAgentTab = true;
+    try {
+      const hasPanel = Boolean(AgentWorkspaceEditorPanel.currentPanel);
+      const { tabsToClose } = collectNonAgentTabsToClose(vscode.window.tabGroups.all);
+      const hasMultipleGroups = vscode.window.tabGroups.all.length > 1;
+      if (hasPanel && tabsToClose.length === 0 && !hasMultipleGroups) {
+        return;
+      }
+
+      ensureAgentPanelOpen();
+      const updated = collectNonAgentTabsToClose(vscode.window.tabGroups.all);
+      if (updated.tabsToClose.length > 0) {
+        await vscode.window.tabGroups.close(updated.tabsToClose, false).then(undefined, () => {});
+      }
+      if (vscode.window.tabGroups.all.length > 1) {
+        await vscode.commands.executeCommand('workbench.action.joinAllGroups').then(undefined, () => {});
+      }
+      AgentWorkspaceEditorPanel.currentPanel?.syncActiveSession();
+      await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar').then(undefined, () => {});
+      await vscode.commands.executeCommand('workbench.action.closeSidebar').then(undefined, () => {});
+      await vscode.commands.executeCommand('workbench.action.closePanel').then(undefined, () => {});
+    } catch (e) {
+      console.warn('[LocalCoders] Agent Mode isolation warning:', e);
+    } finally {
+      isEnforcingSingleAgentTab = false;
+    }
+  };
+
+  AgentWorkspaceEditorPanel.onDidDisposeUnexpected = () => {
+    if (currentMode === 'agent' && !isDeactivating) {
+      setTimeout(() => {
+        if (currentMode === 'agent' && !isDeactivating) {
+          void enforceSingleAgentTab();
+        }
+      }, 20);
+    }
+  };
 
   context.subscriptions.push(
+    vscode.window.tabGroups.onDidChangeTabs(() => {
+      if (currentMode === 'agent' && !isDeactivating) {
+        void enforceSingleAgentTab();
+      }
+    }),
+    vscode.window.tabGroups.onDidChangeTabGroups(() => {
+      if (currentMode === 'agent' && !isDeactivating) {
+        void enforceSingleAgentTab();
+      }
+    }),
+    vscode.window.onDidChangeActiveTextEditor((editor) => {
+      if (currentMode === 'agent' && !isDeactivating && editor) {
+        void enforceSingleAgentTab();
+      }
+    }),
     vscode.commands.registerCommand('localcoders.activateAgentView', async () => {
       currentMode = 'agent';
+      await vscode.commands.executeCommand('setContext', 'localcoders.inAgentMode', true).then(undefined, () => {});
       try {
-        // In Agents View: Close right auxiliary bar and left primary sidebar to dedicate full window to 3-column Devin cockpit
         await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
         await vscode.commands.executeCommand('workbench.action.closeSidebar');
         await vscode.commands.executeCommand('workbench.action.closePanel');
@@ -193,30 +305,20 @@ export async function activate(context: vscode.ExtensionContext) {
         console.warn('[LocalCoders] Focus error:', e);
       }
 
-      AgentWorkspaceEditorPanel.createOrShow(
-        context.extensionUri,
-        orchestrator,
-        sessionManager,
-        ollama,
-        changesManager,
-        modelRegistry,
-        toolManager,
-        permissionManager
-      );
+      ensureAgentPanelOpen();
+      await enforceSingleAgentTab();
 
-      // Re-enforce closing sidebars in case layout restoration re-opened them
-      setTimeout(async () => {
-        try {
-          if (currentMode === 'agent') {
-            await vscode.commands.executeCommand('workbench.action.closeAuxiliaryBar');
-            await vscode.commands.executeCommand('workbench.action.closeSidebar');
-          }
-        } catch (_) {}
+      // Re-enforce closing sidebars & stray restored tabs in case workbench restoration re-opened them
+      setTimeout(() => {
+        if (currentMode === 'agent' && !isDeactivating) {
+          void enforceSingleAgentTab();
+        }
       }, 150);
     }),
 
     vscode.commands.registerCommand('localcoders.activateIDEView', async () => {
       currentMode = 'ide';
+      await vscode.commands.executeCommand('setContext', 'localcoders.inAgentMode', false).then(undefined, () => {});
       try {
         // In IDE View: Unconditionally close the center Agent webview cockpit
         AgentWorkspaceEditorPanel.closeCurrent();
@@ -281,9 +383,13 @@ export async function activate(context: vscode.ExtensionContext) {
         placeHolder: 'e.g. Build a python clock application with tests',
       });
       if (goal) {
-        const models = await ollama.listModels();
-        const model = models[0]?.name || 'qwen3.8:27b';
-        sessionManager.createSession(goal, model);
+        const firstAvailable = await modelRegistry.getDefaultOrFirstAvailableModel();
+        const model = firstAvailable?.id || '';
+        sessionManager.createSession(goal, model, {
+          providerId: firstAvailable?.providerId || 'ollama',
+          modelId: model,
+          modelName: firstAvailable?.displayName || '',
+        });
         if (currentMode === 'agent') {
           AgentWorkspaceEditorPanel.currentPanel?.syncActiveSession();
         } else {
@@ -293,6 +399,10 @@ export async function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand('localcoders.openSetupWizard', () => {
+      if (currentMode === 'agent') {
+        void ensureAgentPanelOpen().openCockpitModal('settings');
+        return;
+      }
       SetupWizardPanel.createOrShow(context.extensionUri, ollama, registry);
     }),
 
@@ -312,13 +422,13 @@ export async function activate(context: vscode.ExtensionContext) {
       const picked = await vscode.window.showQuickPick(
         [
           {
-            label: '☵ Agent View (Autonomous Cockpit)',
+            label: 'Agent View (Autonomous Cockpit)',
             description: current === 'agent' ? '(Current Default)' : '',
             detail: 'Agent-first 3-column Devin workspace with sessions sidebar, conversation stream, and live changes review.',
             value: 'agent' as const,
           },
           {
-            label: '💻 IDE View (Classic Workbench)',
+            label: 'IDE View (Classic Workbench)',
             description: current === 'ide' ? '(Current Default)' : '',
             detail: 'Traditional VS Code code editor, Explorer file tree, and docked AI Assistant in the secondary sidebar.',
             value: 'ide' as const,
@@ -343,13 +453,23 @@ export async function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand('localcoders.selectMainAgent', async () => {
-      const models = await ollama.listModels();
+      const models = await modelRegistry.getAvailableModels({ includeDisabled: false, forceRefresh: true });
       if (models.length === 0) {
-        vscode.window.showWarningMessage('No Ollama models found.');
+        const openMgr = await vscode.window.showWarningMessage(
+          'No models discovered in Ollama or configured cloud providers.',
+          'Open Model Manager'
+        );
+        if (openMgr === 'Open Model Manager') {
+          vscode.commands.executeCommand('localcoders.manageModels');
+        }
         return;
       }
       const selected = await vscode.window.showQuickPick(
-        models.map((m) => ({ label: m.name, description: m.details?.parameter_size })),
+        models.map((m) => ({
+          label: m.displayName,
+          description: `${m.providerName} | ${m.availability}`,
+          modelId: m.id,
+        })),
         { placeHolder: 'Select model for mandatory Main Agent' }
       );
       if (selected) {
@@ -358,13 +478,14 @@ export async function activate(context: vscode.ExtensionContext) {
           id: 'main',
           name: 'Main Agent',
           role: 'Lead Architect',
-          model: selected.label,
+          model: selected.modelId,
           systemPrompt: current?.systemPrompt || 'Lead coordinator and implementation planner.',
           enabled: true,
           maxConcurrency: 1,
           temperature: 0.2,
           contextWindow: 32768,
         });
+        await modelRegistry.setDefaultModel(selected.modelId);
         agentTeamTreeProvider.refresh();
         vscode.window.showInformationMessage(`Main Agent model updated to '${selected.label}'`);
       }
@@ -375,7 +496,11 @@ export async function activate(context: vscode.ExtensionContext) {
     }),
 
     vscode.commands.registerCommand('localcoders.manageModels', () => {
-      vscode.commands.executeCommand('localcoders.openSetupWizard');
+      if (currentMode === 'agent') {
+        void ensureAgentPanelOpen().openCockpitModal('models');
+        return;
+      }
+      ModelManagerPanel.createOrShow(context.extensionUri, modelRegistry, ollama, registry);
     }),
 
     vscode.commands.registerCommand('localcoders.enableCritic', async () => {
@@ -388,7 +513,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     vscode.commands.registerCommand('localcoders.reviewGitChanges', async () => {
       vscode.window.showInformationMessage('LocalCoders: Critic Agent is auditing current Git changes...');
-      const criticConf = registry.getCriticConfig();
+      const criticConf = { ...registry.getCriticConfig() };
       const main = registry.getMainAgent();
       if (!criticConf.model && main) {
         criticConf.model = main.model;
@@ -398,14 +523,17 @@ export async function activate(context: vscode.ExtensionContext) {
         criticConf,
         new (await import('./context/memory-manager')).MemoryManager(workspaceRoot),
         toolManager,
-        workspaceRoot
+        workspaceRoot,
+        orchestrator.getLLMRouter()
       );
 
-      const report = await critic.review({
+      await critic.review({
         userRequirements: 'Audit working tree git changes for defects, security vulnerabilities, and race conditions.',
       });
 
-      vscode.commands.executeCommand('localcoders.criticFindingsPanel.focus');
+      if (currentMode !== 'agent') {
+        vscode.commands.executeCommand('localcoders.criticFindingsPanel.focus');
+      }
     }),
 
     vscode.commands.registerCommand('localcoders.reviewCurrentFile', async () => {
@@ -557,26 +685,39 @@ export async function activate(context: vscode.ExtensionContext) {
     }
   };
 
+  launchPreferredView();
   setTimeout(launchPreferredView, 250);
-  setTimeout(launchPreferredView, 650);
+  setTimeout(launchPreferredView, 700);
 
   console.log('[LocalCoders] Multi-Agent AI Core successfully activated.');
 }
 
 export async function deactivate(): Promise<void> {
-  console.log('[LocalCoders] Closing IDE: Cancelling tasks, unloading Ollama models, and terminating background processes & browsers...');
+  isDeactivating = true;
+  console.log('[LocalCoders] Closing IDE: Stopping active tasks, unloading Ollama models, stopping local Ollama server, and freeing GPU/RAM...');
   try {
     if (activeOrchestrator) {
       activeOrchestrator.cancelTask();
     }
-    if (activeOllamaClient) {
-      await activeOllamaClient.unloadAllModels();
-    }
-    if (activeMcpHost) {
-      await activeMcpHost.disconnectAll();
-    }
     ProcessManager.getInstance().terminateAll();
-    await BrowserManager.getInstance().close();
+    TerminalSessionManager.getInstance().terminateAll();
+    if (activeMcpHost) {
+      await Promise.race([
+        activeMcpHost.disconnectAll().catch(() => {}),
+        new Promise((r) => setTimeout(r, 1200)),
+      ]);
+    }
+    if (activeOllamaClient) {
+      const stopOnExit = vscode.workspace.getConfiguration('localcoders').get<boolean>('stopOllamaOnExit', true);
+      await Promise.race([
+        activeOllamaClient.stopServerAndModels({ stopServer: stopOnExit }),
+        new Promise((r) => setTimeout(r, 3800)),
+      ]);
+    }
+    await Promise.race([
+      BrowserManager.getInstance().close().catch(() => {}),
+      new Promise((r) => setTimeout(r, 800)),
+    ]);
   } catch (err: any) {
     console.warn('[LocalCoders] Warning during deactivation cleanup:', err.message);
   }

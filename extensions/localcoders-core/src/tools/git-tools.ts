@@ -34,7 +34,11 @@ export async function readGitDiffTool(args: { path?: string; staged?: boolean },
 export async function inspectGitStatusTool(_args: any, ctx: ToolExecutionContext): Promise<ToolResult> {
   try {
     const branch = await runGit('branch --show-current', ctx.workspaceRoot).catch(() => 'detached');
-    const statusOut = await runGit('status --porcelain=v1 -uall', ctx.workspaceRoot);
+    const { stdout } = await execAsync('git status --porcelain=v1 -uall', {
+      cwd: ctx.workspaceRoot,
+      maxBuffer: 15 * 1024 * 1024,
+    });
+    const statusOut = stdout.replace(/\r?\n$/, '');
 
     const staged: string[] = [];
     const modified: string[] = [];
@@ -196,15 +200,22 @@ export async function revertFileTool(args: { path: string }, ctx: ToolExecutionC
 
 export async function createCheckpointTool(args: { description: string }, ctx: ToolExecutionContext): Promise<ToolResult> {
   try {
+    const topLevel = (await runGit('rev-parse --show-toplevel', ctx.workspaceRoot).catch(() => '')).trim();
+    if (!topLevel || path.resolve(topLevel) !== path.resolve(ctx.workspaceRoot)) {
+      return { success: true, output: { checkpointCreated: false, message: 'Workspace is not a standalone git repository root; skipped checkpoint.' } };
+    }
     const status = await runGit('status --porcelain', ctx.workspaceRoot).catch(() => '');
     if (!status.trim()) {
       return { success: true, output: { checkpointCreated: true, message: 'Working tree is clean; no changes to stash.' } };
     }
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
     const message = `LocalCoders Checkpoint [${timestamp}]: ${args.description || 'Pre-agent execution'}`;
-    await runGit(`stash push -u -m "${message}"`, ctx.workspaceRoot);
-    await runGit('stash apply', ctx.workspaceRoot);
-    return { success: true, output: { checkpointCreated: true, description: message } };
+    // Non-destructive checkpoint: create stash commit without modifying working tree or removing untracked files
+    const stashCommit = (await runGit(`stash create "${message}"`, ctx.workspaceRoot)).trim();
+    if (stashCommit) {
+      await runGit(`stash store -m "${message}" ${stashCommit}`, ctx.workspaceRoot);
+    }
+    return { success: true, output: { checkpointCreated: true, description: message, commit: stashCommit || undefined } };
   } catch (err: any) {
     return { success: false, error: err.message };
   }

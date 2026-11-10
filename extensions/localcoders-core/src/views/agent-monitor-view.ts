@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { AgentOrchestrator } from '../agents/orchestrator';
 import { AgentRegistry } from '../agents/agent-registry';
 import { AgentActivityEvent } from '../agents/types';
+import { AgentStreamEvent, sanitizeActivityText } from '../agents/events';
 
 export class AgentMonitorViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'localcoders.agentMonitorPanel';
@@ -14,9 +15,36 @@ export class AgentMonitorViewProvider implements vscode.WebviewViewProvider {
     private readonly registry: AgentRegistry
   ) {
     this.orchestrator.onActivity((ev) => {
-      this.logs.unshift(ev);
+      const cleaned = sanitizeActivityText(ev.latestActivity, ev.status);
+      if (!cleaned) return;
+      const safeEv: AgentActivityEvent = { ...ev, latestActivity: cleaned };
+      this.logs.unshift(safeEv);
       if (this.logs.length > 200) this.logs.pop();
-      this._view?.webview.postMessage({ type: 'activity', event: ev, allLogs: this.logs });
+      this._view?.webview.postMessage({ type: 'activity', event: safeEv, allLogs: this.logs });
+    });
+
+    this.orchestrator.onStreamEvent((ev: AgentStreamEvent) => {
+      if (ev.kind === 'activity_upsert') {
+        const it = ev.item;
+        const cmdOrTitle = it.command ? `$ ${it.command}` : it.title;
+        const dur = it.durationMs ? ` (${it.durationMs}ms)` : '';
+        const ec = it.exitCode !== undefined && it.exitCode !== null ? ` [exit ${it.exitCode}]` : '';
+        const safeEv: AgentActivityEvent = {
+          agentId: it.agentId,
+          agentName: it.agentName,
+          status: it.status === 'running' ? 'working' : (it.status as any),
+          latestActivity: `${it.status.toUpperCase()}: ${cmdOrTitle}${ec}${dur}`,
+          timestamp: it.timestamp,
+        };
+        const existingIdx = this.logs.findIndex((l) => (l as any)._actId === it.id);
+        if (existingIdx !== -1) {
+          this.logs[existingIdx] = Object.assign(safeEv, { _actId: it.id }) as any;
+        } else {
+          this.logs.unshift(Object.assign(safeEv, { _actId: it.id }) as any);
+          if (this.logs.length > 200) this.logs.pop();
+        }
+        this._view?.webview.postMessage({ type: 'activity', event: safeEv, allLogs: this.logs });
+      }
     });
   }
 
@@ -103,6 +131,7 @@ export class AgentMonitorViewProvider implements vscode.WebviewViewProvider {
     .badge-planning { background: rgba(168, 85, 247, 0.2); color: #c084fc; }
     .badge-completed { background: rgba(16, 185, 129, 0.2); color: var(--success); }
     .badge-failed { background: rgba(239, 68, 68, 0.2); color: var(--danger); }
+    .badge-cancelled { background: rgba(245, 158, 11, 0.2); color: var(--warning); }
 
     .logs-header {
       font-size: 14px;

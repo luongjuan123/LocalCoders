@@ -4,6 +4,7 @@ import { AgentRegistry } from '../agents/agent-registry';
 import { AgentOrchestrator } from '../agents/orchestrator';
 import { McpHost, McpConnectedServer } from '../mcp/mcp-host';
 import { PermissionManager, SecurityMode } from '../security/permission-manager';
+import { ModelProviderRegistry } from '../models/model-provider-registry';
 
 // 1. Agent Team Tree View
 export class AgentTeamTreeProvider implements vscode.TreeDataProvider<AgentTreeItem> {
@@ -30,8 +31,8 @@ export class AgentTeamTreeProvider implements vscode.TreeDataProvider<AgentTreeI
     if (main) {
       items.push(
         new AgentTreeItem(
-          `★ ${main.name} (${main.model || 'No model'})`,
-          `${main.role} • Mandatory Coordinator`,
+          `${main.name} (${main.model || 'No model'})`,
+          `${main.role} | Mandatory Coordinator`,
           vscode.TreeItemCollapsibleState.None,
           'star',
           'localcoders.manageAgents'
@@ -40,7 +41,7 @@ export class AgentTeamTreeProvider implements vscode.TreeDataProvider<AgentTreeI
     } else {
       items.push(
         new AgentTreeItem(
-          '★ Main Agent (Not Configured)',
+          'Main Agent (Not Configured)',
           'Click to configure mandatory Main Agent',
           vscode.TreeItemCollapsibleState.None,
           'warning',
@@ -66,7 +67,7 @@ export class AgentTeamTreeProvider implements vscode.TreeDataProvider<AgentTreeI
         items.push(
           new AgentTreeItem(
             `${s.name} (${s.model || 'No model'})`,
-            `${s.role} • ${s.enabled ? 'Enabled' : 'Disabled'}`,
+            `${s.role} | ${s.enabled ? 'Enabled' : 'Disabled'}`,
             vscode.TreeItemCollapsibleState.None,
             s.enabled ? 'pass' : 'circle-slash',
             'localcoders.manageAgents'
@@ -79,8 +80,8 @@ export class AgentTeamTreeProvider implements vscode.TreeDataProvider<AgentTreeI
     const critic = this.registry.getCriticConfig();
     items.push(
       new AgentTreeItem(
-        `🛡️ Critic Agent (${critic.enabled ? critic.model || 'Active' : 'Disabled'})`,
-        `Strictness: ${critic.strictness} • Mode: ${critic.reviewMode}`,
+        `Critic Agent (${critic.enabled ? critic.model || 'Active' : 'Disabled'})`,
+        `Strictness: ${critic.strictness} | Mode: ${critic.reviewMode}`,
         vscode.TreeItemCollapsibleState.None,
         critic.enabled ? 'shield' : 'circle-slash',
         'localcoders.enableCritic'
@@ -197,7 +198,11 @@ export class ModelManagerTreeProvider implements vscode.TreeDataProvider<vscode.
   private _onDidChangeTreeData = new vscode.EventEmitter<vscode.TreeItem | undefined | null | void>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
-  constructor(private ollama: any) {}
+  constructor(private ollama: any, private modelRegistry?: ModelProviderRegistry) {
+    if (this.modelRegistry) {
+      this.modelRegistry.onDidChangeModels(() => this.refresh());
+    }
+  }
 
   refresh(): void {
     this._onDidChangeTreeData.fire();
@@ -211,25 +216,48 @@ export class ModelManagerTreeProvider implements vscode.TreeDataProvider<vscode.
     if (element) return [];
 
     const items: vscode.TreeItem[] = [];
-    try {
-      const models = await this.ollama.listModels();
+
+    const openMgrItem = new vscode.TreeItem('Open Model & Provider Manager...', vscode.TreeItemCollapsibleState.None);
+    openMgrItem.description = 'Configure Ollama, Cloud keys, Custom endpoints';
+    openMgrItem.iconPath = new vscode.ThemeIcon('settings-gear');
+    openMgrItem.command = { command: 'localcoders.manageModels', title: 'Open Model Manager' };
+    items.push(openMgrItem);
+
+    if (this.modelRegistry) {
+      const statuses = await this.modelRegistry.getProviderStatuses(false);
+      const models = await this.modelRegistry.getAvailableModels({ includeDisabled: false });
+
+      const ollamaStatus = statuses.find((s) => s.providerId === 'ollama');
+      if (ollamaStatus && ollamaStatus.status !== 'connected') {
+        const warn = new vscode.TreeItem(`Ollama Disconnected (${ollamaStatus.baseUrl})`, vscode.TreeItemCollapsibleState.None);
+        warn.description = ollamaStatus.error || 'Click to configure';
+        warn.iconPath = new vscode.ThemeIcon('warning');
+        warn.command = { command: 'localcoders.manageModels', title: 'Configure Ollama' };
+        items.push(warn);
+      }
+
       for (const m of models) {
-        const sizeGb = (m.size / (1024 * 1024 * 1024)).toFixed(1);
-        const item = new vscode.TreeItem(m.name, vscode.TreeItemCollapsibleState.None);
-        item.description = `${sizeGb} GB • ${m.details?.parameter_size || ''}`;
-        item.iconPath = new vscode.ThemeIcon('package');
-        item.tooltip = `Ollama model: ${m.name}\nQuantization: ${m.details?.quantization_level || 'N/A'}`;
+        const ctxStr = m.contextWindow ? `${Math.round(m.contextWindow / 1024)}k` : 'Ctx Unknown';
+        const item = new vscode.TreeItem(m.displayName, vscode.TreeItemCollapsibleState.None);
+        item.description = `${m.providerName} | ${m.availability} | ${ctxStr}`;
+        item.iconPath = new vscode.ThemeIcon(m.providerType === 'LOCAL' ? 'device-desktop' : 'cloud');
+        item.tooltip = `${m.id}\nSource: ${m.modelSource}\nStatus: ${m.availability}`;
         items.push(item);
       }
-    } catch {
-      items.push(new vscode.TreeItem('Ollama Service Disconnected', vscode.TreeItemCollapsibleState.None));
+    } else {
+      try {
+        const models = await this.ollama.listModels();
+        for (const m of models) {
+          const sizeGb = (m.size / (1024 * 1024 * 1024)).toFixed(1);
+          const item = new vscode.TreeItem(m.name, vscode.TreeItemCollapsibleState.None);
+          item.description = `${sizeGb} GB | ${m.details?.parameter_size || ''}`;
+          item.iconPath = new vscode.ThemeIcon('package');
+          items.push(item);
+        }
+      } catch {
+        items.push(new vscode.TreeItem('Ollama Service Disconnected', vscode.TreeItemCollapsibleState.None));
+      }
     }
-
-    const pullItem = new vscode.TreeItem('+ Browse / Pull Models...', vscode.TreeItemCollapsibleState.None);
-    pullItem.description = 'Install models from Ollama library';
-    pullItem.iconPath = new vscode.ThemeIcon('cloud-download');
-    pullItem.command = { command: 'localcoders.openSetupWizard', title: 'Open Model Manager' };
-    items.push(pullItem);
 
     return items;
   }
@@ -339,7 +367,7 @@ export class McpServersTreeProvider implements vscode.TreeDataProvider<vscode.Tr
               ? vscode.TreeItemCollapsibleState.Collapsed
               : vscode.TreeItemCollapsibleState.None
           );
-          item.description = `[${s.status.toUpperCase()}] • ${s.config.transport} (${s.tools.length} tools)`;
+          item.description = `[${s.status.toUpperCase()}] | ${s.config.transport} (${s.tools.length} tools)`;
           item.iconPath = new vscode.ThemeIcon(
             s.status === 'connected' ? 'plug' : s.status === 'error' ? 'error' : 'circle-slash'
           );

@@ -1,0 +1,2603 @@
+diff --git a/AGENTS.md b/AGENTS.md
+index d6abb76a..0d8b5d44 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -1,5 +1,78 @@
+-# VS Code Agents Instructions
++# LOCALCODERS — AUTONOMOUS AGENT TEAM DIRECTIVES
+ 
+-This file provides instructions for AI coding agents working with the VS Code codebase.
++This document specifies mandatory engineering and design protocols for all agents working on LocalCoders.
+ 
+-For detailed project overview, architecture, coding guidelines, and validation steps, see the [Copilot Instructions](.github/copilot-instructions.md).
++---
++
++## MANDATORY UI/UX DIRECTIVE: UI/UX PRO MAX INTELLIGENCE
++
++Whenever ANY agent (Main Agent, Frontend Specialist, UI/UX Designer, Component Specialist, Code Review / Critic Agent, or subagent) performs ANY user interface, component, styling, layout, interaction, or webview task, it **MUST STRICTLY FOLLOW THE UI/UX PRO MAX DESIGN SYSTEM INTELLIGENCE**.
++
++The universal design skill is permanently installed at:
++- `.agents/skills/ui-ux-pro-max/SKILL.md`
++- Master Design System: `design-system/localcoders/MASTER.md`
++- Search Script: `python3 .agents/skills/ui-ux-pro-max/scripts/search.py`
++
++### Mandatory 6-Step UI/UX Workflow
++
++For every frontend or UI/UX task, agents MUST execute these steps:
++
++1. **Read & Follow the Skill**:
++   Inspect `.agents/skills/ui-ux-pro-max/SKILL.md` and `design-system/localcoders/MASTER.md` before making any layout or styling changes.
++
++2. **Search for Targeted Design System Recommendations**:
++   Execute the local search script for component/pattern guidance:
++   ```bash
++   python3 .agents/skills/ui-ux-pro-max/scripts/search.py "<component or interaction pattern>" --design-system
++   ```
++   Or query specific domains (e.g. `--domain ux`, `--domain icons`, `--domain typography`).
++
++3. **Select Verified Visual Styles, Colors, Typography & Spacing**:
++   - **Theme**: Dark Mode (OLED / Deep Slate) Developer Tool aesthetic.
++   - **Backgrounds**: Deep black/slate (`#0F172A`, `#0B0F19`).
++   - **Cards & Surfaces**: Dark slate surfaces (`#1E293B`, `#161F30`).
++   - **Borders & Separators**: Subtle, low-contrast borders (`rgba(255, 255, 255, 0.08)` / `#334155`).
++   - **Accents**: Sky Blue (`#38BDF8`), Run Green (`#22C55E`), Indigo glow (`#818CF8`).
++   - **Typography**: Primary code font `JetBrains Mono` / UI font `IBM Plex Sans`, `-apple-system`, `Inter`.
++   - **Spacing Tokens**: Systematic 4px/8px grid (`--space-xs: 4px`, `--space-sm: 8px`, `--space-md: 16px`, `--space-lg: 24px`).
++
++4. **Enforce Accessibility & Interaction Guidelines**:
++   - **NEVER use raw emojis as icons**. Always use professional inline SVG icons (Lucide/Codicons/Heroicons) with proper `aria-hidden="true"` or accessible labels.
++   - Ensure `cursor: pointer` is set on every clickable element.
++   - Smooth hover & active transitions (150ms–200ms ease).
++   - High contrast text (`#F8FAFC` on dark surfaces, minimum 4.5:1 ratio).
++   - Visible keyboard focus rings (`:focus-visible` with `outline: 2px solid #38bdf8`).
++   - Respect `prefers-reduced-motion`.
++
++5. **Apply Recommendations to Real Implementation**:
++   Implement actual, working CSS/HTML/TypeScript within the VS Code desktop workbench, webviews, and auxiliary panels. Ensure all controls are backed by real runtime services, IPC handlers, and state management.
++
++6. **Review Visual & Functional Quality**:
++   Audit the modified interface against the UI/UX Pro Max pre-delivery checklist:
++   - [x] No raw emojis as UI icons (use clean SVGs)
++   - [x] Pointer cursor on interactive controls
++   - [x] Smooth 150-250ms transitions
++   - [x] WCAG AAA / AA contrast
++   - [x] Keyboard navigable and visible focus rings
++   - [x] Responsive flex/grid layouts with collapsible sidebars
++
++---
++
++## AGENT ROLES & DESIGN RESPONSIBILITIES
++
++### 1. Main Agent (Lead Architect)
++- Oversees overall desktop IDE ergonomics and ensures strict separation between **Agent View** (3-column Devin cockpit) and **IDE View** (classic Monaco workbench with docked AI assistant).
++- Guarantees **exactly one authoritative chat composer** is visible at all times.
++- References `design-system/localcoders/MASTER.md` for all global layout decisions.
++
++### 2. Frontend Specialist / UI/UX Agent
++- Directly queries `.agents/skills/ui-ux-pro-max/scripts/search.py` before authoring any webview HTML, CSS, or client JavaScript.
++- Enforces professional Dark Mode tokens, typography scale, icon consistency, and layout responsiveness.
++
++### 3. Component Specialist
++- Crafts reusable, accessible UI elements (buttons, popovers, segmented bars, chips, drawers, status badges) adhering to UI/UX Pro Max specifications.
++- Replaces raw emoji decorators with precision vector SVGs.
++
++### 4. Code Review / Critic Agent
++- Audits all UI pull requests and changesets against UI/UX Pro Max quality standards, accessibility rules, and theme consistency.
++- Rejects any code introducing emoji icons in place of SVGs, missing focus states, or unstyled controls.
+diff --git a/bin/localcoders b/bin/localcoders
+new file mode 100755
+index 00000000..1c518cd3
+--- /dev/null
++++ b/bin/localcoders
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++set -e
++
++cleanup() {
++  # Mandate: When user closes the IDE, stop all background processes and unload Ollama models to release GPU VRAM & memory
++  if command -v curl >/dev/null 2>&1; then
++    running_models=$(curl -s http://127.0.0.1:11434/api/ps 2>/dev/null | grep -o '"name":"[^"]*"' | cut -d'"' -f4 || true)
++    for model in $running_models; do
++      curl -s http://127.0.0.1:11434/api/generate -d "{\"model\": \"$model\", \"keep_alive\": 0}" >/dev/null 2>&1 || true
++    done
++  fi
++  # Clean up any child worker processes
++  pkill -P $$ 2>/dev/null || true
++}
++
++trap cleanup EXIT INT TERM
++
++SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
++ROOT_DIR="$(dirname "$SCRIPT_DIR")"
++VSCODE_SKIP_PRELAUNCH=1 "$ROOT_DIR/scripts/code.sh" "$@"
+diff --git a/extensions/copilot/package.json b/extensions/copilot/package.json.disabled
+similarity index 100%
+rename from extensions/copilot/package.json
+rename to extensions/copilot/package.json.disabled
+diff --git a/extensions/github-authentication/package.json b/extensions/github-authentication/package.json.disabled
+similarity index 100%
+rename from extensions/github-authentication/package.json
+rename to extensions/github-authentication/package.json.disabled
+diff --git a/extensions/github/package.json b/extensions/github/package.json.disabled
+similarity index 100%
+rename from extensions/github/package.json
+rename to extensions/github/package.json.disabled
+diff --git a/extensions/microsoft-authentication/package.json b/extensions/microsoft-authentication/package.json.disabled
+similarity index 100%
+rename from extensions/microsoft-authentication/package.json
+rename to extensions/microsoft-authentication/package.json.disabled
+diff --git a/package.json b/package.json
+index 470c1a52..4d94da31 100644
+--- a/package.json
++++ b/package.json
+@@ -30,9 +30,9 @@
+     "check-cyclic-dependencies": "node build/lib/checkCyclicDependencies.ts out",
+     "preinstall": "node build/npm/preinstall.ts",
+     "postinstall": "node build/npm/postinstall.ts",
+-    "compile": "npm-run-all2 -lp compile-client compile-copilot",
++    "compile": "pnpm run gulp compile",
+     "compile-client": "pnpm run gulp compile",
+-    "compile-copilot": "pnpm -C extensions/copilot run compile",
++    "compile-copilot": "echo 'Copilot disabled'",
+     "build-fast": "node build/next/build-fast.ts",
+     "build-fast-extensions": "pnpm run gulp copy-codicons compile-extensions compile-extension-media",
+     "typecheck-client": "tsc --project ./src/tsconfig.json --noEmit --skipLibCheck",
+@@ -158,7 +158,6 @@
+     "https-proxy-agent": "^7.0.2",
+     "jschardet": "3.1.4",
+     "katex": "^0.16.22",
+-    "kerberos": "2.1.1",
+     "libsodium-wrappers": "^0.8.4",
+     "minimist": "^1.2.8",
+     "native-is-elevated": "0.9.0",
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 3505ae57..0e23c413 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -7,7 +7,6 @@ settings:
+ overrides:
+   '@typescript-eslint/types': 8.66.0
+   node-gyp-build: 4.8.1
+-  kerberos@2.1.1>node-addon-api: 7.1.0
+   koffi: 3.2.1
+   serialize-javascript: ^7.0.3
+   yauzl: ^3.3.1
+@@ -171,9 +170,6 @@ importers:
+       katex:
+         specifier: ^0.16.22
+         version: 0.16.22
+-      kerberos:
+-        specifier: 2.1.1
+-        version: 2.1.1
+       libsodium-wrappers:
+         specifier: ^0.8.4
+         version: 0.8.4
+@@ -339,7 +335,7 @@ importers:
+         version: 2.4.0
+       '@vscode/test-web':
+         specifier: ^0.0.81
+-        version: 0.0.81(kerberos@2.1.1)
++        version: 0.0.81
+       '@webgpu/types':
+         specifier: ^0.1.66
+         version: 0.1.66
+@@ -8355,6 +8351,30 @@ snapshots:
+     transitivePeerDependencies:
+       - supports-color
+ 
++  '@vscode/test-web@0.0.81':
++    dependencies:
++      '@koa/cors': 5.0.0
++      '@koa/router': 15.6.0(koa@3.2.1)
++      '@playwright/browser-chromium': 1.61.1
++      gunzip-maybe: 1.4.2
++      http-proxy-agent: 9.1.0
++      https-proxy-agent: 9.1.0
++      koa: 3.2.1
++      koa-morgan: 1.0.1
++      koa-mount: 4.2.0
++      koa-static: 5.0.0
++      minimist: 1.2.8
++      playwright: 1.61.1
++      tar-fs: 3.1.3
++      tinyglobby: 0.2.17
++      vscode-uri: 3.1.0
++    transitivePeerDependencies:
++      - bare-abort-controller
++      - bare-buffer
++      - kerberos
++      - react-native-b4a
++      - supports-color
++
+   '@vscode/test-web@0.0.81(kerberos@2.1.1)':
+     dependencies:
+       '@koa/cors': 5.0.0
+@@ -10764,6 +10784,15 @@ snapshots:
+     transitivePeerDependencies:
+       - supports-color
+ 
++  http-proxy-agent@9.1.0:
++    dependencies:
++      agent-base: 9.0.0
++      debug: 4.4.3
++      proxy-agent-negotiate: 1.1.0
++    transitivePeerDependencies:
++      - kerberos
++      - supports-color
++
+   http-proxy-agent@9.1.0(kerberos@2.1.1):
+     dependencies:
+       agent-base: 9.0.0
+@@ -10792,6 +10821,15 @@ snapshots:
+     transitivePeerDependencies:
+       - supports-color
+ 
++  https-proxy-agent@9.1.0:
++    dependencies:
++      agent-base: 9.0.0
++      debug: 4.4.3
++      proxy-agent-negotiate: 1.1.0
++    transitivePeerDependencies:
++      - kerberos
++      - supports-color
++
+   https-proxy-agent@9.1.0(kerberos@2.1.1):
+     dependencies:
+       agent-base: 9.0.0
+@@ -11277,7 +11315,7 @@ snapshots:
+   kerberos@2.1.1:
+     dependencies:
+       bindings: 1.5.0
+-      node-addon-api: 7.1.0
++      node-addon-api: 6.1.0
+       prebuild-install: 7.1.2
+ 
+   keygrip@1.1.0:
+@@ -12265,6 +12303,8 @@ snapshots:
+       forwarded: 0.2.0
+       ipaddr.js: 1.9.1
+ 
++  proxy-agent-negotiate@1.1.0: {}
++
+   proxy-agent-negotiate@1.1.0(kerberos@2.1.1):
+     optionalDependencies:
+       kerberos: 2.1.1
+diff --git a/pnpm-workspace.yaml b/pnpm-workspace.yaml
+index c31f55fd..c7212b79 100644
+--- a/pnpm-workspace.yaml
++++ b/pnpm-workspace.yaml
+@@ -63,10 +63,11 @@ allowBuilds:
+   fsevents@2.3.2: true
+   fsevents@2.3.3: true
+   husky: false
+-  kerberos@2.1.1: true
++  kerberos: false
++  kerberos@2.1.1: false
+   koffi@3.2.1: false
+   native-is-elevated@0.9.0: true
+-  native-keymap@3.3.9: true
++  native-keymap@3.3.9: false
+   node-pty@1.2.0-beta.18: true
+   protobufjs@7.6.5: false
+   ssh2: false
+@@ -75,7 +76,6 @@ allowBuilds:
+ overrides:
+   '@typescript-eslint/types': 8.66.0
+   node-gyp-build: 4.8.1
+-  kerberos@2.1.1>node-addon-api: 7.1.0
+   koffi: 3.2.1
+   serialize-javascript: ^7.0.3
+   yauzl: ^3.3.1
+diff --git a/product.json b/product.json
+index 64e1c4d2..09f97b02 100644
+--- a/product.json
++++ b/product.json
+@@ -1,41 +1,47 @@
+ {
+-	"nameShort": "Code - OSS",
+-	"nameLong": "Code - OSS",
+-	"applicationName": "code-oss",
+-	"dataFolderName": ".vscode-oss",
+-	"sharedDataFolderName": ".vscode-oss-shared",
+-	"win32MutexName": "vscodeoss",
++	"nameShort": "LocalCoders",
++	"nameLong": "LocalCoders AI IDE",
++	"applicationName": "localcoders",
++	"dataFolderName": ".localcoders-ide",
++	"sharedDataFolderName": ".localcoders-ide-shared",
++	"win32MutexName": "localcoders",
+ 	"licenseName": "MIT",
+-	"licenseUrl": "https://github.com/microsoft/vscode/blob/main/LICENSE.txt",
+-	"serverLicenseUrl": "https://github.com/microsoft/vscode/blob/main/LICENSE.txt",
++	"licenseUrl": "",
++	"serverLicenseUrl": "",
+ 	"serverGreeting": [],
+ 	"serverLicense": [],
+ 	"serverLicensePrompt": "",
+-	"serverApplicationName": "code-server-oss",
+-	"serverDataFolderName": ".vscode-server-oss",
+-	"tunnelApplicationName": "code-tunnel-oss",
+-	"win32DirName": "Microsoft Code OSS",
+-	"win32NameVersion": "Microsoft Code OSS",
+-	"win32RegValueName": "CodeOSS",
++	"serverApplicationName": "localcoders-server",
++	"serverDataFolderName": ".localcoders-server",
++	"tunnelApplicationName": "localcoders-tunnel",
++	"win32DirName": "LocalCoders",
++	"win32NameVersion": "LocalCoders AI IDE",
++	"win32RegValueName": "LocalCoders",
+ 	"win32x64AppId": "{{D77B7E06-80BA-4137-BCF4-654B95CCEBC5}",
+ 	"win32arm64AppId": "{{D1ACE434-89C5-48D1-88D3-E2991DF85475}",
+ 	"win32x64UserAppId": "{{CC6B787D-37A0-49E8-AE24-8559A032BE0C}",
+ 	"win32arm64UserAppId": "{{3AEBF0C8-F733-4AD4-BADE-FDB816D53D7B}",
+-	"win32AppUserModelId": "Microsoft.CodeOSS",
+-	"win32ShellNameShort": "C&ode - OSS",
+-	"win32TunnelServiceMutex": "vscodeoss-tunnelservice",
+-	"win32TunnelMutex": "vscodeoss-tunnel",
+-	"darwinBundleIdentifier": "com.visualstudio.code.oss",
++	"win32AppUserModelId": "LocalCoders.IDE",
++	"win32ShellNameShort": "LocalCoders",
++	"win32TunnelServiceMutex": "localcoders-tunnelservice",
++	"win32TunnelMutex": "localcoders-tunnel",
++	"darwinBundleIdentifier": "com.localcoders.ide",
+ 	"darwinProfileUUID": "47827DD9-4734-49A0-AF80-7E19B11495CC",
+ 	"darwinProfilePayloadUUID": "CF808BE7-53F3-46C6-A7E2-7EDB98A5E959",
+-	"linuxDesktopName": "com.visualstudio.CodeOSS",
+-	"linuxIconName": "code-oss",
++	"linuxDesktopName": "localcoders.desktop",
++	"linuxIconName": "localcoders",
+ 	"licenseFileName": "LICENSE.txt",
+-	"reportIssueUrl": "https://github.com/microsoft/vscode/issues/new",
++	"reportIssueUrl": "https://github.com/localcoders/localcoders/issues",
+ 	"nodejsArtifactFeed": "",
+ 	"electronArtifactFeed": "",
+-	"urlProtocol": "code-oss",
+-	"agentsTelemetryAppName": "agents",
++	"urlProtocol": "localcoders",
++	"extensionsGallery": {
++		"serviceUrl": "https://open-vsx.org/vscode/gallery",
++		"itemUrl": "https://open-vsx.org/vscode/item",
++		"resourceUrlTemplate": "https://open-vsx.org/vscode/unpkg/{publisher}/{name}/{version}/{path}",
++		"controlUrl": ""
++	},
++	"agentsTelemetryAppName": "",
+ 	"webviewContentExternalBaseUrlTemplate": "https://{{uuid}}.vscode-cdn.net/insider/ef65ac1ba57f57f2a3961bfe94aa20481caca4c6/out/vs/workbench/contrib/webview/browser/pre/",
+ 	"builtInExtensions": [
+ 		{
+@@ -87,86 +93,6 @@
+ 			}
+ 		}
+ 	],
+-	"defaultChatAgent": {
+-		"extensionId": "GitHub.copilot",
+-		"chatExtensionId": "GitHub.copilot-chat",
+-		"chatExtensionOutputId": "GitHub.copilot-chat.GitHub Copilot Chat.log",
+-		"chatExtensionOutputExtensionStateCommand": "github.copilot.debug.extensionState",
+-		"documentationUrl": "https://aka.ms/github-copilot-overview",
+-		"termsStatementUrl": "https://aka.ms/github-copilot-terms-statement",
+-		"privacyStatementUrl": "https://aka.ms/github-copilot-privacy-statement",
+-		"skusDocumentationUrl": "https://aka.ms/github-copilot-plans",
+-		"optimizeUsageDocumentationUrl": "https://aka.ms/token-usage-tips",
+-		"publicCodeMatchesUrl": "https://aka.ms/github-copilot-match-public-code",
+-		"managePlanUrl": "https://aka.ms/github-copilot-manage-plan",
+-		"upgradePlanUrl": "https://aka.ms/github-copilot-upgrade-plan",
+-		"signUpUrl": "https://aka.ms/github-sign-up",
+-		"provider": {
+-			"default": {
+-				"id": "github",
+-				"name": "GitHub"
+-			},
+-			"enterprise": {
+-				"id": "github-enterprise",
+-				"name": "GHE"
+-			},
+-			"google": {
+-				"id": "google",
+-				"name": "Google"
+-			},
+-			"apple": {
+-				"id": "apple",
+-				"name": "Apple"
+-			},
+-			"microsoft": {
+-				"id": "microsoft",
+-				"name": "Microsoft"
+-			}
+-		},
+-		"providerExtensionId": "vscode.github-authentication",
+-		"providerUriSetting": "github-enterprise.uri",
+-		"providerScopes": [
+-			[
+-				"read:user",
+-				"user:email",
+-				"repo",
+-				"workflow"
+-			],
+-			[
+-				"user:email"
+-			],
+-			[
+-				"read:user"
+-			]
+-		],
+-		"entitlementUrl": "https://api.github.com/copilot_internal/user",
+-		"entitlementSignupLimitedUrl": "https://api.github.com/copilot_internal/subscribe_limited_user",
+-		"chatQuotaExceededContext": "github.copilot.chat.quotaExceeded",
+-		"completionsQuotaExceededContext": "github.copilot.completions.quotaExceeded",
+-		"walkthroughCommand": "github.copilot.open.walkthrough",
+-		"completionsMenuCommand": "github.copilot.toggleStatusMenu",
+-		"chatRefreshTokenCommand": "github.copilot.refreshToken",
+-		"generateCommitMessageCommand": "github.copilot.git.generateCommitMessage",
+-		"resolveMergeConflictsCommand": "github.copilot.git.resolveMergeConflicts",
+-		"completionsAdvancedSetting": "github.copilot.advanced",
+-		"completionsEnablementSetting": "github.copilot.enable",
+-		"nextEditSuggestionsSetting": "github.copilot.nextEditSuggestions.enabled",
+-		"tokenEntitlementUrl": "https://api.github.com/copilot_internal/v2/token",
+-		"mcpRegistryDataUrl": "https://api.github.com/copilot/mcp_registry",
+-		"mcpConnectorsUrl": "https://api.github.com/copilot-connectors/api/v1",
+-		"managedSettingsUrl": "https://api.github.com/copilot_internal/managed_settings"
+-	},
+-	"trustedExtensionAuthAccess": {
+-		"github": [
+-			"GitHub.copilot-chat"
+-		],
+-		"github-enterprise": [
+-			"GitHub.copilot-chat"
+-		],
+-		"microsoft": [
+-			"vscode.github-authentication"
+-		]
+-	},
+ 	"onboardingKeymaps": [
+ 		{
+ 			"id": "vscode",
+@@ -242,9 +168,14 @@
+ 			"type": "light"
+ 		}
+ 	],
+-	"builtInExtensionsEnabledWithAutoUpdates": [
+-		"GitHub.copilot-chat"
+-	],
+ 	"sessionsWindowAllowedExtensions": [],
+-	"voiceWsUrl": "wss://falcon-caas.mai.microsoft.com/voice-code/api/v1/realtime/voice"
+-}
++	"configurationDefaults": {
++		"chat.commandCenter.enabled": false,
++		"chat.titleBar.signIn.enabled": false,
++		"workbench.accounts.action.hidden": true,
++		"github.copilot.enable": false,
++		"telemetry.telemetryLevel": "off",
++		"update.mode": "none"
++	},
++	"builtInExtensionsEnabledWithAutoUpdates": []
++}
+\ No newline at end of file
+diff --git a/remote/package.json b/remote/package.json
+index 1eb834df..6794f14c 100644
+--- a/remote/package.json
++++ b/remote/package.json
+@@ -48,7 +48,6 @@
+     "https-proxy-agent": "^7.0.2",
+     "jschardet": "3.1.4",
+     "katex": "^0.16.22",
+-    "kerberos": "2.1.1",
+     "libsodium-wrappers": "^0.8.4",
+     "minimist": "^1.2.8",
+     "node-addon-api": "^6.0.0",
+diff --git a/remote/pnpm-lock.yaml b/remote/pnpm-lock.yaml
+index 7de60486..e8222a66 100644
+--- a/remote/pnpm-lock.yaml
++++ b/remote/pnpm-lock.yaml
+@@ -6,7 +6,6 @@ settings:
+ 
+ overrides:
+   node-gyp-build: 4.8.1
+-  kerberos@2.1.1>node-addon-api: 7.1.0
+   koffi: 3.2.1
+   yauzl: ^3.3.1
+ 
+@@ -124,9 +123,6 @@ importers:
+       katex:
+         specifier: ^0.16.22
+         version: 0.16.47
+-      kerberos:
+-        specifier: 2.1.1
+-        version: 2.1.1
+       libsodium-wrappers:
+         specifier: ^0.8.4
+         version: 0.8.4
+@@ -526,31 +522,19 @@ packages:
+   asn1@0.2.6:
+     resolution: {integrity: sha512-ix/FxPn0MDjeyJ7i/yoHGFt/EX6LyNbxSEhPPXODPL+KB0VPk86UYfL0lMdy+KCnv+fmvIzySwaK5COwqVbWTQ==}
+ 
+-  base64-js@1.5.1:
+-    resolution: {integrity: sha512-AKpaYlHn8t4SVbOHCy+b5+KKgvR4vrsD8vbvrbiQJps7fKDTkjkDry6ji0rUJjC0kzbNePLwzxq8iypo41qeWA==}
+-
+   bcrypt-pbkdf@1.0.2:
+     resolution: {integrity: sha512-qeFIXtP4MSoi6NLqO12WfqARWWuCKi2Rn/9hJLEmtB5yTNr9DqFWkJRCf2qShWzPeAMRnOgCrq0sg/KLv5ES9w==}
+ 
+   bindings@1.5.0:
+     resolution: {integrity: sha512-p2q/t/mhvuOj/UeLlV6566GD/guowlr0hHxClI0W9m7MWYkL1F0hLo+0Aexs9HSPCtR1SXQ0TD3MMKrXZajbiQ==}
+ 
+-  bl@4.1.0:
+-    resolution: {integrity: sha512-1W07cM9gS6DcLperZfFSj+bWLtaPGSOHWhPiGzXmvVJbRLdG82sH/Kn8EtW1VqWVA54AKf2h5k5BbnIbwF3h6w==}
+-
+   buffer-crc32@0.2.13:
+     resolution: {integrity: sha512-VO9Ht/+p3SN7SKWqcrgEzjGbRSJYTx+Q1pTQC0wrWqHx0vpJraQ6GtHx8tvcg1rlK1byhU5gccxgOgj7B0TDkQ==}
+ 
+-  buffer@5.7.1:
+-    resolution: {integrity: sha512-EHcyIPBQ4BSGlvjB16k5KgAJ27CIsHY/2JBmCRReo48y9rQ3MaUzWX3KVlBa4U7MyX02HdVj0K7C3WaB3ju7FQ==}
+-
+   buildcheck@0.0.7:
+     resolution: {integrity: sha512-lHblz4ahamxpTmnsk+MNTRWsjYKv965MwOrSJyeD588rR3Jcu7swE+0wN5F+PbL5cjgu/9ObkhfzEPuofEMwLA==}
+     engines: {node: '>=10.0.0'}
+ 
+-  chownr@1.1.4:
+-    resolution: {integrity: sha512-jJ0bqzaylmJtVnNgzTeSOs8DPavpbYgEr/b0YL8/2GO3xJEhInFmhKMUnEJQjZumK7KXGFhUy89PrsJWlakBVg==}
+-
+   chownr@3.0.0:
+     resolution: {integrity: sha512-+IxzY9BZOQd/XuYPRmrvEVjF/nqj5kgT4kEq7VofrDoM1MxoRjEWkrCC3EtLi59TVawxTAn+orJwFQcrqEN1+g==}
+     engines: {node: '>=18'}
+@@ -580,38 +564,17 @@ packages:
+       supports-color:
+         optional: true
+ 
+-  decompress-response@6.0.0:
+-    resolution: {integrity: sha512-aW35yZM6Bb/4oJlZncMH2LCoZtJXTRxES17vE3hoRiowU2kWHaJKFkSBDnDR+cm9J+9QhXmREyIfv0pji9ejCQ==}
+-    engines: {node: '>=10'}
+-
+-  deep-extend@0.6.0:
+-    resolution: {integrity: sha512-LOHxIOaPYdHlJRtCQfDIVZtfw/ufM8+rVj649RIHzcm/vGwQRXFt6OPqIFWsm2XEMrNIEtWR64sY1LEKD2vAOA==}
+-    engines: {node: '>=4.0.0'}
+-
+   detect-libc@2.1.2:
+     resolution: {integrity: sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==}
+     engines: {node: '>=8'}
+ 
+-  end-of-stream@1.4.4:
+-    resolution: {integrity: sha512-+uw1inIHVPQoaVuHzRyXd21icM+cnt4CzD5rW+NC1wjOUSTOs+Te7FOv7AhN7vS9x/oIyhLP5PR1H+phQAHu5Q==}
+-
+-  expand-template@2.0.3:
+-    resolution: {integrity: sha512-XYfuKMvj4O35f/pOXLObndIRvyQ+/+6AhODh+OKWj9S9498pHHn/IMszH+gt0fBCRWMNfk1ZSp5x3AifmnI2vg==}
+-    engines: {node: '>=6'}
+-
+   file-uri-to-path@1.0.0:
+     resolution: {integrity: sha512-0Zt+s3L7Vf1biwWZ29aARiVYLx7iMGnEUl9x33fbB/j3jR81u/O2LbqK+Bm1CDSNDKVtJ/YjwY7TUd5SkeLQLw==}
+ 
+-  fs-constants@1.0.0:
+-    resolution: {integrity: sha512-y6OAwoSIf7FyjMIv94u+b5rdheZEjzR63GTyZJm5qh4Bi+2YgwLCcI/fPFZkL5PSixOt6ZNKm+w+Hfp/Bciwow==}
+-
+   fs-extra@11.2.0:
+     resolution: {integrity: sha512-PmDi3uwK5nFuXh7XDTlVnS17xJS7vW36is2+w3xcv8SVxiB4NyATf4ctkVY5bkSjX0Y4nbvZCq1/EjtEyr9ktw==}
+     engines: {node: '>=14.14'}
+ 
+-  github-from-package@0.0.0:
+-    resolution: {integrity: sha512-SyHy3T1v2NUXn29OsWdxmK6RwHD+vkj3v8en8AOBZ1wBQ/hCAQ5bAQTD02kW4W9tUp/3Qh6J8r9EvntiyCmOOw==}
+-
+   graceful-fs@4.2.11:
+     resolution: {integrity: sha512-RbJ5/jmFcNNCcDV5o9eTnBLJ/HszWV0P73bc+Ff4nS/rJj+YaS6IGyiOL0VoBYX+l1Wrl3k63h/KrH+nhJ0XvQ==}
+ 
+@@ -623,15 +586,6 @@ packages:
+     resolution: {integrity: sha512-NmLNjm6ucYwtcUmL7JQC1ZQ57LmHP4lT15FQ8D61nak1rO6DH+fz5qNK2Ap5UN4ZapYICE3/0KodcLYSPsPbaA==}
+     engines: {node: '>= 14'}
+ 
+-  ieee754@1.2.1:
+-    resolution: {integrity: sha512-dcyqhDvX1C46lXZcVqCpK+FtMRQVdIMN6/Df5js2zouUsqG7I6sFxitIC+7KYK29KdXOLHdu9zL4sFnoVQnqaA==}
+-
+-  inherits@2.0.4:
+-    resolution: {integrity: sha512-k/vGaX4/Yla3WzyMCvTQOXYeIHvqOKtnqBduzTHpzpQZzAskKMhZ2K+EnBiSM9zGSoIFeMpXKxa4dYeZIQqewQ==}
+-
+-  ini@1.3.8:
+-    resolution: {integrity: sha512-JV/yugV2uzW5iMRSiZAyDtQd+nxtUnjeLt0acNdw98kKLrvuRVyB80tsREOE7yvGVgalhZ6RNXCmEHkUKBKxew==}
+-
+   ip-address@10.7.4:
+     resolution: {integrity: sha512-DWBMKyeM25D70nrIiTkgQth59/G+naKOTep6huF9j+GmeK3DMD60Zvxg5d5qQnz+38AHgou6ean2LECX+lrKDg==}
+     engines: {node: '>= 12'}
+@@ -655,10 +609,6 @@ packages:
+     resolution: {integrity: sha512-Eeo8Ys1doU1z+x8AZsPpQu+p/QcZBI5PeOo7QGQdy2x2m0MU/hYagBbGOmXwr5KVbEfVuWv9LpnQWeehogurjg==}
+     hasBin: true
+ 
+-  kerberos@2.1.1:
+-    resolution: {integrity: sha512-414s1G/qgK2T60cXnZsHbtRj8Ynjg0DBlQWeY99tkyqQ2e8vGgFHvxRdvjTlLHg/SxBA0zLQcGE6Pk6Dfq/BCA==}
+-    engines: {node: '>=12.9.0'}
+-
+   koffi@3.2.1:
+     resolution: {integrity: sha512-0qE3lZ8jllRqPN4Ob6Ajl7c2bJSJDhQWuKLGP5hIEpHLllJWv1ydHFMhHmHc5p/W9GticKVDbYzZd7TBoQ4CZg==}
+ 
+@@ -672,10 +622,6 @@ packages:
+     resolution: {integrity: sha512-RPimw/7aMdv2oqRrxKwvZXcPfwBrn/JZ2xYcY9Hus/6LaS3VOAKVWKWgNLCFSiOm1ESXinjsDlidVU7JlnCN2A==}
+     engines: {node: 20 || >=22}
+ 
+-  mimic-response@3.1.0:
+-    resolution: {integrity: sha512-z0yWI+4FDrrweS8Zmt4Ej5HdJmky15+L2e6Wgn3+iK5fWzb6T3fhNFq2+MeTRb064c6Wr4N/wv0DzQTjNzHNGQ==}
+-    engines: {node: '>=10'}
+-
+   minimist@1.2.8:
+     resolution: {integrity: sha512-2yyAR8qBkN3YuheJanUpWC5U3bb5osDywNB8RzDVlDwDHbocAJveqqj1u8+SVD7jkWT4yvsHCpWqqWqAxb0zCA==}
+ 
+@@ -687,9 +633,6 @@ packages:
+     resolution: {integrity: sha512-KZxYo1BUkWD2TVFLr0MQoM8vUUigWD3LlD83a/75BqC+4qE0Hb1Vo5v1FgcfaNXvfXzr+5EhQ6ing/CaBijTlw==}
+     engines: {node: '>= 18'}
+ 
+-  mkdirp-classic@0.5.3:
+-    resolution: {integrity: sha512-gKLcREMhtuZRwRAfqP3RFW+TK4JqApVBtOIftVgjuABpAtpxhPGaDcfvbhNvD0B8iD1oUr/txX35NjcaY6Ns/A==}
+-
+   mkdirp@1.0.4:
+     resolution: {integrity: sha512-vVqVZQyf3WLx2Shd0qJ9xuvqgAyKPLAiqITEtqW0oIUjzo3PePDd6fW9iFz30ef7Ysp/oiWqbhszeGWW2T6Gzw==}
+     engines: {node: '>=10'}
+@@ -701,13 +644,6 @@ packages:
+   nan@2.26.2:
+     resolution: {integrity: sha512-0tTvBTYkt3tdGw22nrAy50x7gpbGCCFH3AFcyS5WiUu7Eu4vWlri1woE6qHBSfy11vksDqkiwjOnlR7WV8G1Hw==}
+ 
+-  napi-build-utils@1.0.2:
+-    resolution: {integrity: sha512-ONmRUqK7zj7DWX0D9ADe03wbwOBZxNAfF20PlGfCWQcD3+/MakShIHrMqx9YwPTfxDdF1zLeL+RGZiR9kGMLdg==}
+-
+-  node-abi@3.8.0:
+-    resolution: {integrity: sha512-tzua9qWWi7iW4I42vUPKM+SfaF0vQSLAm4yO5J83mSwB7GeoWrDKC/K+8YCnYNwqP5duwazbw2X9l4m8SC2cUw==}
+-    engines: {node: '>=10'}
+-
+   node-addon-api@6.1.0:
+     resolution: {integrity: sha512-+eawOlIgy680F0kBzPUNFhMZGtJ1YmqM6l4+Crf4IkImjYrO/mqPwRMh352g23uIaQKFItcQ64I7KMaJxHgAVA==}
+ 
+@@ -725,9 +661,6 @@ packages:
+   node-pty@1.2.0-beta.18:
+     resolution: {integrity: sha512-3Rej3788OnasAwoSmTZhlCeUraJ9CQldtL5b571b9+3Nv47+PaxA5VPIGOOs+16OYQePTrC1Lrs8a9/df5WPRg==}
+ 
+-  once@1.4.0:
+-    resolution: {integrity: sha512-lNaJgI+2Q5URQBkccEKHTQOPaXdUxnZZElQTZY0MFUAuaEqe1E+Nyvgdz/aIyNi6Z9MzO5dv1H8n58/GELp3+w==}
+-
+   opentype.js@2.0.0:
+     resolution: {integrity: sha512-kCyjv6xdDY1W/jLWZ/L3QhhTlKUqDZMQ5+Jdlw12b3dXkKNpYBqqlMMj0YDQPShWFTMwgZI1hG14kN3XUDSg/A==}
+     hasBin: true
+@@ -739,44 +672,13 @@ packages:
+     resolution: {integrity: sha512-QP88BAKvMam/3NxH6vj2o21R6MjxZUAd6nlwAS/pnGvN9IVLocLHxGYIzFhg6fUQ+5th6P4dv4eW9jX3DSIj7A==}
+     engines: {node: '>=12'}
+ 
+-  prebuild-install@7.1.2:
+-    resolution: {integrity: sha512-UnNke3IQb6sgarcZIDU3gbMeTp/9SSU1DAIkil7PrqG1vZlBtY5msYccSKSHDqa3hNg436IXK+SNImReuA1wEQ==}
+-    engines: {node: '>=10'}
+-    deprecated: No longer maintained. Please contact the author of the relevant native addon; alternatives are available.
+-    hasBin: true
+-
+-  pump@3.0.0:
+-    resolution: {integrity: sha512-LwZy+p3SFs1Pytd/jYct4wpv49HiYCqd9Rlc5ZVdk0V+8Yzv6jR5Blk3TRmPL1ft69TxP0IMZGJ+WPFU2BFhww==}
+-
+-  rc@1.2.8:
+-    resolution: {integrity: sha512-y3bGgqKj3QBdxLbLkomlohkvsA8gdAiUQlSBJnBhfn+BPxg4bc62d8TcBW15wavDfgexCgccckhcZvywyQYPOw==}
+-    hasBin: true
+-
+-  readable-stream@3.6.0:
+-    resolution: {integrity: sha512-BViHy7LKeTz4oNnkcLJ+lVSL6vpiFeX6/d3oSH8zCW7UxP2onchk+vTGB143xuFjHS3deTgkKoXXymXqymiIdA==}
+-    engines: {node: '>= 6'}
+-
+-  safe-buffer@5.2.1:
+-    resolution: {integrity: sha512-rp3So07KcdmmKbGvgaNxQSJr7bGVSVk5S9Eq1F+ppbRo70+YeaDxkw5Dd8NPN+GD6bjnYm2VuPuCXmpuYvmCXQ==}
+-
+   safer-buffer@2.1.2:
+     resolution: {integrity: sha512-YZo3K82SD7Riyi0E1EQPojLz7kpepnSQI9IyPbHHg1XXXevb5dJI7tpyN2ADxGcQbHG7vcyRHk0cbwqcQriUtg==}
+ 
+-  semver@7.8.0:
+-    resolution: {integrity: sha512-AcM7dV/5ul4EekoQ29Agm5vri8JNqRyj39o0qpX6vDF2GZrtutZl5RwgD1XnZjiTAfncsJhMI48QQH3sN87YNA==}
+-    engines: {node: '>=10'}
+-    hasBin: true
+-
+   shell-quote@1.12.0:
+     resolution: {integrity: sha512-PcByqNyT/38F2kDNi006HAMRJaULuBzq/FOsw3qdZvX/GA9W/jamDaRskgHjubHiftXK5sIFxLNkvrXUwcof6Q==}
+     engines: {node: '>= 0.4'}
+ 
+-  simple-concat@1.0.1:
+-    resolution: {integrity: sha512-cSFtAPtRhljv69IK0hTVZQ+OfE9nePi/rtJmw5UjHeVyVroEqJXP1sFztKUy1qU+xvz3u/sfYJLa947b7nAN2Q==}
+-
+-  simple-get@4.0.1:
+-    resolution: {integrity: sha512-brv7p5WgH0jmQJr1ZDDfKDOSeWWg+OVypG99A/5vYGPqJ6pxiaHLy8nxtFjBA7oMa01ebA9gfh1uMCFqOuXxvA==}
+-
+   smart-buffer@4.2.0:
+     resolution: {integrity: sha512-94hK0Hh8rPqQl2xXc3HsaBoOXKV20MToPkcXvwbISWLEs+64sBq5kFgn2kJDHb1Pry9yrP0dxrCI9RRci7RXKg==}
+     engines: {node: '>= 6.0.0', npm: '>= 3.0.0'}
+@@ -793,20 +695,6 @@ packages:
+     resolution: {integrity: sha512-wPldCk3asibAjQ/kziWQQt1Wh3PgDFpC0XpwclzKcdT1vql6KeYxf5LIt4nlFkUeR8WuphYMKqUA56X4rjbfgQ==}
+     engines: {node: '>=10.16.0'}
+ 
+-  string_decoder@1.3.0:
+-    resolution: {integrity: sha512-hkRX8U1WjJFd8LsDJ2yQ/wWWxaopEsABU1XfkM8A+j0+85JAGppt16cr1Whg6KIbb4okU6Mql6BOj+uup/wKeA==}
+-
+-  strip-json-comments@2.0.1:
+-    resolution: {integrity: sha512-4gB8na07fecVVkOI6Rs4e7T6NOTki5EmL7TUduTs6bu3EdnSycntVJ4re8kgZA+wx9IueI2Y11bfbgwtzuE0KQ==}
+-    engines: {node: '>=0.10.0'}
+-
+-  tar-fs@2.1.4:
+-    resolution: {integrity: sha512-mDAjwmZdh7LTT6pNleZ05Yt65HC3E+NiQzl672vQG38jIrehtJk/J3mNwIg+vShQPcLF/LV7CMnDW6vjj6sfYQ==}
+-
+-  tar-stream@2.2.0:
+-    resolution: {integrity: sha512-ujeqbceABgwMZxEJnk2HDY2DlnUZ+9oEcb1KzTVfYHio0UE6dG71n60d8D2I4qNvleWrrXpmjpt7vZeF1LnMZQ==}
+-    engines: {node: '>=6'}
+-
+   tar@7.5.22:
+     resolution: {integrity: sha512-MFO/QzvtAOmJbkhOaCTvbGcFN9L9b+JunIsDwaKljSOdcLMea3NJ1k9Usz/rjdfSXTq4dfzfeS7W4p4YOAAHeA==}
+     engines: {node: '>=18'}
+@@ -815,9 +703,6 @@ packages:
+     resolution: {integrity: sha512-mmefC5nu8YZ5zGY4IyeXWnvK6YWv2YCz60/7q5banNU+R8JGZT2Q4lOS4g4xJyvnQIbqBFXzMFPsIitI8kVXqA==}
+     engines: {node: '>=22'}
+ 
+-  tunnel-agent@0.6.0:
+-    resolution: {integrity: sha512-McnNiV1l8RYeY8tBgEpuodCC1mLUdbSN+CYBL7kJsJNInOP8UjDDEwdk6Mw60vdLLrr5NHKZhMAOSrR2NZuQ+w==}
+-
+   tweetnacl@0.14.5:
+     resolution: {integrity: sha512-KXXFFdAbFXY4geFIwoyNK+f5Z1b7swfXABfL7HXCmoIWMKU3dmS26672A4EeQtDzLKy7SXmfBu51JolvEKwtGA==}
+ 
+@@ -829,9 +714,6 @@ packages:
+     resolution: {integrity: sha512-gptHNQghINnc/vTGIk0SOFGFNXw7JVrlRUtConJRlvaw6DuX0wO5Jeko9sWrMBhh+PsYAZ7oXAiOnf/UKogyiw==}
+     engines: {node: '>= 10.0.0'}
+ 
+-  util-deprecate@1.0.2:
+-    resolution: {integrity: sha512-EPD5q1uXyFxJpCrLnCc1nHnq3gOa6DZBocAIiI2TaSCA7VCJ1UJDMagCzIkXNsUYfD1daK//LTEQ8xiIbrHtcw==}
+-
+   uuid@14.0.0:
+     resolution: {integrity: sha512-Qo+uWgilfSmAhXCMav1uYFynlQO7fMFiMVZsQqZRMIXp0O7rR7qjkj+cPvBHLgBqi960QCoo/PH2/6ZtVqKvrg==}
+     hasBin: true
+@@ -850,9 +732,6 @@ packages:
+   vscode-textmate@9.3.2:
+     resolution: {integrity: sha512-n2uGbUcrjhUEBH16uGA0TvUfhWwliFZ1e3+pTjrkim1Mt7ydB41lV08aUvsi70OlzDWp6X7Bx3w/x3fAXIsN0Q==}
+ 
+-  wrappy@1.0.2:
+-    resolution: {integrity: sha512-l4Sp/DRseor9wL6EvV2+TuQn63dMkPjZ/sp9XkghTEbV9KlPS1xUsZ3u7/IQO4wxtcFB4bgpQPRcR3QCvezPcQ==}
+-
+   ws@8.21.0:
+     resolution: {integrity: sha512-Vsp28b7DRcimFQvrqu2Wek3z1iYxDCWqHYB8Qsnk/S4RfaCQzPGPyBNuVjJV3cd6UiKtUtp6sNM77gWvzcCH+g==}
+     engines: {node: '>=10.0.0'}
+@@ -1145,8 +1024,6 @@ snapshots:
+     dependencies:
+       safer-buffer: 2.1.2
+ 
+-  base64-js@1.5.1: {}
+-
+   bcrypt-pbkdf@1.0.2:
+     dependencies:
+       tweetnacl: 0.14.5
+@@ -1155,24 +1032,11 @@ snapshots:
+     dependencies:
+       file-uri-to-path: 1.0.0
+ 
+-  bl@4.1.0:
+-    dependencies:
+-      buffer: 5.7.1
+-      inherits: 2.0.4
+-      readable-stream: 3.6.0
+-
+   buffer-crc32@0.2.13: {}
+ 
+-  buffer@5.7.1:
+-    dependencies:
+-      base64-js: 1.5.1
+-      ieee754: 1.2.1
+-
+   buildcheck@0.0.7:
+     optional: true
+ 
+-  chownr@1.1.4: {}
+-
+   chownr@3.0.0: {}
+ 
+   commander@12.1.0: {}
+@@ -1191,32 +1055,16 @@ snapshots:
+     dependencies:
+       ms: 2.1.2
+ 
+-  decompress-response@6.0.0:
+-    dependencies:
+-      mimic-response: 3.1.0
+-
+-  deep-extend@0.6.0: {}
+-
+   detect-libc@2.1.2: {}
+ 
+-  end-of-stream@1.4.4:
+-    dependencies:
+-      once: 1.4.0
+-
+-  expand-template@2.0.3: {}
+-
+   file-uri-to-path@1.0.0: {}
+ 
+-  fs-constants@1.0.0: {}
+-
+   fs-extra@11.2.0:
+     dependencies:
+       graceful-fs: 4.2.11
+       jsonfile: 6.1.0
+       universalify: 2.0.1
+ 
+-  github-from-package@0.0.0: {}
+-
+   graceful-fs@4.2.11: {}
+ 
+   http-proxy-agent@7.0.0:
+@@ -1233,12 +1081,6 @@ snapshots:
+     transitivePeerDependencies:
+       - supports-color
+ 
+-  ieee754@1.2.1: {}
+-
+-  inherits@2.0.4: {}
+-
+-  ini@1.3.8: {}
+-
+   ip-address@10.7.4: {}
+ 
+   is-extglob@2.1.1: {}
+@@ -1259,12 +1101,6 @@ snapshots:
+     dependencies:
+       commander: 8.3.0
+ 
+-  kerberos@2.1.1:
+-    dependencies:
+-      bindings: 1.5.0
+-      node-addon-api: 7.1.0
+-      prebuild-install: 7.1.2
+-
+   koffi@3.2.1:
+     optionalDependencies:
+       '@koromix/koffi-android-arm64': 3.2.1
+@@ -1294,8 +1130,6 @@ snapshots:
+ 
+   lru-cache@11.5.1: {}
+ 
+-  mimic-response@3.1.0: {}
+-
+   minimist@1.2.8: {}
+ 
+   minipass@7.1.3: {}
+@@ -1304,8 +1138,6 @@ snapshots:
+     dependencies:
+       minipass: 7.1.3
+ 
+-  mkdirp-classic@0.5.3: {}
+-
+   mkdirp@1.0.4: {}
+ 
+   ms@2.1.2: {}
+@@ -1313,12 +1145,6 @@ snapshots:
+   nan@2.26.2:
+     optional: true
+ 
+-  napi-build-utils@1.0.2: {}
+-
+-  node-abi@3.8.0:
+-    dependencies:
+-      semver: 7.8.0
+-
+   node-addon-api@6.1.0: {}
+ 
+   node-addon-api@7.1.0: {}
+@@ -1331,65 +1157,16 @@ snapshots:
+     dependencies:
+       node-addon-api: 7.1.1
+ 
+-  once@1.4.0:
+-    dependencies:
+-      wrappy: 1.0.2
+-
+   opentype.js@2.0.0: {}
+ 
+   pend@1.2.0: {}
+ 
+   picomatch@4.0.4: {}
+ 
+-  prebuild-install@7.1.2:
+-    dependencies:
+-      detect-libc: 2.1.2
+-      expand-template: 2.0.3
+-      github-from-package: 0.0.0
+-      minimist: 1.2.8
+-      mkdirp-classic: 0.5.3
+-      napi-build-utils: 1.0.2
+-      node-abi: 3.8.0
+-      pump: 3.0.0
+-      rc: 1.2.8
+-      simple-get: 4.0.1
+-      tar-fs: 2.1.4
+-      tunnel-agent: 0.6.0
+-
+-  pump@3.0.0:
+-    dependencies:
+-      end-of-stream: 1.4.4
+-      once: 1.4.0
+-
+-  rc@1.2.8:
+-    dependencies:
+-      deep-extend: 0.6.0
+-      ini: 1.3.8
+-      minimist: 1.2.8
+-      strip-json-comments: 2.0.1
+-
+-  readable-stream@3.6.0:
+-    dependencies:
+-      inherits: 2.0.4
+-      string_decoder: 1.3.0
+-      util-deprecate: 1.0.2
+-
+-  safe-buffer@5.2.1: {}
+-
+   safer-buffer@2.1.2: {}
+ 
+-  semver@7.8.0: {}
+-
+   shell-quote@1.12.0: {}
+ 
+-  simple-concat@1.0.1: {}
+-
+-  simple-get@4.0.1:
+-    dependencies:
+-      decompress-response: 6.0.0
+-      once: 1.4.0
+-      simple-concat: 1.0.1
+-
+   smart-buffer@4.2.0: {}
+ 
+   socks-proxy-agent@8.0.4:
+@@ -1413,27 +1190,6 @@ snapshots:
+       cpu-features: 0.0.10
+       nan: 2.26.2
+ 
+-  string_decoder@1.3.0:
+-    dependencies:
+-      safe-buffer: 5.2.1
+-
+-  strip-json-comments@2.0.1: {}
+-
+-  tar-fs@2.1.4:
+-    dependencies:
+-      chownr: 1.1.4
+-      mkdirp-classic: 0.5.3
+-      pump: 3.0.0
+-      tar-stream: 2.2.0
+-
+-  tar-stream@2.2.0:
+-    dependencies:
+-      bl: 4.1.0
+-      end-of-stream: 1.4.4
+-      fs-constants: 1.0.0
+-      inherits: 2.0.4
+-      readable-stream: 3.6.0
+-
+   tar@7.5.22:
+     dependencies:
+       '@isaacs/fs-minipass': 4.0.1
+@@ -1444,18 +1200,12 @@ snapshots:
+ 
+   tas-client@0.4.6: {}
+ 
+-  tunnel-agent@0.6.0:
+-    dependencies:
+-      safe-buffer: 5.2.1
+-
+   tweetnacl@0.14.5: {}
+ 
+   undici@7.29.1: {}
+ 
+   universalify@2.0.1: {}
+ 
+-  util-deprecate@1.0.2: {}
+-
+   uuid@14.0.0: {}
+ 
+   vscode-jsonrpc@10.0.0: {}
+@@ -1466,8 +1216,6 @@ snapshots:
+ 
+   vscode-textmate@9.3.2: {}
+ 
+-  wrappy@1.0.2: {}
+-
+   ws@8.21.0: {}
+ 
+   yallist@5.0.0: {}
+diff --git a/remote/pnpm-workspace.yaml b/remote/pnpm-workspace.yaml
+index 43b868d2..4431aee7 100644
+--- a/remote/pnpm-workspace.yaml
++++ b/remote/pnpm-workspace.yaml
+@@ -32,12 +32,10 @@ allowBuilds:
+   '@vscode/windows-process-tree@0.8.0': true
+   '@vscode/windows-registry@1.3.0': true
+   cpu-features: false
+-  kerberos@2.1.1: true
+   koffi@3.2.1: false
+   node-pty@1.2.0-beta.18: true
+   ssh2: false
+ overrides:
+   node-gyp-build: 4.8.1
+-  kerberos@2.1.1>node-addon-api: 7.1.0
+   koffi: 3.2.1
+   yauzl: ^3.3.1
+diff --git a/scripts/code.sh b/scripts/code.sh
+index 4fea9e56..cf62f3eb 100755
+--- a/scripts/code.sh
++++ b/scripts/code.sh
+@@ -6,7 +6,7 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
+ 	realpath() { [[ $1 = /* ]] && echo "$1" || echo "$PWD/${1#./}"; }
+ 	ROOT=$(dirname "$(dirname "$(realpath "$0")")")
+ else
+-	ROOT=$(dirname "$(dirname "$(readlink -f $0)")")
++	ROOT=$(dirname "$(dirname "$(readlink -f "$0")")")
+ 	# If the script is running in Docker using the WSL2 engine, powershell.exe won't exist
+ 	if grep -qi Microsoft /proc/version && type powershell.exe > /dev/null 2>&1; then
+ 		IN_WSL=true
+diff --git a/src/vs/platform/lifecycle/electron-main/lifecycleMainService.ts b/src/vs/platform/lifecycle/electron-main/lifecycleMainService.ts
+index f039180c..5ba4ba42 100644
+--- a/src/vs/platform/lifecycle/electron-main/lifecycleMainService.ts
++++ b/src/vs/platform/lifecycle/electron-main/lifecycleMainService.ts
+@@ -4,6 +4,9 @@
+  *--------------------------------------------------------------------------------------------*/
+ 
+ import electron from 'electron';
++import { execFile } from 'child_process';
++import { readFileSync } from 'fs';
++import { join, basename } from '../../../base/common/path.js';
+ import { validatedIpcMain } from '../../../base/parts/ipc/electron-main/ipcMain.js';
+ import { Barrier, Promises, timeout } from '../../../base/common/async.js';
+ import { Emitter, Event } from '../../../base/common/event.js';
+@@ -323,9 +326,15 @@ export class LifecycleMainService extends Disposable implements ILifecycleMainSe
+ 			const shutdownPromise = this.fireOnWillShutdown(ShutdownReason.QUIT);
+ 
+ 			// Wait until shutdown is signaled to be complete
+-			shutdownPromise.finally(() => {
++			shutdownPromise.finally(async () => {
+ 				this.trace('Lifecycle#app.on(will-quit) - after fireOnWillShutdown');
+ 
++				// Ensure every loaded Ollama model and local Ollama/llama-server process is stopped cleanly before exit
++				await Promise.race([
++					this.stopLocalOllamaOnAppQuit(),
++					timeout(3000)
++				]);
++
+ 				// Resolve pending quit promise now without veto
+ 				this.resolvePendingQuitPromise(false /* no veto */);
+ 
+@@ -711,11 +720,133 @@ export class LifecycleMainService extends Disposable implements ILifecycleMainSe
+ 		}
+ 	}
+ 
++	private async stopLocalOllamaOnAppQuit(): Promise<void> {
++		try {
++			let stopOnExit = true;
++			let ollamaHost = 'http://127.0.0.1:11434';
++			try {
++				const settingsPath = join(this.environmentMainService.appSettingsHome.fsPath, 'settings.json');
++				const parsed = JSON.parse(readFileSync(settingsPath, 'utf-8'));
++				if (parsed && parsed['localcoders.stopOllamaOnExit'] === false) {
++					stopOnExit = false;
++				}
++				if (parsed && typeof parsed['localcoders.ollamaHost'] === 'string' && parsed['localcoders.ollamaHost'].trim()) {
++					ollamaHost = parsed['localcoders.ollamaHost'].trim().replace(/\/$/, '');
++				}
++			} catch {
++				// Use defaults when settings file does not exist or contains JSONC
++			}
++
++			if (!stopOnExit) {
++				return;
++			}
++
++			// 1. Unload any active models via Ollama HTTP API first
++			try {
++				const psRes = await fetch(`${ollamaHost}/api/ps`, { signal: AbortSignal.timeout(800) });
++				if (psRes.ok) {
++					const data = await psRes.json() as { models?: Array<{ name?: string; model?: string }> };
++					const models = (data.models || []).map(m => m.name || m.model).filter((n): n is string => Boolean(n));
++					await Promise.allSettled(
++						models.map(name =>
++							fetch(`${ollamaHost}/api/generate`, {
++								method: 'POST',
++								headers: { 'Content-Type': 'application/json' },
++								body: JSON.stringify({ model: name, keep_alive: 0 }),
++								signal: AbortSignal.timeout(1200)
++							}).catch(() => undefined)
++						)
++					);
++				}
++			} catch {
++				// Server may already be unreachable
++			}
++
++			// 2. Stop local Ollama daemon & GPU runner processes if host is loopback
++			let isLoopback = false;
++			try {
++				const h = new URL(ollamaHost).hostname.toLowerCase();
++				isLoopback = h === '127.0.0.1' || h === 'localhost' || h === '::1' || h === '0.0.0.0' || h === '[::1]';
++			} catch {
++				isLoopback = true;
++			}
++			if (!isLoopback) {
++				return;
++			}
++
++			const runExecFile = (cmd: string, args: string[], ms: number) => new Promise<string>((resolve) => {
++				execFile(cmd, args, { timeout: ms }, (_err, stdout) => resolve(String(stdout || '')));
++			});
++
++			if (isWindows) {
++				for (const exe of ['llama-server.exe', 'ollama.exe', 'ollama app.exe']) {
++					await runExecFile('taskkill', ['/F', '/IM', exe], 1200);
++				}
++				return;
++			}
++
++			// Stop non-interactive systemd service if running
++			await new Promise<void>((resolve) => {
++				execFile('systemctl', ['is-active', '--quiet', 'ollama'], { timeout: 600 }, (err) => {
++					if (!err) {
++						execFile('systemctl', ['--no-ask-password', 'stop', 'ollama'], { timeout: 1500 }, () => resolve());
++					} else {
++						resolve();
++					}
++				});
++			});
++
++			// Stop user-owned ollama serve / runner / llama-server processes directly
++			const uid = typeof process.getuid === 'function' ? String(process.getuid()) : '';
++			const psOut = await runExecFile('ps', uid ? ['-u', uid, '-o', 'pid=,comm=,args='] : ['-eo', 'pid=,comm=,args='], 1000);
++			const targetPids: number[] = [];
++			for (const raw of psOut.split(/\r?\n/)) {
++				const m = raw.trim().match(/^(\d+)\s+(\S+)\s+([\s\S]+)$/);
++				if (!m) {
++					continue;
++				}
++				const pid = parseInt(m[1], 10);
++				if (!Number.isFinite(pid) || pid <= 1 || pid === process.pid || pid === process.ppid) {
++					continue;
++				}
++				const bin = basename((m[3].split(/\s+/)[0] || '')).toLowerCase();
++				const comm = basename(m[2]).toLowerCase();
++				const isOllama = (bin === 'ollama' || comm === 'ollama') && /\b(serve|runner)\b/i.test(m[3]);
++				const isRunner = (bin === 'llama-server' || comm === 'llama-server') && /ollama/i.test(m[3]);
++				if (isOllama || isRunner) {
++					targetPids.push(pid);
++				}
++			}
++
++			for (const pid of targetPids) {
++				try {
++					process.kill(pid, 'SIGTERM');
++				} catch {
++					// ignore
++				}
++			}
++			if (targetPids.length > 0) {
++				await timeout(300);
++				for (const pid of targetPids) {
++					try {
++						process.kill(pid, 0);
++						process.kill(pid, 'SIGKILL');
++					} catch {
++						// already exited
++					}
++				}
++			}
++		} catch (e) {
++			this.logService.warn('[LifecycleMainService] stopLocalOllamaOnAppQuit warning:', e);
++		}
++	}
++
+ 	async kill(code?: number): Promise<void> {
+ 		this.trace('Lifecycle#kill()');
+ 
+ 		// Give main process participants a chance to orderly shutdown
+ 		await this.fireOnWillShutdown(ShutdownReason.KILL);
++		await Promise.race([this.stopLocalOllamaOnAppQuit(), timeout(2500)]);
+ 
+ 		// From extension tests we have seen issues where calling app.exit()
+ 		// with an opened window can lead to native crashes (Linux). As such,
+diff --git a/src/vs/workbench/browser/media/code-icon.svg b/src/vs/workbench/browser/media/code-icon.svg
+index cc61f81e..bb4b2a1b 100644
+--- a/src/vs/workbench/browser/media/code-icon.svg
++++ b/src/vs/workbench/browser/media/code-icon.svg
+@@ -1 +1,86 @@
+-<svg id="Layer_1" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024"><style>.st0{fill:#f6f6f6;fill-opacity:0}.st1{fill:#fff}.st2{fill:#167abf}</style><path class="st0" d="M1024 1024H0V0h1024v1024z"/><path class="st1" d="M1024 85.333v853.333H0V85.333h1024z"/><path class="st2" d="M0 85.333h298.667v853.333H0V85.333zm1024 0v853.333H384V85.333h640zm-554.667 160h341.333v-64H469.333v64zm341.334 533.334H469.333v64h341.333l.001-64zm128-149.334H597.333v64h341.333l.001-64zm0-149.333H597.333v64h341.333l.001-64zm0-149.333H597.333v64h341.333l.001-64z"/></svg>
+\ No newline at end of file
++<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
++  <defs>
++    <clipPath id="squircleClip">
++      <rect x="28" y="28" width="456" height="456" rx="108"/>
++    </clipPath>
++
++    <linearGradient id="bgObsidian" x1="0%" y1="0%" x2="100%" y2="100%">
++      <stop offset="0%" stop-color="#090c15"/>
++      <stop offset="52%" stop-color="#0f1526"/>
++      <stop offset="100%" stop-color="#06080e"/>
++    </linearGradient>
++
++    <linearGradient id="rimStroke" x1="0%" y1="0%" x2="100%" y2="100%">
++      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.48"/>
++      <stop offset="50%" stop-color="#818cf8" stop-opacity="0.32"/>
++      <stop offset="100%" stop-color="#2dd4bf" stop-opacity="0.38"/>
++    </linearGradient>
++
++    <!-- Soft Layered Ambient Aura -->
++    <radialGradient id="auraCenter" cx="50%" cy="50%" r="50%">
++      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.42"/>
++      <stop offset="42%" stop-color="#6366f1" stop-opacity="0.24"/>
++      <stop offset="76%" stop-color="#2dd4bf" stop-opacity="0.09"/>
++      <stop offset="100%" stop-color="#0f1526" stop-opacity="0"/>
++    </radialGradient>
++
++    <radialGradient id="auraUpperRight" cx="66%" cy="30%" r="44%">
++      <stop offset="0%" stop-color="#a78bfa" stop-opacity="0.34"/>
++      <stop offset="55%" stop-color="#818cf8" stop-opacity="0.09"/>
++      <stop offset="100%" stop-color="#818cf8" stop-opacity="0"/>
++    </radialGradient>
++
++    <radialGradient id="auraLowerLeft" cx="32%" cy="70%" r="44%">
++      <stop offset="0%" stop-color="#22d3ee" stop-opacity="0.30"/>
++      <stop offset="55%" stop-color="#0ea5e9" stop-opacity="0.08"/>
++      <stop offset="100%" stop-color="#0ea5e9" stop-opacity="0"/>
++    </radialGradient>
++
++    <linearGradient id="auraRingGrad" x1="0%" y1="0%" x2="100%" y2="100%">
++      <stop offset="0%" stop-color="#22d3ee"/>
++      <stop offset="50%" stop-color="#818cf8"/>
++      <stop offset="100%" stop-color="#34d399"/>
++    </linearGradient>
++
++    <linearGradient id="lcTextGrad" x1="15%" y1="0%" x2="85%" y2="100%">
++      <stop offset="0%" stop-color="#ffffff"/>
++      <stop offset="60%" stop-color="#e0f2fe"/>
++      <stop offset="100%" stop-color="#c7d2fe"/>
++    </linearGradient>
++
++    <filter id="ringBlur" x="-25%" y="-25%" width="150%" height="150%">
++      <feGaussianBlur stdDeviation="11"/>
++    </filter>
++
++    <filter id="letterAura" x="-30%" y="-30%" width="160%" height="160%">
++      <feGaussianBlur stdDeviation="14"/>
++    </filter>
++  </defs>
++
++  <!-- Obsidian Rounded Squircle Frame -->
++  <rect x="28" y="28" width="456" height="456" rx="108" fill="url(#bgObsidian)"/>
++
++  <!-- Atmospheric Multi-Tone Aura Wash -->
++  <g clip-path="url(#squircleClip)">
++    <rect x="28" y="28" width="456" height="456" fill="url(#auraCenter)"/>
++    <rect x="28" y="28" width="456" height="456" fill="url(#auraUpperRight)"/>
++    <rect x="28" y="28" width="456" height="456" fill="url(#auraLowerLeft)"/>
++  </g>
++
++  <!-- Soft Luminous Aura Halo Ring -->
++  <circle cx="256" cy="256" r="164" fill="none" stroke="url(#auraRingGrad)" stroke-width="11" opacity="0.50" filter="url(#ringBlur)"/>
++  <circle cx="256" cy="256" r="164" fill="none" stroke="url(#auraRingGrad)" stroke-width="3" opacity="0.86"/>
++
++  <!-- Outer Squircle Rim -->
++  <rect x="28" y="28" width="456" height="456" rx="108" fill="none" stroke="url(#rimStroke)" stroke-width="4"/>
++
++  <!-- Luminous Aura Behind LC -->
++  <g filter="url(#letterAura)" opacity="0.68">
++    <path d="M 158 192 L 158 310 Q 158 320 168 320 L 220 320" fill="none" stroke="url(#auraRingGrad)" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
++    <path d="M 354 206 C 336 178 270 182 270 256 C 270 330 336 334 354 306" fill="none" stroke="url(#auraRingGrad)" stroke-width="34" stroke-linecap="round" stroke-linejoin="round"/>
++  </g>
++
++  <!-- Crisp Simple LC Monogram (Optically Centered) -->
++  <path d="M 158 192 L 158 310 Q 158 320 168 320 L 220 320" fill="none" stroke="url(#lcTextGrad)" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
++  <path d="M 354 206 C 336 178 270 182 270 256 C 270 330 336 334 354 306" fill="none" stroke="url(#lcTextGrad)" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
++</svg>
+diff --git a/src/vs/workbench/browser/parts/editor/editorGroupView.ts b/src/vs/workbench/browser/parts/editor/editorGroupView.ts
+index 4926b845..12844463 100644
+--- a/src/vs/workbench/browser/parts/editor/editorGroupView.ts
++++ b/src/vs/workbench/browser/parts/editor/editorGroupView.ts
+@@ -569,6 +569,7 @@ export class EditorGroupView extends Themable implements IEditorGroupView {
+ 	private updateTitleContainer(): void {
+ 		this.titleContainer.classList.toggle('tabs', this.groupsView.partOptions.showTabs === 'multiple');
+ 		this.titleContainer.classList.toggle('show-file-icons', this.groupsView.partOptions.showIcons);
++		this.updateTitleContainerVisibility();
+ 	}
+ 
+ 	private restoreEditors(from: IEditorGroupView | ISerializedEditorGroupModel | null, groupViewOptions?: IEditorGroupViewOptions): Promise<void> | undefined {
+@@ -633,6 +634,14 @@ export class EditorGroupView extends Themable implements IEditorGroupView {
+ 		// Visibility
+ 		this._register(this.groupsView.onDidVisibilityChange(e => this.onDidVisibilityChange(e)));
+ 
++		// LocalCoders Agent Mode context key -> hide redundant single editor tab strip
++		this._register(this.contextKeyService.onDidChangeContext(e => {
++			if (e.affectsSome(new Set(['localcoders.inAgentMode']))) {
++				this.updateTitleContainerVisibility();
++				this.relayout();
++			}
++		}));
++
+ 		// Focus
+ 		this._register(this.onDidFocus(() => this.onDidGainFocus()));
+ 	}
+@@ -968,7 +977,7 @@ export class EditorGroupView extends Themable implements IEditorGroupView {
+ 	}
+ 
+ 	get titleHeight(): IEditorGroupTitleHeight {
+-		if (this.titleProvidedByEditor) {
++		if (this.shouldHideTitleContainer()) {
+ 			return { total: 0, offset: 0 };
+ 		}
+ 
+@@ -977,6 +986,25 @@ export class EditorGroupView extends Themable implements IEditorGroupView {
+ 
+ 	private titleProvidedByEditor = false;
+ 
++	private isAgentMode(): boolean {
++		return this.contextKeyService.getContextKeyValue<boolean>('localcoders.inAgentMode') === true ||
++			Boolean(this.element.closest('.monaco-workbench.localcoders-agent-mode'));
++	}
++
++	private shouldHideTitleContainer(): boolean {
++		return this.titleProvidedByEditor || this.isAgentMode();
++	}
++
++	private updateTitleContainerVisibility(): void {
++		const hideTitle = this.shouldHideTitleContainer();
++		this.element.classList.toggle('title-provided-by-editor', hideTitle);
++		if (hideTitle) {
++			hide(this.titleContainer);
++		} else {
++			show(this.titleContainer);
++		}
++	}
++
+ 	/**
+ 	 * A group that holds exactly one editor whose pane renders its own title
+ 	 * does not show its title area. With more editors, it shows as usual, and
+@@ -989,19 +1017,19 @@ export class EditorGroupView extends Themable implements IEditorGroupView {
+ 		if (paneProvidesTitle) {
+ 			activeEditorPane.setProvidedTitleVisible(titleProvidedByEditor);
+ 		}
++		const prevShouldHide = this.shouldHideTitleContainer();
+ 		if (this.titleProvidedByEditor === titleProvidedByEditor) {
++			this.updateTitleContainerVisibility();
+ 			return;
+ 		}
+ 
+ 		this.titleProvidedByEditor = titleProvidedByEditor;
+-		this.element.classList.toggle('title-provided-by-editor', titleProvidedByEditor);
+-		if (titleProvidedByEditor) {
+-			hide(this.titleContainer);
+-		} else {
+-			show(this.titleContainer);
++		this.updateTitleContainerVisibility();
++		if (prevShouldHide !== this.shouldHideTitleContainer()) {
++			this.relayout();
++		} else if (!this.isAgentMode()) {
++			this.relayout();
+ 		}
+-
+-		this.relayout();
+ 	}
+ 
+ 	notifyIndexChanged(newIndex: number): void {
+@@ -2303,7 +2331,7 @@ export class EditorGroupView extends Themable implements IEditorGroupView {
+ 		this.titleContainer.style.setProperty('--title-border-bottom-width', `${contentWidth}px`);
+ 
+ 		// Keep tabs full-width while the header and editor pane follow the content inset.
+-		const titleControlSize = this.titleProvidedByEditor ? new Dimension(width, 0) : this.titleControl.layout({
++		const titleControlSize = this.shouldHideTitleContainer() ? new Dimension(width, 0) : this.titleControl.layout({
+ 			container: new Dimension(width, height),
+ 			available: new Dimension(width, height - this.editorPane.minimumHeight)
+ 		}, contentWidth);
+diff --git a/src/vs/workbench/browser/parts/editor/editorGroupWatermark.ts b/src/vs/workbench/browser/parts/editor/editorGroupWatermark.ts
+index 18769852..e9079351 100644
+--- a/src/vs/workbench/browser/parts/editor/editorGroupWatermark.ts
++++ b/src/vs/workbench/browser/parts/editor/editorGroupWatermark.ts
+@@ -41,12 +41,9 @@ interface WatermarkEntry {
+ 	};
+ }
+ 
+-const showChatContextKey = ContextKeyExpr.and(ContextKeyExpr.equals('chatSetupHidden', false), ContextKeyExpr.equals('chatSetupDisabledInWorkspace', false));
+-
+ const openChat: WatermarkEntry = {
+-	text: localize('watermark.openChat', "Open Chat"), id: 'workbench.action.chat.open',
++	text: localize('watermark.openChat', "Ask LocalCoders"), id: 'localcoders.openComposer',
+ 	icon: registerIcon('watermark-chat', Codicon.chatSparkle, localize('watermark.chatIcon', "Icon for opening chat in the editor watermark.")),
+-	when: { native: showChatContextKey, web: showChatContextKey }
+ };
+ const showCommands: WatermarkEntry = {
+ 	text: localize('watermark.showCommands', "Show All Commands"), id: 'workbench.action.showCommands',
+diff --git a/src/vs/workbench/browser/parts/titlebar/media/titlebarpart.css b/src/vs/workbench/browser/parts/titlebar/media/titlebarpart.css
+index 68961abf..af905b76 100644
+--- a/src/vs/workbench/browser/parts/titlebar/media/titlebarpart.css
++++ b/src/vs/workbench/browser/parts/titlebar/media/titlebarpart.css
+@@ -74,8 +74,9 @@
+ 
+ .monaco-workbench .part.titlebar > .titlebar-container.has-center > .titlebar-left {
+ 	order: 0;
+-	width: 20%;
+-	flex-grow: 2;
++	width: auto !important;
++	min-width: max-content;
++	flex-grow: 1;
+ 	justify-content: flex-start;
+ }
+ 
+@@ -543,3 +544,159 @@
+ 	width: 12px;
+ 	height: 12px;
+ }
++
++
++/* LocalCoders Top Titlebar Switcher */
++.monaco-workbench .part.titlebar .window-appicon {
++	display: none !important;
++}
++
++.monaco-workbench .part.titlebar .localcoders-mode-switcher-container {
++	display: flex;
++	align-items: center;
++	gap: 6px;
++	height: 100%;
++	padding: 0 6px 0 8px;
++	z-index: 2500;
++	order: 0;
++	-webkit-app-region: no-drag;
++}
++
++.monaco-workbench .part.titlebar .localcoders-nav-arrows {
++	display: inline-flex;
++	align-items: center;
++	gap: 2px;
++	margin-left: 2px;
++}
++
++.monaco-workbench .part.titlebar .localcoders-nav-btn {
++	display: inline-flex;
++	align-items: center;
++	justify-content: center;
++	width: 22px;
++	height: 22px;
++	border-radius: 4px;
++	border: 1px solid transparent;
++	background: transparent;
++	color: #94a3b8;
++	font-size: 13px;
++	cursor: pointer;
++	outline: none;
++	user-select: none;
++	transition: all 0.15s ease;
++}
++
++.monaco-workbench .part.titlebar .localcoders-nav-btn:hover {
++	background: rgba(255, 255, 255, 0.08);
++	color: #ffffff;
++}
++
++/* Segmented Switcher */
++.monaco-workbench .part.titlebar .localcoders-segmented-switcher {
++	display: inline-flex;
++	align-items: center;
++	background: rgba(0, 0, 0, 0.35);
++	border: 1px solid rgba(255, 255, 255, 0.12);
++	border-radius: 6px;
++	padding: 2px;
++	gap: 2px;
++}
++
++.monaco-workbench .part.titlebar .localcoders-segment-btn {
++	display: inline-flex;
++	align-items: center;
++	gap: 5px;
++	height: 22px;
++	padding: 0 9px;
++	border-radius: 4px;
++	border: 1px solid transparent;
++	background: transparent;
++	color: #94a3b8;
++	font-size: 11.5px;
++	font-weight: 500;
++	cursor: pointer;
++	transition: all 0.15s ease;
++	outline: none;
++	user-select: none;
++}
++
++.monaco-workbench .part.titlebar .localcoders-segment-btn:hover {
++	color: #ffffff;
++	background: rgba(255, 255, 255, 0.06);
++}
++
++.monaco-workbench .part.titlebar .localcoders-segment-btn.active.agent-btn {
++	background: rgba(56, 189, 248, 0.18);
++	border-color: rgba(56, 189, 248, 0.45);
++	color: #38bdf8;
++	font-weight: 600;
++	box-shadow: 0 0 8px rgba(56, 189, 248, 0.2);
++}
++
++.monaco-workbench .part.titlebar .localcoders-segment-btn.active.ide-btn {
++	background: rgba(168, 85, 247, 0.18);
++	border-color: rgba(168, 85, 247, 0.45);
++	color: #c084fc;
++	font-weight: 600;
++	box-shadow: 0 0 8px rgba(168, 85, 247, 0.2);
++}
++
++.monaco-workbench .part.titlebar .localcoders-segment-btn .localcoders-dot,
++.monaco-workbench .part.titlebar .localcoders-segment-btn .localcoders-ide-icon {
++	display: inline-flex;
++	align-items: center;
++	justify-content: center;
++	line-height: 1;
++}
++
++.monaco-workbench .part.titlebar .localcoders-segment-btn.active.agent-btn .localcoders-dot {
++	color: #38bdf8;
++}
++
++.monaco-workbench .part.titlebar .localcoders-segment-btn.active.ide-btn .localcoders-dot {
++	color: #c084fc;
++}
++
++.monaco-workbench .part.titlebar .localcoders-segment-btn .localcoders-ide-icon {
++	font-size: 11px;
++	line-height: 1;
++}
++
++.monaco-workbench .part.titlebar .localcoders-segment-btn .localcoders-btn-text {
++	font-size: 11.5px;
++	letter-spacing: 0.2px;
++	font-family: inherit;
++}
++
++/* Strict Agent Mode Isolation: Single Locked Tab, Zero IDE Sidebars/Chrome */
++.monaco-workbench.localcoders-agent-mode .part.titlebar .localcoders-nav-arrows,
++.monaco-workbench.localcoders-agent-mode .part.titlebar .command-center {
++	display: none !important;
++}
++
++.monaco-workbench.localcoders-agent-mode .part.activitybar,
++.monaco-workbench.localcoders-agent-mode .part.sidebar,
++.monaco-workbench.localcoders-agent-mode .part.auxiliarybar,
++.monaco-workbench.localcoders-agent-mode .part.panel,
++.monaco-workbench.localcoders-agent-mode .part.statusbar {
++	display: none !important;
++}
++
++.monaco-workbench.localcoders-agent-mode .part.editor > .content .editor-group-container > .title {
++	display: none !important;
++	height: 0 !important;
++}
++
++.monaco-workbench.localcoders-agent-mode .part.editor > .content .editor-group-container > .title .tabs-container {
++	pointer-events: none !important;
++}
++
++.monaco-workbench.localcoders-agent-mode .part.editor > .content .editor-group-container > .title .tabs-container > .tab:not(.active),
++.monaco-workbench.localcoders-agent-mode .part.editor > .content .editor-group-container > .title .tabs-container > .tab > .tab-actions,
++.monaco-workbench.localcoders-agent-mode .part.editor > .content .editor-group-container > .title .tabs-container > .tabs-bar-add-tab,
++.monaco-workbench.localcoders-agent-mode .part.editor > .content .editor-group-container > .title .editor-actions,
++.monaco-workbench.localcoders-agent-mode .part.editor > .content .editor-group-container > .title .tabs-breadcrumbs,
++.monaco-workbench.localcoders-agent-mode .part.editor > .content .editor-group-container > .title .breadcrumbs-control {
++	display: none !important;
++}
++
+diff --git a/src/vs/workbench/browser/parts/titlebar/titlebarPart.ts b/src/vs/workbench/browser/parts/titlebar/titlebarPart.ts
+index 5c45ec92..dcb31e85 100644
+--- a/src/vs/workbench/browser/parts/titlebar/titlebarPart.ts
++++ b/src/vs/workbench/browser/parts/titlebar/titlebarPart.ts
+@@ -27,6 +27,7 @@ import { Parts, IWorkbenchLayoutService, ActivityBarPosition, LayoutSettings, Ed
+ import { createActionViewItem, fillInActionBarActions } from '../../../../platform/actions/browser/menuEntryActionViewItem.js';
+ import { Action2, IMenu, IMenuService, MenuId, registerAction2 } from '../../../../platform/actions/common/actions.js';
+ import { IContextKey, IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
++import { ICommandService } from '../../../../platform/commands/common/commands.js';
+ import { IHostService } from '../../../services/host/browser/host.js';
+ import { WindowTitle } from './windowTitle.js';
+ import { CommandCenterControl } from './commandCenterControl.js';
+@@ -34,7 +35,7 @@ import { Categories } from '../../../../platform/action/common/actionCommonCateg
+ import { HiddenItemStrategy, MenuWorkbenchToolBar, WorkbenchToolBar } from '../../../../platform/actions/browser/toolbar.js';
+ import { IActionViewItemService } from '../../../../platform/actions/browser/actionViewItemService.js';
+ import { ACCOUNTS_ACTIVITY_ID, GLOBAL_ACTIVITY_ID } from '../../../common/activity.js';
+-import { AccountsActivityActionViewItem, isAccountsActionVisible, SimpleAccountActivityActionViewItem, SimpleGlobalActivityActionViewItem } from '../globalCompositeBar.js';
++import { AccountsActivityActionViewItem, SimpleAccountActivityActionViewItem, SimpleGlobalActivityActionViewItem } from '../globalCompositeBar.js';
+ import { HoverPosition } from '../../../../base/browser/ui/hover/hoverWidget.js';
+ import { IEditorGroupsContainer, IEditorGroupsService } from '../../../services/editor/common/editorGroupsService.js';
+ import { ActionRunner, IAction, Separator } from '../../../../base/common/actions.js';
+@@ -48,7 +49,7 @@ import { ResolvedKeybinding } from '../../../../base/common/keybindings.js';
+ import { EditorCommandsContextActionRunner } from '../editor/editorTabsControl.js';
+ import { IEditorCommandsContext, IEditorPartOptionsChangeEvent, IToolbarActions } from '../../../common/editor.js';
+ import { CodeWindow, mainWindow } from '../../../../base/browser/window.js';
+-import { ACCOUNTS_ACTIVITY_TILE_ACTION, GLOBAL_ACTIVITY_TITLE_ACTION, TitleBarLeadingActionsGroup } from './titlebarActions.js';
++import { GLOBAL_ACTIVITY_TITLE_ACTION, TitleBarLeadingActionsGroup } from './titlebarActions.js';
+ import { IView } from '../../../../base/browser/ui/grid/grid.js';
+ import { createInstantHoverDelegate } from '../../../../base/browser/ui/hover/hoverDelegateFactory.js';
+ import { IBaseActionViewItemOptions } from '../../../../base/browser/ui/actionbar/actionViewItems.js';
+@@ -299,8 +300,11 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
+ 
+ 	private readonly isAuxiliary: boolean;
+ 	private isCompact = false;
++	private localCodersMode: 'agent' | 'ide' = 'agent';
++	private isApplyingLocalCodersMode = false;
+ 
+ 	private readonly isCompactContextKey: IContextKey<boolean>;
++	private readonly inAgentModeContextKey: IContextKey<boolean>;
+ 
+ 	readonly windowTitle: WindowTitle;
+ 
+@@ -334,6 +338,9 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
+ 		this.isAuxiliary = targetWindow.vscodeWindowId !== mainWindow.vscodeWindowId;
+ 
+ 		this.isCompactContextKey = IsCompactTitleBarContext.bindTo(this.contextKeyService);
++		const configuredDefaultView = this.configurationService.getValue<'agent' | 'ide'>('localcoders.defaultView');
++		this.localCodersMode = configuredDefaultView === 'ide' ? 'ide' : 'agent';
++		this.inAgentModeContextKey = this.contextKeyService.createKey<boolean>('localcoders.inAgentMode', !this.isAuxiliary && this.localCodersMode === 'agent');
+ 
+ 		this.titleBarStyle = getTitleBarStyle(this.configurationService);
+ 
+@@ -357,6 +364,27 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
+ 			}
+ 		}));
+ 		this._register(this.editorGroupsContainer.onDidChangeEditorPartOptions(e => this.onEditorPartConfigurationChange(e)));
++		this._register(this.layoutService.onDidChangePartVisibility(e => {
++			if (this.isAuxiliary || this.localCodersMode !== 'agent' || this.isApplyingLocalCodersMode) {
++				return;
++			}
++			if (
++				e.visible &&
++				(
++					e.partId === Parts.ACTIVITYBAR_PART ||
++					e.partId === Parts.SIDEBAR_PART ||
++					e.partId === Parts.AUXILIARYBAR_PART ||
++					e.partId === Parts.PANEL_PART
++				)
++			) {
++				this.isApplyingLocalCodersMode = true;
++				try {
++					this.layoutService.setPartHidden(true, e.partId);
++				} finally {
++					this.isApplyingLocalCodersMode = false;
++				}
++			}
++		}));
+ 	}
+ 
+ 	private onEditorPartConfigurationChange({ oldPartOptions, newPartOptions }: IEditorPartOptionsChangeEvent): void {
+@@ -528,6 +556,9 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
+ 		// Draggable region that we can manipulate for #52522
+ 		this.dragRegion = prepend(this.rootContainer, $('div.titlebar-drag-region'));
+ 
++		// LocalCoders Agent / IDE View Mode Switcher
++		this.createLocalCodersModeSwitcher();
++
+ 		// Menubar: install a custom menu bar depending on configuration
+ 		this.updateMenubarInstallation();
+ 
+@@ -677,6 +708,179 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
+ 		}
+ 	}
+ 
++	private createLocalCodersModeSwitcher(): void {
++		if (this.isAuxiliary) {
++			return; // Only show mode switcher on main window titlebar
++		}
++
++		const switcherContainer = append(this.leftContent, $('div.localcoders-mode-switcher-container'));
++		const svgNs = 'http://www.w3.org/2000/svg';
++		const createLucideSvg = (doc: Document, specs: Array<[string, Record<string, string>]>, size: number = 14): SVGSVGElement => {
++			const svg = doc.createElementNS(svgNs, 'svg');
++			svg.setAttribute('width', String(size));
++			svg.setAttribute('height', String(size));
++			svg.setAttribute('viewBox', '0 0 24 24');
++			svg.setAttribute('fill', 'none');
++			svg.setAttribute('stroke', 'currentColor');
++			svg.setAttribute('stroke-width', '1.75');
++			svg.setAttribute('stroke-linecap', 'round');
++			svg.setAttribute('stroke-linejoin', 'round');
++			svg.setAttribute('aria-hidden', 'true');
++			svg.style.display = 'block';
++			svg.style.flexShrink = '0';
++			for (const [tag, attrs] of specs) {
++				const child = doc.createElementNS(svgNs, tag);
++				for (const [k, v] of Object.entries(attrs)) {
++					child.setAttribute(k, v);
++				}
++				svg.appendChild(child);
++			}
++			return svg;
++		};
++		const LUCIDE_SHAPES: Record<string, Array<[string, Record<string, string>]>> = {
++			bot: [
++				['path', { d: 'M12 8V4H8' }],
++				['rect', { width: '16', height: '12', x: '4', y: '8', rx: '2' }],
++				['path', { d: 'M2 14h2' }],
++				['path', { d: 'M20 14h2' }],
++				['path', { d: 'M15 13v2' }],
++				['path', { d: 'M9 13v2' }],
++			],
++			code: [
++				['path', { d: 'm16 18 6-6-6-6' }],
++				['path', { d: 'm8 6-6 6 6 6' }],
++			],
++			arrowLeft: [
++				['path', { d: 'm12 19-7-7 7-7' }],
++				['path', { d: 'M19 12H5' }],
++			],
++			arrowRight: [
++				['path', { d: 'M5 12h14' }],
++				['path', { d: 'm12 5 7 7-7 7' }],
++			],
++		};
++
++		// 1. Segmented Workspace Switcher: [ Agent ] [ IDE ]
++		const segmentedBox = append(switcherContainer, $('div.localcoders-segmented-switcher'));
++
++		const agentBtn = append(segmentedBox, $('button.localcoders-segment-btn.agent-btn.active'));
++		agentBtn.setAttribute('title', 'Switch to Agent View (Ctrl+Shift+A)');
++		agentBtn.setAttribute('type', 'button');
++		const agentDot = append(agentBtn, $('span.localcoders-dot'));
++		agentDot.appendChild(createLucideSvg(switcherContainer.ownerDocument, LUCIDE_SHAPES.bot, 13));
++		const agentLabel = append(agentBtn, $('span.localcoders-btn-text'));
++		agentLabel.textContent = 'Agent';
++
++		const ideBtn = append(segmentedBox, $('button.localcoders-segment-btn.ide-btn'));
++		ideBtn.setAttribute('title', 'Switch to IDE View (Ctrl+Shift+E)');
++		ideBtn.setAttribute('type', 'button');
++		const ideIcon = append(ideBtn, $('span.localcoders-ide-icon'));
++		ideIcon.appendChild(createLucideSvg(switcherContainer.ownerDocument, LUCIDE_SHAPES.code, 13));
++		const ideLabel = append(ideBtn, $('span.localcoders-btn-text'));
++		ideLabel.textContent = 'IDE';
++
++		// 2. Navigation Arrows: Back / Forward
++		const navBox = append(switcherContainer, $('div.localcoders-nav-arrows'));
++		const backBtn = append(navBox, $('button.localcoders-nav-btn'));
++		backBtn.setAttribute('title', 'Go Back (Alt+Left)');
++		backBtn.setAttribute('type', 'button');
++		backBtn.appendChild(createLucideSvg(switcherContainer.ownerDocument, LUCIDE_SHAPES.arrowLeft, 14));
++
++		const forwardBtn = append(navBox, $('button.localcoders-nav-btn'));
++		forwardBtn.setAttribute('title', 'Go Forward (Alt+Right)');
++		forwardBtn.setAttribute('type', 'button');
++		forwardBtn.appendChild(createLucideSvg(switcherContainer.ownerDocument, LUCIDE_SHAPES.arrowRight, 14));
++
++		const commandService = this.instantiationService.invokeFunction(accessor => accessor.get(ICommandService));
++
++		const updateButton = (mode: 'agent' | 'ide') => {
++			if (mode === 'agent') {
++				agentBtn.classList.add('active');
++				ideBtn.classList.remove('active');
++			} else {
++				ideBtn.classList.add('active');
++				agentBtn.classList.remove('active');
++			}
++		};
++
++		updateButton(this.localCodersMode);
++		this.applyLocalCodersWorkbenchMode(this.localCodersMode, this.layoutService.isRestored());
++		this.layoutService.whenRestored.then(() => {
++			if (!this._store.isDisposed && !this.isAuxiliary) {
++				this.applyLocalCodersWorkbenchMode(this.localCodersMode, true);
++			}
++		});
++
++		this._register(commandService.onDidExecuteCommand(e => {
++			if (e.commandId === 'localcoders.activateAgentView') {
++				updateButton('agent');
++				this.applyLocalCodersWorkbenchMode('agent', true);
++			} else if (e.commandId === 'localcoders.activateIDEView') {
++				updateButton('ide');
++				this.applyLocalCodersWorkbenchMode('ide', true);
++			}
++		}));
++
++		this._register(addDisposableListener(agentBtn, EventType.CLICK, (e: MouseEvent) => {
++			e.stopPropagation();
++			e.preventDefault();
++			commandService.executeCommand('localcoders.activateAgentView');
++		}));
++
++		this._register(addDisposableListener(ideBtn, EventType.CLICK, (e: MouseEvent) => {
++			e.stopPropagation();
++			e.preventDefault();
++			commandService.executeCommand('localcoders.activateIDEView');
++		}));
++
++		this._register(addDisposableListener(backBtn, EventType.CLICK, (e: MouseEvent) => {
++			e.stopPropagation();
++			e.preventDefault();
++			commandService.executeCommand('workbench.action.navigateBack');
++		}));
++
++		this._register(addDisposableListener(forwardBtn, EventType.CLICK, (e: MouseEvent) => {
++			e.stopPropagation();
++			e.preventDefault();
++			commandService.executeCommand('workbench.action.navigateForward');
++		}));
++	}
++
++	private applyLocalCodersWorkbenchMode(mode: 'agent' | 'ide', applyPartVisibility: boolean): void {
++		if (this.isAuxiliary) {
++			return;
++		}
++		this.localCodersMode = mode;
++		this.inAgentModeContextKey.set(mode === 'agent');
++
++		const container = this.layoutService.getContainer(this.targetWindow);
++		container.classList.toggle('localcoders-agent-mode', mode === 'agent');
++
++		if (this.actionToolBar) {
++			this.createActionToolBarMenus({ layoutActions: true, editorActions: true });
++		}
++
++		if (!applyPartVisibility) {
++			return;
++		}
++
++		this.isApplyingLocalCodersMode = true;
++		try {
++			this.layoutService.setPartHidden(true, Parts.STATUSBAR_PART);
++			if (mode === 'agent') {
++				this.layoutService.setPartHidden(true, Parts.ACTIVITYBAR_PART);
++				this.layoutService.setPartHidden(true, Parts.SIDEBAR_PART);
++				this.layoutService.setPartHidden(true, Parts.AUXILIARYBAR_PART);
++				this.layoutService.setPartHidden(true, Parts.PANEL_PART);
++			} else {
++				this.layoutService.setPartHidden(false, Parts.ACTIVITYBAR_PART);
++				this.layoutService.setPartHidden(false, Parts.SIDEBAR_PART);
++			}
++		} finally {
++			this.isApplyingLocalCodersMode = false;
++		}
++	}
++
+ 	private actionViewItemProvider(action: IAction, options: IBaseActionViewItemOptions): IActionViewItem | undefined {
+ 
+ 		// --- Custom view items registered via IActionViewItemService
+@@ -806,10 +1010,7 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
+ 
+ 			// --- Activity Actions (always at the end)
+ 			if (this.activityActionsEnabled) {
+-				if (isAccountsActionVisible(this.storageService)) {
+-					actions.primary.push(ACCOUNTS_ACTIVITY_TILE_ACTION);
+-				}
+-
++				// LocalCoders: Omit Microsoft/GitHub account login action from titlebar
+ 				actions.primary.push(GLOBAL_ACTIVITY_TITLE_ACTION);
+ 			}
+ 
+@@ -934,14 +1135,23 @@ export class BrowserTitlebarPart extends Part implements ITitlebarPart {
+ 	}
+ 
+ 	private get layoutControlEnabled(): boolean {
++		if (!this.isAuxiliary && this.localCodersMode === 'agent') {
++			return false;
++		}
+ 		return this.configurationService.getValue<boolean>(LayoutSettings.LAYOUT_ACTIONS) !== false;
+ 	}
+ 
+ 	protected get isCommandCenterVisible() {
++		if (!this.isAuxiliary && this.localCodersMode === 'agent') {
++			return false;
++		}
+ 		return !this.isCompact && this.configurationService.getValue<boolean>(LayoutSettings.COMMAND_CENTER) !== false;
+ 	}
+ 
+ 	private get editorActionsEnabled(): boolean {
++		if (!this.isAuxiliary && this.localCodersMode === 'agent') {
++			return false;
++		}
+ 		return (this.editorGroupsContainer.partOptions.editorActionsLocation === EditorActionsLocation.TITLEBAR ||
+ 			(
+ 				this.editorGroupsContainer.partOptions.editorActionsLocation === EditorActionsLocation.DEFAULT &&
+diff --git a/src/vs/workbench/browser/workbench.contribution.ts b/src/vs/workbench/browser/workbench.contribution.ts
+index 75c746cf..839496fa 100644
+--- a/src/vs/workbench/browser/workbench.contribution.ts
++++ b/src/vs/workbench/browser/workbench.contribution.ts
+@@ -642,7 +642,7 @@ const registry = Registry.as<IConfigurationRegistry>(ConfigurationExtensions.Con
+ 			},
+ 			'workbench.statusBar.visible': {
+ 				'type': 'boolean',
+-				'default': true,
++				'default': false,
+ 				'description': localize('statusBarVisibility', "Controls the visibility of the status bar at the bottom of the workbench."),
+ 				agentsWindow: { default: false, readOnly: true },
+ 			},
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSignedOutModelsNotification.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSignedOutModelsNotification.ts
+index faceddda..564fcfc6 100644
+--- a/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSignedOutModelsNotification.ts
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/agentHost/agentHostSignedOutModelsNotification.ts
+@@ -194,15 +194,18 @@ export class AgentHostSignedOutModelsNotificationContribution extends Disposable
+ 	}
+ 
+ 	private _setNotification(show: boolean): void {
+-		if (show === this._notificationShown) {
++		if (this._notificationShown === show) {
+ 			return;
+ 		}
+ 		this._notificationShown = show;
+-		if (!show) {
+-			this._chatInputNotificationService.deleteNotification(SIGNED_OUT_MODELS_NOTIFICATION_ID);
+-			return;
++		this._chatInputNotificationService.deleteNotification(SIGNED_OUT_MODELS_NOTIFICATION_ID);
++		if (show) {
++			// In LocalCoders, default to silent (no Copilot models banner)
++			const notification = this._createNotification();
++			if (notification.id === 'DISABLED') {
++				this._chatInputNotificationService.setNotification(notification);
++			}
+ 		}
+-		this._chatInputNotificationService.setNotification(this._createNotification());
+ 	}
+ 
+ 	private _createNotification(): IChatInputNotification {
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/agentSessionsBanner.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/agentSessionsBanner.ts
+index a9a70796..19a3b9c8 100644
+--- a/src/vs/workbench/contrib/chat/browser/agentSessions/agentSessionsBanner.ts
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/agentSessionsBanner.ts
+@@ -8,7 +8,7 @@ import { onUnexpectedError } from '../../../../../base/common/errors.js';
+ import { DisposableStore } from '../../../../../base/common/lifecycle.js';
+ import { autorun, IObservable, observableValue } from '../../../../../base/common/observable.js';
+ import { localize } from '../../../../../nls.js';
+-import { ICommandService, CommandsRegistry } from '../../../../../platform/commands/common/commands.js';
++import { ICommandService } from '../../../../../platform/commands/common/commands.js';
+ import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
+ import { IDefaultAccountService } from '../../../../../platform/defaultAccount/common/defaultAccount.js';
+ import { logSettingExperimentTrigger } from '../../../../../platform/telemetry/common/experimentTrigger.js';
+@@ -40,11 +40,7 @@ export interface IAgentsBannerResult {
+ 
+ /** Returns whether the desktop Agents window is available and agent mode and AI features are enabled. */
+ export function canShowAgentsBanner(chatEntitlementService: IChatEntitlementService, configurationService: IConfigurationService): boolean {
+-	const sentiment = chatEntitlementService.sentiment;
+-	if (sentiment.hidden || sentiment.disabled || configurationService.getValue<boolean>(ChatConfiguration.AgentEnabled) === false) {
+-		return false;
+-	}
+-	return !!CommandsRegistry.getCommand(OPEN_WORKSPACE_IN_AGENTS_WINDOW_COMMAND_ID);
++	return false;
+ }
+ 
+ export interface IAgentsBannerOptions {
+diff --git a/src/vs/workbench/contrib/chat/browser/agentSessions/experiments/agentSessionsExperiments.contribution.ts b/src/vs/workbench/contrib/chat/browser/agentSessions/experiments/agentSessionsExperiments.contribution.ts
+index 7b38af22..4825630e 100644
+--- a/src/vs/workbench/contrib/chat/browser/agentSessions/experiments/agentSessionsExperiments.contribution.ts
++++ b/src/vs/workbench/contrib/chat/browser/agentSessions/experiments/agentSessionsExperiments.contribution.ts
+@@ -10,11 +10,12 @@ import { EnterAgentSessionProjectionAction, ExitAgentSessionProjectionAction, To
+ import { IWorkbenchContribution, registerWorkbenchContribution2, WorkbenchPhase } from '../../../../../common/contributions.js';
+ import { AgentTitleBarStatusRendering } from './agentTitleBarStatusWidget.js';
+ import { AgentTitleBarStatusService, IAgentTitleBarStatusService } from './agentTitleBarStatusService.js';
+-import { Codicon } from '../../../../../../base/common/codicons.js';
++// LocalCoders: Cleaned unused imports
++// import { Codicon } from '../../../../../../base/common/codicons.js';
+ import { localize } from '../../../../../../nls.js';
+ import { ContextKeyExpr } from '../../../../../../platform/contextkey/common/contextkey.js';
+ import { ProductQualityContext } from '../../../../../../platform/contextkey/common/contextkeys.js';
+-import { InEditorZenModeContext } from '../../../../../common/contextkeys.js';
++// import { InEditorZenModeContext } from '../../../../../common/contextkeys.js';
+ import { ChatAgentLocation, ChatConfiguration } from '../../../common/constants.js';
+ import { ChatContextKeys } from '../../../common/actions/chatContextKeys.js';
+ import { Disposable, DisposableStore, IDisposable } from '../../../../../../base/common/lifecycle.js';
+@@ -261,35 +262,25 @@ registerSingleton(IAgentTitleBarStatusService, AgentTitleBarStatusService, Insta
+ registerWorkbenchContribution2(AgentTitleBarStatusRendering.ID, AgentTitleBarStatusRendering, WorkbenchPhase.AfterRestored);
+ registerWorkbenchContribution2(AgentSessionReadyContribution.ID, AgentSessionReadyContribution, WorkbenchPhase.AfterRestored);
+ 
+-// Register Agent Status as a menu item in the command center (alongside the search box, not replacing it)
++/*
++// LocalCoders: Disable Microsoft Copilot titlebar items in favor of native LocalCoders mode switcher
+ MenuRegistry.appendMenuItem(MenuId.CommandCenter, {
+ 	submenu: MenuId.AgentsTitleBarControlMenu,
+ 	title: localize('agentsControl', "Agents"),
+ 	icon: Codicon.chatSparkle,
+-	when: ContextKeyExpr.and(
+-		ChatContextKeys.enabled,
+-		ContextKeyExpr.notEquals(`config.${ChatConfiguration.AgentStatusEnabled}`, 'hidden'),
+-		ContextKeyExpr.notEquals(`config.${ChatConfiguration.AgentStatusEnabled}`, false),
+-		InEditorZenModeContext.negate()
+-	),
+-	order: 10002 // to the right of the chat button
++	when: ContextKeyExpr.false(),
++	order: 10002
+ });
+ 
+-// Add to the global title bar if command center is disabled
+ MenuRegistry.appendMenuItem(MenuId.TitleBar, {
+ 	submenu: MenuId.ChatTitleBarMenu,
+ 	title: localize('title4', "Chat"),
+ 	group: 'navigation',
+ 	icon: Codicon.chatSparkle,
+-	when: ContextKeyExpr.and(
+-		ChatContextKeys.supported,
+-		ContextKeyExpr.and(
+-			ChatContextKeys.Setup.hidden.negate(),
+-		),
+-		ContextKeyExpr.has('config.window.commandCenter').negate(),
+-	),
++	when: ContextKeyExpr.false(),
+ 	order: 1
+ });
++*/
+ 
+ // Register a placeholder action to the submenu so it appears (required for submenus)
+ MenuRegistry.appendMenuItem(MenuId.AgentsTitleBarControlMenu, {
+diff --git a/src/vs/workbench/contrib/chat/browser/chatParticipant.contribution.ts b/src/vs/workbench/contrib/chat/browser/chatParticipant.contribution.ts
+index 89200842..d9c866f8 100644
+--- a/src/vs/workbench/contrib/chat/browser/chatParticipant.contribution.ts
++++ b/src/vs/workbench/contrib/chat/browser/chatParticipant.contribution.ts
+@@ -4,23 +4,19 @@
+  *--------------------------------------------------------------------------------------------*/
+ 
+ import { coalesce, isNonEmptyArray } from '../../../../base/common/arrays.js';
+-import { Codicon } from '../../../../base/common/codicons.js';
+ import { toErrorMessage } from '../../../../base/common/errorMessage.js';
+ import { Event } from '../../../../base/common/event.js';
+ import { createCommandUri, MarkdownString } from '../../../../base/common/htmlContent.js';
+-import { KeyCode, KeyMod } from '../../../../base/common/keyCodes.js';
+ import { Disposable, DisposableMap, DisposableStore } from '../../../../base/common/lifecycle.js';
+ import * as strings from '../../../../base/common/strings.js';
+-import { localize, localize2 } from '../../../../nls.js';
+-import { ContextKeyExpr, IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
++import { localize } from '../../../../nls.js';
++import { IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
+ import { ExtensionIdentifier, IExtensionManifest } from '../../../../platform/extensions/common/extensions.js';
+ import { SyncDescriptor } from '../../../../platform/instantiation/common/descriptors.js';
+ import { IProductService } from '../../../../platform/product/common/productService.js';
+ import { Registry } from '../../../../platform/registry/common/platform.js';
+-import { registerIcon } from '../../../../platform/theme/common/iconRegistry.js';
+-import { ViewPaneContainer } from '../../../browser/parts/views/viewPaneContainer.js';
+ import { IWorkbenchContribution } from '../../../common/contributions.js';
+-import { IViewContainersRegistry, IViewDescriptor, IViewsRegistry, ViewContainer, ViewContainerLocation, Extensions as ViewExtensions } from '../../../common/views.js';
++import { IViewsRegistry, Extensions as ViewExtensions } from '../../../common/views.js';
+ import { Extensions, IExtensionFeaturesRegistry, IExtensionFeatureTableRenderer, IRenderedData, IRowData, ITableData } from '../../../services/extensionManagement/common/extensionFeatures.js';
+ import { isProposedApiEnabled } from '../../../services/extensions/common/extensions.js';
+ import * as extensionsRegistry from '../../../services/extensions/common/extensionsRegistry.js';
+@@ -30,13 +26,12 @@ import { IChatAgentData, IChatAgentService } from '../common/participants/chatAg
+ import { ChatContextKeys } from '../common/actions/chatContextKeys.js';
+ import { IRawChatParticipantContribution } from '../common/participants/chatParticipantContribTypes.js';
+ import { ChatAgentLocation, ChatModeKind } from '../common/constants.js';
+-import { ChatViewId, ChatViewContainerId } from './chat.js';
+-import { ChatViewPane } from './widgetHosts/viewPane/chatViewPane.js';
+-import { ChatUpdateRequiredView } from './viewsWelcome/chatUpdateRequiredView.js';
+-import { MANAGED_SETTINGS_UPDATE_VIEW_ID, ManagedSettingsUpdateRequiredContext } from '../../../services/policies/common/managedSettingsUpdate.js';
++import { ChatViewId } from './chat.js';
+ 
+ // --- Chat Container &  View Registration
+ 
++// LocalCoders: Disable default Microsoft Copilot chat container & views in favor of native LocalCoders AI
++/*
+ const chatViewIcon = registerIcon('chat-view-icon', Codicon.chatSparkle, localize('chatViewIcon', 'View icon of the chat view.'));
+ 
+ const chatViewContainer: ViewContainer = Registry.as<IViewContainersRegistry>(ViewExtensions.ViewContainersRegistry).registerViewContainer({
+@@ -46,8 +41,8 @@ const chatViewContainer: ViewContainer = Registry.as<IViewContainersRegistry>(Vi
+ 	ctorDescriptor: new SyncDescriptor(ViewPaneContainer, [ChatViewContainerId, { mergeViewWithContainerWhenSingleView: true }]),
+ 	storageId: ChatViewContainerId,
+ 	hideIfEmpty: true,
+-	order: 1,
+-}, ViewContainerLocation.AuxiliaryBar, { isDefault: true, doNotRegisterOpenCommand: true });
++	order: 10,
++}, ViewContainerLocation.AuxiliaryBar, { isDefault: false, doNotRegisterOpenCommand: true });
+ 
+ const chatViewDescriptor: IViewDescriptor = {
+ 	id: ChatViewId,
+@@ -67,20 +62,10 @@ const chatViewDescriptor: IViewDescriptor = {
+ 				primary: KeyMod.CtrlCmd | KeyMod.WinCtrl | KeyCode.KeyI
+ 			}
+ 		},
+-		order: 1
++		order: 10
+ 	},
+ 	ctorDescriptor: new SyncDescriptor(ChatViewPane),
+-	when: ContextKeyExpr.and(
+-		ChatContextKeys.accountPolicyGateActive.negate(),
+-		ContextKeyExpr.or(
+-			ContextKeyExpr.and(
+-				ChatContextKeys.Setup.hidden.negate(),
+-				ChatContextKeys.Setup.disabledInWorkspace.negate(),
+-			),
+-			ChatContextKeys.panelParticipantRegistered,
+-			ChatContextKeys.extensionInvalid
+-		)
+-	)
++	when: ContextKeyExpr.false()
+ };
+ Registry.as<IViewsRegistry>(ViewExtensions.ViewsRegistry).registerViews([chatViewDescriptor], chatViewContainer);
+ 
+@@ -102,6 +87,7 @@ Registry.as<IViewsRegistry>(ViewExtensions.ViewsRegistry).registerViews([{
+ 		},
+ 	},
+ }], chatViewContainer);
++*/
+ 
+ const chatParticipantExtensionPoint = extensionsRegistry.ExtensionsRegistry.registerExtensionPoint<IRawChatParticipantContribution[]>({
+ 	extensionPoint: 'chatParticipants',
+diff --git a/src/vs/workbench/contrib/chat/browser/chatSetup/chatSetupContributions.ts b/src/vs/workbench/contrib/chat/browser/chatSetup/chatSetupContributions.ts
+index dafd354c..38edb77e 100644
+--- a/src/vs/workbench/contrib/chat/browser/chatSetup/chatSetupContributions.ts
++++ b/src/vs/workbench/contrib/chat/browser/chatSetup/chatSetupContributions.ts
+@@ -3,9 +3,9 @@
+  *  Licensed under the MIT License. See License.txt in the project root for license information.
+  *--------------------------------------------------------------------------------------------*/
+ 
+-import * as dom from '../../../../../base/browser/dom.js';
+-import { BaseActionViewItem, IBaseActionViewItemOptions } from '../../../../../base/browser/ui/actionbar/actionViewItems.js';
+-import { IAction, WorkbenchActionExecutedClassification, WorkbenchActionExecutedEvent } from '../../../../../base/common/actions.js';
++// import * as dom from '../../../../../base/browser/dom.js';
++// import { BaseActionViewItem, IBaseActionViewItemOptions } from '../../../../../base/browser/ui/actionbar/actionViewItems.js';
++import { WorkbenchActionExecutedClassification, WorkbenchActionExecutedEvent } from '../../../../../base/common/actions.js';
+ import { CancellationToken } from '../../../../../base/common/cancellation.js';
+ import { Event } from '../../../../../base/common/event.js';
+ import { Lazy } from '../../../../../base/common/lazy.js';
+@@ -23,34 +23,27 @@ import { Action2, MenuId, MenuRegistry, registerAction2 } from '../../../../../p
+ import { CommandsRegistry, ICommandService } from '../../../../../platform/commands/common/commands.js';
+ import { ConfigurationTarget, IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
+ import { ContextKeyExpr, IContextKeyService } from '../../../../../platform/contextkey/common/contextkey.js';
+-import { IsWebContext } from '../../../../../platform/contextkey/common/contextkeys.js';
+ import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
+ import { IEnvironmentService } from '../../../../../platform/environment/common/environment.js';
+ import { ExtensionIdentifier } from '../../../../../platform/extensions/common/extensions.js';
+ import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
+ import { ILogService } from '../../../../../platform/log/common/log.js';
+ import { IMarkerService } from '../../../../../platform/markers/common/markers.js';
+-import { IOpenerService } from '../../../../../platform/opener/common/opener.js';
+ import product from '../../../../../platform/product/common/product.js';
+-import { GitHubPaths, IDefaultAccountService } from '../../../../../platform/defaultAccount/common/defaultAccount.js';
+ import { IProductService } from '../../../../../platform/product/common/productService.js';
+ import { ITelemetryService } from '../../../../../platform/telemetry/common/telemetry.js';
+-import { ToggleTitleBarConfigAction } from '../../../../browser/parts/titlebar/titlebarActions.js';
+ import { ACCOUNTS_SHARED_SIGN_IN_GROUP } from '../../../../common/activity.js';
+ import { IWorkbenchContribution } from '../../../../common/contributions.js';
+ import { IViewDescriptorService, ViewContainerLocation } from '../../../../common/views.js';
+-import { ChatEntitlement, ChatEntitlementContext, ChatEntitlementContextKeys, ChatEntitlementRequests, ChatEntitlementService, IChatEntitlementService, isProUser } from '../../../../services/chat/common/chatEntitlementService.js';
++import { ChatEntitlement, ChatEntitlementContext, ChatEntitlementRequests, ChatEntitlementService, IChatEntitlementService } from '../../../../services/chat/common/chatEntitlementService.js';
+ import { EnablementState, IWorkbenchExtensionEnablementService } from '../../../../services/extensionManagement/common/extensionManagement.js';
+ import { ExtensionUrlHandlerOverrideRegistry, IExtensionUrlHandlerOverride } from '../../../../services/extensions/browser/extensionUrlHandler.js';
+ import { IExtensionService } from '../../../../services/extensions/common/extensions.js';
+ import { CONTEXT_DEFAULT_ACCOUNT_STATE, DefaultAccountStatus } from '../../../../services/accounts/browser/defaultAccount.js';
+-import { IHostService } from '../../../../services/host/browser/host.js';
+ import { IWorkbenchLayoutService, Parts } from '../../../../services/layout/browser/layoutService.js';
+-import { InEditorZenModeContext } from '../../../../common/contextkeys.js';
+ import { ILifecycleService } from '../../../../services/lifecycle/common/lifecycle.js';
+ import { IPreferencesService } from '../../../../services/preferences/common/preferences.js';
+ import { IExtension, IExtensionsWorkbenchService } from '../../../extensions/common/extensions.js';
+-import { UpdateTitleBarEditorVisibleContext } from '../../../update/common/update.js';
+ import { ChatContextKeys } from '../../common/actions/chatContextKeys.js';
+ import { IChatSessionsService } from '../../common/chatSessionsService.js';
+ import { ChatAIDisabledSettingId, ChatAgentLocation, ChatConfiguration, ChatModeKind } from '../../common/constants.js';
+@@ -58,7 +51,7 @@ import { CHAT_CATEGORY, CHAT_SETUP_ACTION_ID, CHAT_SETUP_SUPPORT_ANONYMOUS_ACTIO
+ import { ChatViewContainerId, IChatWidget, IChatWidgetService } from '../chat.js';
+ import { ChatInputNotificationSeverity, IChatInputNotificationService } from '../widget/input/chatInputNotificationService.js';
+ import { chatViewsWelcomeRegistry } from '../viewsWelcome/chatViewsWelcome.js';
+-import { buildUpgradeUrlWithRedirect, ChatSetupAnonymous, ChatSetupSource, ChatSetupStrategy, IChatSetupCommandOptions, IChatSetupResult, refreshTokens } from './chatSetup.js';
++import { ChatSetupAnonymous, ChatSetupSource, ChatSetupStrategy, IChatSetupCommandOptions, IChatSetupResult, refreshTokens } from './chatSetup.js';
+ import { ChatSetupController } from './chatSetupController.js';
+ import { GrowthSessionController, registerGrowthSession } from './chatSetupGrowthSession.js';
+ import { AICodeActionsHelper, AINewSymbolNamesProvider, ChatCodeActionsProvider, SetupAgent } from './chatSetupProviders.js';
+@@ -68,8 +61,6 @@ const defaultChat = {
+ 	chatExtensionId: product.defaultChatAgent?.chatExtensionId ?? '',
+ };
+ 
+-const SIGN_IN_TITLE_BAR_ACTION_ID = 'workbench.action.chat.signInIndicator';
+-
+ export const ChatSetupFromAccountsWhen = ContextKeyExpr.and(
+ 	ChatContextKeys.Setup.hidden.negate(),
+ 	ChatContextKeys.Setup.disabledInWorkspace.negate(),
+@@ -81,7 +72,7 @@ export class ChatSetupContribution extends Disposable implements IWorkbenchContr
+ 	static readonly ID = 'workbench.contrib.chatSetup';
+ 
+ 	constructor(
+-		@IActionViewItemService actionViewItemService: IActionViewItemService,
++		@IActionViewItemService _actionViewItemService: IActionViewItemService,
+ 		@IInstantiationService private readonly instantiationService: IInstantiationService,
+ 		@IChatEntitlementService chatEntitlementService: ChatEntitlementService,
+ 		@ILogService private readonly logService: ILogService,
+@@ -106,7 +97,8 @@ export class ChatSetupContribution extends Disposable implements IWorkbenchContr
+ 		this.registerSetupAgents(context, controller);
+ 		this.registerGrowthSession(chatEntitlementService);
+ 		this.registerActions(context, requests, controller);
+-		this.registerSignInTitleBarEntry(actionViewItemService);
++		// LocalCoders: Omit Copilot titlebar sign-in button
++		// this.registerSignInTitleBarEntry(actionViewItemService);
+ 		this.registerUrlLinkHandler();
+ 		this.checkExtensionInstallation(context);
+ 	}
+@@ -397,6 +389,8 @@ export class ChatSetupContribution extends Disposable implements IWorkbenchContr
+ 			}
+ 		}
+ 
++		// LocalCoders: Unused Copilot sign-in and upsell actions commented out
++		/*
+ 		class ChatSetupSignInTitleBarAction extends Action2 {
+ 
+ 			static readonly ID = SIGN_IN_TITLE_BAR_ACTION_ID;
+@@ -406,21 +400,7 @@ export class ChatSetupContribution extends Disposable implements IWorkbenchContr
+ 					id: ChatSetupSignInTitleBarAction.ID,
+ 					title: localize('signInIndicatorTitleBarAction', 'Sign In'),
+ 					f1: false,
+-					menu: [{
+-						id: MenuId.TitleBarAdjacentCenter,
+-						order: 0,
+-						when: ContextKeyExpr.and(
+-							IsWebContext.negate(),
+-							ChatContextKeys.Entitlement.signedOut,
+-							CONTEXT_DEFAULT_ACCOUNT_STATE.notEqualsTo(DefaultAccountStatus.Available), // hide only when signed in (a default GitHub account is present); still shown while signed out or before the account state resolves, incl. untrusted workspaces — no auth prompt
+-							ChatEntitlementContextKeys.hasByokModels.negate(),
+-							ChatContextKeys.Setup.hidden.negate(),
+-							ChatContextKeys.Setup.disabledInWorkspace.negate(),
+-							ContextKeyExpr.equals(`config.${ChatConfiguration.TitleBarSignInEnabled}`, true),
+-							UpdateTitleBarEditorVisibleContext.negate(),
+-							InEditorZenModeContext.negate(),
+-						),
+-					}]
++					menu: []
+ 				});
+ 			}
+ 
+@@ -569,16 +549,18 @@ export class ChatSetupContribution extends Disposable implements IWorkbenchContr
+ 				openerService.open(URI.parse(budgetsUrl));
+ 			}
+ 		}
++		*/
+ 
+ 		registerAction2(ChatSetupTriggerAction);
+ 		registerAction2(ChatSetupTriggerForceSignInDialogAction);
+ 		registerAction2(ChatSetupFromAccountsAction);
+-		registerAction2(ChatSetupSignInTitleBarAction);
+-		registerAction2(ToggleSignInTitleBarAction);
++		// LocalCoders: Disable Microsoft Copilot sign in and upgrade actions in titlebar
++		// registerAction2(ChatSetupSignInTitleBarAction);
++		// registerAction2(ToggleSignInTitleBarAction);
+ 		registerAction2(ChatSetupTriggerAnonymousWithoutDialogAction);
+ 		registerAction2(ChatSetupTriggerSupportAnonymousAction);
+-		registerAction2(UpgradePlanAction);
+-		registerAction2(ManageAdditionalSpendAction);
++		// registerAction2(UpgradePlanAction);
++		// registerAction2(ManageAdditionalSpendAction);
+ 
+ 		//#endregion
+ 
+@@ -666,13 +648,7 @@ export class ChatSetupContribution extends Disposable implements IWorkbenchContr
+ 
+ 	}
+ 
+-	private registerSignInTitleBarEntry(actionViewItemService: IActionViewItemService): void {
+-		this._register(actionViewItemService.register(
+-			MenuId.TitleBarAdjacentCenter,
+-			SIGN_IN_TITLE_BAR_ACTION_ID,
+-			(action, options) => new SignInTitleBarEntry(action, options)
+-		));
+-	}
++	// LocalCoders: Omitted registerSignInTitleBarEntry to eliminate Copilot sign-in titlebar item
+ 
+ 	private registerUrlLinkHandler(): void {
+ 		this._register(ExtensionUrlHandlerOverrideRegistry.registerHandler(this.instantiationService.createInstance(ChatSetupExtensionUrlHandler)));
+@@ -914,44 +890,8 @@ export class ChatTeardownContribution extends Disposable implements IWorkbenchCo
+ 
+ //#endregion
+ 
+-/**
+- * Custom action view item that renders a "Sign In" button
+- * in the title bar with prominent button styling.
+- */
++/*
+ class SignInTitleBarEntry extends BaseActionViewItem {
+-
+-	private label: HTMLElement | undefined;
+-
+-	constructor(
+-		action: IAction,
+-		options: IBaseActionViewItemOptions,
+-	) {
+-		super(undefined, action, options);
+-	}
+-
+-	public override render(container: HTMLElement) {
+-		super.render(container);
+-
+-		container.setAttribute('role', 'button');
+-		container.setAttribute('aria-label', this.action.label);
+-
+-		const content = dom.append(container, dom.$('.update-indicator.prominent'));
+-		this.label = dom.append(content, dom.$('.indicator-label'));
+-		this.label.textContent = this.action.label;
+-	}
+-
+-	protected override updateLabel(): void {
+-		if (this.label) {
+-			this.label.textContent = this.action.label;
+-		}
+-		if (this.element) {
+-			this.element.setAttribute('aria-label', this.action.label);
+-		}
+-	}
+-
+-	protected override updateEnabled(): void {
+-		if (this.element) {
+-			this.element.classList.toggle('disabled', !this.action.enabled);
+-		}
+-	}
++...
+ }
++*/
+diff --git a/src/vs/workbench/contrib/chat/electron-browser/agentSessions/agentSessionsActions.ts b/src/vs/workbench/contrib/chat/electron-browser/agentSessions/agentSessionsActions.ts
+index b008528c..8735f1b2 100644
+--- a/src/vs/workbench/contrib/chat/electron-browser/agentSessions/agentSessionsActions.ts
++++ b/src/vs/workbench/contrib/chat/electron-browser/agentSessions/agentSessionsActions.ts
+@@ -219,10 +219,7 @@ export class OpenWorkspaceInAgentsWindowTitleBarAction extends Action2 {
+ 			menu: {
+ 				id: MenuId.TitleBarAdjacentCenter,
+ 				order: -1000,
+-				when: ContextKeyExpr.and(
+-					OPEN_AGENTS_WINDOW_PRECONDITION,
+-					ContextKeyExpr.notEquals(`config.${ChatConfiguration.TitleBarOpenInAgentsWindowEnabled}`, false),
+-				),
++				when: ContextKeyExpr.false(),
+ 			},
+ 		});
+ 	}
+diff --git a/src/vs/workbench/contrib/welcomeGettingStarted/browser/gettingStarted.contribution.ts b/src/vs/workbench/contrib/welcomeGettingStarted/browser/gettingStarted.contribution.ts
+index ca1f6061..2cd30183 100644
+--- a/src/vs/workbench/contrib/welcomeGettingStarted/browser/gettingStarted.contribution.ts
++++ b/src/vs/workbench/contrib/welcomeGettingStarted/browser/gettingStarted.contribution.ts
+@@ -47,7 +47,7 @@ registerAction2(class extends Action2 {
+ 				order: 1,
+ 			},
+ 			metadata: {
+-				description: localize2('minWelcomeDescription', 'Opens a Walkthrough to help you get started in VS Code.')
++				description: localize2('minWelcomeDescription', 'Opens a Walkthrough to help you get started in LocalCoders.')
+ 			}
+ 		});
+ 	}
+@@ -301,13 +301,13 @@ configurationRegistry.registerConfiguration({
+ 			'enum': ['none', 'welcomePage', 'readme', 'newUntitledFile', 'welcomePageInEmptyWorkbench', 'terminal'],
+ 			'enumDescriptions': [
+ 				localize({ comment: ['This is the description for a setting. Values surrounded by single quotes are not to be translated.'], key: 'workbench.startupEditor.none' }, "Start without an editor."),
+-				localize({ comment: ['This is the description for a setting. Values surrounded by single quotes are not to be translated.'], key: 'workbench.startupEditor.welcomePage' }, "Open the Welcome page, with content to aid in getting started with VS Code and extensions."),
++				localize({ comment: ['This is the description for a setting. Values surrounded by single quotes are not to be translated.'], key: 'workbench.startupEditor.welcomePage' }, "Open the Welcome page, with content to aid in getting started with LocalCoders and extensions."),
+ 				localize({ comment: ['This is the description for a setting. Values surrounded by single quotes are not to be translated.'], key: 'workbench.startupEditor.readme' }, "Open the README when opening a folder that contains one, fallback to 'welcomePage' otherwise. Note: This is only observed as a global configuration, it will be ignored if set in a workspace or folder configuration."),
+ 				localize({ comment: ['This is the description for a setting. Values surrounded by single quotes are not to be translated.'], key: 'workbench.startupEditor.newUntitledFile' }, "Open a new untitled text file (only applies when opening an empty window)."),
+ 				localize({ comment: ['This is the description for a setting. Values surrounded by single quotes are not to be translated.'], key: 'workbench.startupEditor.welcomePageInEmptyWorkbench' }, "Open the Welcome page when opening an empty workbench."),
+ 				localize({ comment: ['This is the description for a setting. Values surrounded by single quotes are not to be translated.'], key: 'workbench.startupEditor.terminal' }, "Open a new terminal in the editor area."),
+ 			],
+-			'default': 'welcomePage',
++			'default': 'none',
+ 			'description': localize('workbench.startupEditor', "Controls which editor is shown at startup, if none are restored from the previous session."),
+ 			'experiment': { mode: 'auto' },
+ 			agentsWindow: { default: 'none', readOnly: true },
+diff --git a/src/vs/workbench/contrib/welcomeGettingStarted/browser/gettingStarted.ts b/src/vs/workbench/contrib/welcomeGettingStarted/browser/gettingStarted.ts
+index db913f20..6956fb70 100644
+--- a/src/vs/workbench/contrib/welcomeGettingStarted/browser/gettingStarted.ts
++++ b/src/vs/workbench/contrib/welcomeGettingStarted/browser/gettingStarted.ts
+@@ -941,7 +941,7 @@ export class GettingStartedPage extends EditorPane {
+ 
+ 		const header = $('.header', {},
+ 			$('h1.product-name.caption', {}, this.productService.nameLong),
+-			$('p.subtitle.description', {}, localize({ key: 'gettingStarted.editingEvolved', comment: ['Shown as subtitle on the Welcome page.'] }, "Editing evolved"))
++			$('p.subtitle.description', {}, "Autonomous Multi-Agent AI Coding IDE")
+ 		);
+ 
+ 		const leftColumn = $('.categories-column.categories-column-left', {},);
+@@ -965,7 +965,8 @@ export class GettingStartedPage extends EditorPane {
+ 			this.defaultAccountService,
+ 		);
+ 		this.categoriesSlideDisposables.add(agentsBanner.disposables);
+-		footerChildren.push(agentsBanner.element);
++		// LocalCoders: Omit GitHub Copilot sign-in banner from welcome footer
++		// footerChildren.push(agentsBanner.element);
+ 		footerChildren.push($('p.showOnStartup', {},
+ 			showOnStartupCheckbox.domNode,
+ 			showOnStartupLabel,
+diff --git a/src/vs/workbench/contrib/welcomeGettingStarted/common/gettingStartedContent.ts b/src/vs/workbench/contrib/welcomeGettingStarted/common/gettingStartedContent.ts
+index 7a870e40..0fc6906f 100644
+--- a/src/vs/workbench/contrib/welcomeGettingStarted/common/gettingStartedContent.ts
++++ b/src/vs/workbench/contrib/welcomeGettingStarted/common/gettingStartedContent.ts
+@@ -214,47 +214,19 @@ export const startEntries: GettingStartedStartEntryContent = [
+ 
+ const Button = (title: string, href: string) => `[${title}](${href})`;
+ 
+-const CopilotStepTitle = localize('gettingStarted.copilotSetup.title', "Use AI features with Copilot for free");
+-const CopilotDescription = localize({ key: 'gettingStarted.copilotSetup.description', comment: ['{Locked="["}', '{Locked="]({0})"}'] }, "You can use [Copilot]({0}) to generate code across multiple files, fix errors, ask questions about your code, and much more using natural language.", defaultChat.documentationUrl ?? '');
+-const CopilotTermsString = localize({ key: 'gettingStarted.copilotSetup.terms', comment: ['{Locked="]({2})"}', '{Locked="]({3})"}'] }, "By continuing with {0} Copilot, you agree to {1}'s [Terms]({2}) and [Privacy Statement]({3})", defaultChat.provider.default.name, defaultChat.provider.default.name, defaultChat.termsStatementUrl, defaultChat.privacyStatementUrl);
+-const CopilotAnonymousButton = Button(localize('setupCopilotButton.setup', "Use AI Features"), `command:workbench.action.chat.triggerSetupAnonymousWithoutDialog`);
+-const CopilotSignedOutButton = Button(localize('setupCopilotButton.setup', "Use AI Features"), `command:workbench.action.chat.triggerSetup`);
+-const CopilotSignedInButton = Button(localize('setupCopilotButton.setup', "Use AI Features"), `command:workbench.action.chat.triggerSetup`);
+-const CopilotCompleteButton = Button(localize('setupCopilotButton.chatWithCopilot', "Start to Chat"), 'command:workbench.action.chat.open');
+-
+-function createCopilotSetupStep(id: string, button: string, when: string, includeTerms: boolean): BuiltinGettingStartedStep {
+-	const description = includeTerms ?
+-		`${CopilotDescription}\n${CopilotTermsString}\n${button}` :
+-		`${CopilotDescription}\n${button}`;
+-
+-	return {
+-		id,
+-		title: CopilotStepTitle,
+-		description,
+-		when: `${when} && !chatSetupHidden && !chatSetupDisabledInWorkspace`,
+-		media: {
+-			type: 'svg', altText: 'VS Code Copilot multi file edits', path: 'multi-file-edits.svg'
+-		},
+-	};
+-}
+-
+ export const walkthroughs: GettingStartedWalkthroughContent = [
+ 	{
+ 		id: 'Setup',
+-		title: localize('gettingStarted.setup.title', "Get started with VS Code"),
++		title: localize('gettingStarted.setup.title', "Get started with LocalCoders"),
+ 		description: localize('gettingStarted.setup.description', "Customize your editor, learn the basics, and start coding"),
+ 		isFeatured: true,
+ 		icon: setupIcon,
+ 		when: '!isWeb',
+-		walkthroughPageTitle: localize('gettingStarted.setup.walkthroughPageTitle', 'Setup VS Code'),
++		walkthroughPageTitle: localize('gettingStarted.setup.walkthroughPageTitle', 'Setup LocalCoders'),
+ 		next: 'Beginner',
+ 		content: {
+ 			type: 'steps',
+ 			steps: [
+-				createCopilotSetupStep('CopilotSetupAnonymous', CopilotAnonymousButton, 'chatAnonymous && !chatSetupCompleted', true),
+-				createCopilotSetupStep('CopilotSetupSignedOut', CopilotSignedOutButton, 'chatEntitlementSignedOut && !chatAnonymous && !github.copilot.hasByokModels', false),
+-				createCopilotSetupStep('CopilotSetupComplete', CopilotCompleteButton, 'chatSetupCompleted && !chatSetupDisabled && (chatAnonymous || chatPlanPro || chatPlanProPlus || chatPlanMax || chatPlanBusiness || chatPlanEnterprise || chatPlanFree)', false),
+-				createCopilotSetupStep('CopilotSetupSignedIn', CopilotSignedInButton, '!chatEntitlementSignedOut && (!chatSetupCompleted || chatSetupDisabled || chatPlanCanSignUp)', false),
+ 				{
+ 					id: 'pickColorTheme',
+ 					title: localize('gettingStarted.pickColor.title', "Choose your theme"),
+@@ -267,9 +239,9 @@ export const walkthroughs: GettingStartedWalkthroughContent = [
+ 				},
+ 				{
+ 					id: 'videoTutorial',
+-					title: localize('gettingStarted.videoTutorial.title', "Watch video tutorials"),
+-					description: localize('gettingStarted.videoTutorial.description.interpolated', "Watch the first in a series of short & practical video tutorials for VS Code's key features.\n{0}", Button(localize('watch', "Watch Tutorial"), 'https://aka.ms/vscode-getting-started-video')),
+-					media: { type: 'svg', altText: 'VS Code Settings', path: 'learn.svg' },
++					title: localize('gettingStarted.videoTutorial.title', "LocalCoders Architecture"),
++					description: localize('gettingStarted.videoTutorial.description.interpolated', "Configure multi-agent local inference models with Ollama, manage sessions, and build with full autonomy.\n{0}", Button(localize('watch', "Open LocalCoders Panel"), 'command:localcoders.openChatView')),
++					media: { type: 'svg', altText: 'LocalCoders Settings', path: 'learn.svg' },
+ 				}
+ 			]
+ 		}
+@@ -337,13 +309,13 @@ export const walkthroughs: GettingStartedWalkthroughContent = [
+ 				{
+ 					id: 'commandPaletteTaskWeb',
+ 					title: localize('gettingStarted.commandPalette.title', "Unlock productivity with the Command Palette "),
+-					description: localize('gettingStarted.commandPalette.description.interpolated', "Run commands without reaching for your mouse to accomplish any task in VS Code.\n{0}", Button(localize('commandPalette', "Open Command Palette"), 'command:workbench.action.showCommands')),
++					description: localize('gettingStarted.commandPalette.description.interpolated', "Run commands without reaching for your mouse to accomplish any task in LocalCoders.\n{0}", Button(localize('commandPalette', "Open Command Palette"), 'command:workbench.action.showCommands')),
+ 					media: { type: 'svg', altText: 'Command Palette overlay for searching and executing commands.', path: 'commandPalette.svg' },
+ 				},
+ 				{
+ 					id: 'pickAFolderTask-WebWeb',
+ 					title: localize('gettingStarted.setup.OpenFolder.title', "Open up your code"),
+-					description: localize('gettingStarted.setup.OpenFolderWeb.description.interpolated', "You're all set to start coding. You can open a local project or a remote repository to get your files into VS Code.\n{0}\n{1}", Button(localize('openFolder', "Open Folder"), 'command:workbench.action.addRootFolder'), Button(localize('openRepository', "Open Repository"), 'command:remoteHub.openRepository')),
++					description: localize('gettingStarted.setup.OpenFolderWeb.description.interpolated', "You're all set to start coding. You can open a local project or a remote repository to get your files into LocalCoders.\n{0}\n{1}", Button(localize('openFolder', "Open Folder"), 'command:workbench.action.addRootFolder'), Button(localize('openRepository', "Open Repository"), 'command:remoteHub.openRepository')),
+ 					when: 'workspaceFolderCount == 0',
+ 					media: {
+ 						type: 'svg', altText: 'Explorer view showing buttons for opening folder and cloning repository.', path: 'openFolder.svg'
+@@ -364,12 +336,12 @@ export const walkthroughs: GettingStartedWalkthroughContent = [
+ 	{
+ 		id: 'SetupAccessibility',
+ 		title: localize('gettingStarted.setupAccessibility.title', "Get Started with Accessibility Features"),
+-		description: localize('gettingStarted.setupAccessibility.description', "Learn the tools and shortcuts that make VS Code accessible. Note that some actions are not actionable from within the context of the walkthrough."),
++		description: localize('gettingStarted.setupAccessibility.description', "Learn the tools and shortcuts that make LocalCoders accessible. Note that some actions are not actionable from within the context of the walkthrough."),
+ 		isFeatured: true,
+ 		icon: setupIcon,
+ 		when: CONTEXT_ACCESSIBILITY_MODE_ENABLED.key,
+ 		next: 'Setup',
+-		walkthroughPageTitle: localize('gettingStarted.setupAccessibility.walkthroughPageTitle', 'Setup VS Code Accessibility'),
++		walkthroughPageTitle: localize('gettingStarted.setupAccessibility.walkthroughPageTitle', 'Setup LocalCoders Accessibility'),
+ 		content: {
+ 			type: 'steps',
+ 			steps: [
+@@ -480,20 +452,20 @@ export const walkthroughs: GettingStartedWalkthroughContent = [
+ 				{
+ 					id: 'settingsAndSync',
+ 					title: localize('gettingStarted.settings.title', "Tune your settings"),
+-					description: localize('gettingStarted.settingsAndSync.description.interpolated', "Customize every aspect of VS Code and [sync](command:workbench.userDataSync.actions.turnOn) customizations across devices.\n{0}", Button(localize('tweakSettings', "Open Settings"), 'command:toSide:workbench.action.openSettings')),
++					description: localize('gettingStarted.settingsAndSync.description.interpolated', "Customize every aspect of LocalCoders and [sync](command:workbench.userDataSync.actions.turnOn) customizations across devices.\n{0}", Button(localize('tweakSettings', "Open Settings"), 'command:toSide:workbench.action.openSettings')),
+ 					when: 'workspacePlatform != \'webworker\' && syncStatus != uninitialized',
+ 					completionEvents: ['onEvent:sync-enabled'],
+ 					media: {
+-						type: 'svg', altText: 'VS Code Settings', path: 'settings.svg'
++						type: 'svg', altText: 'LocalCoders Settings', path: 'settings.svg'
+ 					},
+ 				},
+ 				{
+ 					id: 'extensions',
+ 					title: localize('gettingStarted.extensions.title', "Code with extensions"),
+-					description: localize('gettingStarted.extensions.description.interpolated', "Extensions are VS Code's power-ups. They range from handy productivity hacks, expanding out-of-the-box features, to adding completely new capabilities.\n{0}", Button(localize('browsePopular', "Browse Popular Extensions"), 'command:workbench.extensions.action.showPopularExtensions')),
++					description: localize('gettingStarted.extensions.description.interpolated', "Extensions are LocalCoders' power-ups. They range from handy productivity hacks, expanding out-of-the-box features, to adding completely new capabilities.\n{0}", Button(localize('browsePopular', "Browse Popular Extensions"), 'command:workbench.extensions.action.showPopularExtensions')),
+ 					when: 'workspacePlatform != \'webworker\'',
+ 					media: {
+-						type: 'svg', altText: 'VS Code extension marketplace with featured language extensions', path: 'extensions.svg'
++						type: 'svg', altText: 'LocalCoders extension marketplace with featured language extensions', path: 'extensions.svg'
+ 					},
+ 				},
+ 				{
+diff --git a/src/vs/workbench/contrib/welcomeOnboarding/browser/onboardingVariationA.ts b/src/vs/workbench/contrib/welcomeOnboarding/browser/onboardingVariationA.ts
+index 125bc26b..56ce0dba 100644
+--- a/src/vs/workbench/contrib/welcomeOnboarding/browser/onboardingVariationA.ts
++++ b/src/vs/workbench/contrib/welcomeOnboarding/browser/onboardingVariationA.ts
+@@ -10,7 +10,6 @@ import { isCancellationError } from '../../../../base/common/errors.js';
+ import { StopWatch } from '../../../../base/common/stopwatch.js';
+ import { URI } from '../../../../base/common/uri.js';
+ import { isWindows, isMacintosh, isLinux } from '../../../../base/common/platform.js';
+-import { assertDefined } from '../../../../base/common/types.js';
+ import { FileAccess } from '../../../../base/common/network.js';
+ import { ILayoutService } from '../../../../platform/layout/browser/layoutService.js';
+ import { KeyCode } from '../../../../base/common/keyCodes.js';
+@@ -78,8 +77,41 @@ type OnboardingActionEvent = {
+ 
+ type EnterpriseSignInUiState = 'options' | 'instance' | 'progress';
+ 
+-assertDefined(product.defaultChatAgent, 'Onboarding requires a default chat agent product configuration.');
+-const defaultChat = product.defaultChatAgent;
++const defaultChat = product.defaultChatAgent ?? {
++	extensionId: '',
++	chatExtensionId: '',
++	provider: { default: { name: 'LocalCoders' }, enterprise: { name: 'LocalCoders' } },
++	providerScopes: [],
++	termsStatementUrl: '',
++	privacyStatementUrl: '',
++	documentationUrl: '',
++	publicCodeMatchesUrl: '',
++	signUpUrl: '',
++	managePlanUrl: '',
++	upgradePlanUrl: '',
++	tokenEntitlementUrl: '',
++	entitlementUrl: '',
++	entitlementSignupLimitedUrl: '',
++	chatQuotaExceededContext: '',
++	completionsQuotaExceededContext: '',
++	walkthroughCommand: '',
++	completionsMenuCommand: '',
++	chatRefreshTokenCommand: '',
++	generateCommitMessageCommand: '',
++	resolveMergeConflictsCommand: '',
++	completionsAdvancedSetting: '',
++	completionsEnablementSetting: '',
++	nextEditSuggestionsSetting: '',
++	mcpRegistryDataUrl: '',
++	mcpConnectorsUrl: '',
++	managedSettingsUrl: '',
++	chatExtensionOutputId: '',
++	chatExtensionOutputExtensionStateCommand: '',
++	skusDocumentationUrl: '',
++	optimizeUsageDocumentationUrl: '',
++	providerExtensionId: '',
++	providerUriSetting: '',
++} as any;
+ 
+ /**
+  * Variation A — Classic Wizard Modal
+diff --git a/src/vs/workbench/services/accounts/browser/defaultAccount.ts b/src/vs/workbench/services/accounts/browser/defaultAccount.ts
+index 00164eda..b2e14a8b 100644
+--- a/src/vs/workbench/services/accounts/browser/defaultAccount.ts
++++ b/src/vs/workbench/services/accounts/browser/defaultAccount.ts
+@@ -92,7 +92,22 @@ interface IMcpRegistryResponse {
+ 	readonly mcp_registries: ReadonlyArray<IMcpRegistryProvider>;
+ }
+ 
+-function toDefaultAccountConfig(defaultChatAgent: IDefaultChatAgent): IDefaultAccountConfig {
++function toDefaultAccountConfig(defaultChatAgent?: IDefaultChatAgent): IDefaultAccountConfig {
++	if (!defaultChatAgent) {
++		return {
++			preferredExtensions: [],
++			authenticationProvider: {
++				default: { id: '', name: '' },
++				enterprise: { id: '', name: '' },
++				enterpriseProviderConfig: '',
++				scopes: [],
++			},
++			entitlementUrl: '',
++			tokenEntitlementUrl: '',
++			mcpRegistryDataUrl: '',
++			managedSettingsUrl: '',
++		};
++	}
+ 	return {
+ 		preferredExtensions: [
+ 			defaultChatAgent.chatExtensionId,
+@@ -156,6 +171,9 @@ export class DefaultAccountService extends Disposable implements IDefaultAccount
+ 	) {
+ 		super();
+ 		this.defaultAccountConfig = toDefaultAccountConfig(productService.defaultChatAgent);
++		if (!productService.defaultChatAgent) {
++			this.initBarrier.open();
++		}
+ 	}
+ 
+ 	async getDefaultAccount(): Promise<IDefaultAccount | null> {
+@@ -1665,8 +1683,10 @@ class DefaultAccountProviderContribution extends Disposable implements IWorkbenc
+ 		@IDefaultAccountService defaultAccountService: IDefaultAccountService,
+ 	) {
+ 		super();
+-		const defaultAccountProvider = this._register(instantiationService.createInstance(DefaultAccountProvider, toDefaultAccountConfig(productService.defaultChatAgent)));
+-		defaultAccountService.setDefaultAccountProvider(defaultAccountProvider);
++		if (productService.defaultChatAgent) {
++			const defaultAccountProvider = this._register(instantiationService.createInstance(DefaultAccountProvider, toDefaultAccountConfig(productService.defaultChatAgent)));
++			defaultAccountService.setDefaultAccountProvider(defaultAccountProvider);
++		}
+ 	}
+ }
+ 

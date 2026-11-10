@@ -1,21 +1,53 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import { getLucideCss, getLucideClientScript, lucideSvg, getLocalCodersLogoSvg } from './lucide-icons';
 import * as path from 'path';
 import { AgentOrchestrator } from '../agents/orchestrator';
+import { AgentRegistry } from '../agents/agent-registry';
+import { McpHost } from '../mcp/mcp-host';
 import { AgentMessage, TaskPlanItem, ToolApprovalRequest } from '../agents/types';
 import { SessionManager, SessionData, ExecutionGroup, AgentSessionConfig, ExecutionMode, PermissionMode } from '../sessions/session-manager';
 import { OllamaClient } from '../ollama/client';
+import { collectLiveSystemTelemetry, LiveSystemTelemetry } from '../ollama/hardware';
 import { ChangesManager, ChangesSummary } from '../context/changes-manager';
 import { ModelProviderRegistry, ModelMetadata, ReasoningEffort } from '../models/model-provider-registry';
+import { getModelSelectorStyles, getModelSelectorMarkup, getModelSelectorScript } from './model-selector-ui';
+import { getActivityStreamStyles, getActivityClientScript, inspectorTabIcon } from './activity-stream-ui';
+import { getSessionsBarStyles, getSessionsBarClientScript } from './sessions-bar-ui';
+import { CockpitModalType, getCockpitModalStyles, getCockpitModalMarkup, getCockpitModalScript } from './agent-cockpit-modals';
 import { ToolManager } from '../tools/tool-manager';
 import { PermissionManager, SecurityMode } from '../security/permission-manager';
+import { TerminalSessionManager } from '../tools/terminal-session-manager';
+import { upsertActivityItem, finalizeRunningActivities, getSafePhaseLabel } from '../agents/events';
+import {
+  SlashCommandRegistry,
+  ensureBuiltinSlashCommandsRegistered,
+  runSlashCommandForWorkspace,
+  isSlashCommandInput,
+  getSlashCommandStyles,
+  getSlashCommandPopupMarkup,
+  getSlashCommandClientScript,
+  CommandResult,
+} from '../commands';
 
 export class AgentWorkspaceEditorPanel {
   public static currentPanel: AgentWorkspaceEditorPanel | undefined;
   public static readonly viewType = 'localcoders.agentWorkspace';
+  private static _registry?: AgentRegistry;
+  private static _mcpHost?: McpHost;
+  public static onDidDisposeUnexpected?: () => void;
+  private static _closingInternally = false;
+
+  public static configureServices(registry?: AgentRegistry, mcpHost?: McpHost): void {
+    AgentWorkspaceEditorPanel._registry = registry;
+    AgentWorkspaceEditorPanel._mcpHost = mcpHost;
+  }
 
   private readonly _panel: vscode.WebviewPanel;
   private readonly _extensionUri: vscode.Uri;
   private _disposables: vscode.Disposable[] = [];
+  private _telemetryTimer?: NodeJS.Timeout;
+  private _telemetryInFlight = false;
 
   public static createOrShow(
     extensionUri: vscode.Uri,
@@ -62,8 +94,24 @@ export class AgentWorkspaceEditorPanel {
 
   public static closeCurrent(): void {
     if (AgentWorkspaceEditorPanel.currentPanel) {
-      AgentWorkspaceEditorPanel.currentPanel._panel.dispose();
-      AgentWorkspaceEditorPanel.currentPanel = undefined;
+      AgentWorkspaceEditorPanel._closingInternally = true;
+      try {
+        AgentWorkspaceEditorPanel.currentPanel._panel.dispose();
+        AgentWorkspaceEditorPanel.currentPanel = undefined;
+      } finally {
+        AgentWorkspaceEditorPanel._closingInternally = false;
+      }
+    }
+  }
+
+  private _isDisposed = false;
+
+  private postMessageSafe(data: any): void {
+    if (this._isDisposed) return;
+    try {
+      this._panel.webview.postMessage(data);
+    } catch {
+      // Safely ignore if webview was disposed
     }
   }
 
@@ -100,72 +148,144 @@ export class AgentWorkspaceEditorPanel {
       this._disposables
     );
 
-    // Event connections
-    this.orchestrator.onMessage((msg) => {
-      this._panel.webview.postMessage({ type: 'addMessage', message: msg });
-      this.sessionManager.updateActiveSession((s) => {
-        s.messages.push(msg);
-      });
-      this.updateTitle();
-    });
+    const terminalManager = TerminalSessionManager.getInstance();
+    const rootDir = this.getActiveWorkspaceRoot();
+    if (rootDir) {
+      terminalManager.setDefaultCwd(rootDir);
+    }
+    terminalManager.ensureDefaultTab(rootDir);
+    this._disposables.push(
+      terminalManager.onDidChange((tabs) => {
+        this.postMessageSafe({ type: 'terminalTabs', tabs });
+      })
+    );
 
-    this.orchestrator.onActivity((ev) => {
-      this.sessionManager.updateActiveSession((s) => {
-        if (!s.executionGroups) s.executionGroups = [];
-        let currentGroup = s.executionGroups[s.executionGroups.length - 1];
-        if (!currentGroup || currentGroup.status === 'completed') {
-          currentGroup = {
-            id: `eg_${Date.now()}`,
-            agentId: ev.agentId || 'main',
-            agentName: ev.agentName || 'Main Agent',
-            title: `Worked on task`,
-            durationMs: 0,
-            status: 'working',
-            details: [],
-            startedAt: Date.now()
-          };
-          s.executionGroups.push(currentGroup);
+    this._telemetryTimer = setInterval(() => {
+      if (this._panel.visible && !this._isDisposed) {
+        this.pushSystemTelemetry().catch(() => {});
+      }
+    }, 4000);
+
+    // Track message IDs completed in live run to prevent duplicate rendering
+    let currentRunId = '';
+
+    // Event connections tracked in disposables
+    this._disposables.push(
+      this.orchestrator.onMessage((msg) => {
+        if (msg.senderRole === 'user') {
+          // User messages are already optimistically added upon submit
+          return;
         }
-        currentGroup.details.push(ev.latestActivity || ev.currentTool || 'activity');
-        currentGroup.durationMs = Math.max(1000, Date.now() - currentGroup.startedAt);
-      });
-      this._panel.webview.postMessage({ type: 'activity', event: ev });
-    });
+        this.sessionManager.updateActiveSession((s) => {
+          if (!s.messages.some((m) => m.id === msg.id)) {
+            s.messages.push(msg);
+          }
+        });
+        this.postMessageSafe({ type: 'addMessage', message: msg });
+        this.updateTitle();
+      })
+    );
 
-    this.orchestrator.onPlanUpdate((plan) => {
-      this._panel.webview.postMessage({ type: 'planUpdate', plan });
-      this.sessionManager.updateActiveSession((s) => {
-        s.plan = plan;
-      });
-    });
+    this._disposables.push(
+      this.orchestrator.onStreamEvent((ev) => {
+        if (ev.runId) currentRunId = ev.runId;
+        switch (ev.kind) {
+          case 'status':
+            this.sessionManager.updateActiveSession((s) => {
+              s.activePhase = ev.phase;
+              s.activePhaseSummary = ev.summary;
+              if (ev.phase === 'completed' || ev.phase === 'failed' || ev.phase === 'cancelled') {
+                s.activities = finalizeRunningActivities(s.activities || [], ev.runId, ev.phase);
+                if (s.status === 'running') {
+                  s.status = ev.phase;
+                }
+              }
+            });
+            this.postMessageSafe({ type: 'streamStatus', event: ev });
+            break;
 
-    this.orchestrator.onApproval((req) => {
-      this._panel.webview.postMessage({ type: 'approvalRequest', request: req });
-    });
+          case 'message_delta':
+            this.postMessageSafe({ type: 'messageDelta', event: ev });
+            break;
+
+          case 'activity_upsert':
+            this.sessionManager.updateActiveSession((s) => {
+              s.activities = upsertActivityItem(s.activities || [], ev.item);
+            });
+            this.postMessageSafe({ type: 'activityUpsert', item: ev.item });
+            if (ev.item.category === 'file' && ev.item.status === 'completed') {
+              this.changesManager.refresh().catch(() => {});
+            }
+            break;
+
+          case 'plan':
+            this.sessionManager.updateActiveSession((s) => {
+              s.plan = ev.plan;
+              s.planExplicit = ev.explicit;
+            });
+            this.postMessageSafe({ type: 'planUpdate', plan: ev.plan, explicit: ev.explicit });
+            break;
+        }
+      })
+    );
+
+    this._disposables.push(
+      this.orchestrator.onApproval((req) => {
+        this.postMessageSafe({ type: 'approvalRequest', request: req });
+      })
+    );
 
     // Session manager events
-    this.sessionManager.onDidChangeSessions(() => {
-      this.syncActiveSession();
-      this.updateTitle();
-    });
+    this._disposables.push(
+      this.sessionManager.onDidChangeSessions(() => {
+        this.syncActiveSession();
+        this.updateTitle();
+      })
+    );
 
     // Changes manager events
-    this.changesManager.onDidChangeChanges((summary) => {
-      this._panel.webview.postMessage({ type: 'changesSummary', summary });
-    });
+    this._disposables.push(
+      this.changesManager.onDidChangeChanges((summary) => {
+        this.postMessageSafe({ type: 'changesSummary', summary });
+      })
+    );
+
+    // Model registry events
+    this._disposables.push(
+      this.modelRegistry.onDidChangeModels(() => {
+        this.syncActiveSession();
+      })
+    );
 
     this._panel.webview.onDidReceiveMessage(
       async (data) => {
         switch (data.command) {
+          case 'runSlashCommand':
+          case 'confirmSlashCommand': {
+            const rawCmd = String(data.text || '').trim();
+            if (!rawCmd) return;
+            const confirmed = data.command === 'confirmSlashCommand' || !!data.confirmed;
+            await this.executeSlashCommand(rawCmd, confirmed);
+            return;
+          }
+
           case 'sendMessage': {
             const text = data.text?.trim();
             if (!text) return;
+            if (isSlashCommandInput(text)) {
+              await this.executeSlashCommand(text, false);
+              return;
+            }
 
             let active = this.sessionManager.getActiveSession();
             if (!active) {
-              const models = await this.ollama.listModels();
-              const model = models[0]?.name || 'qwen3.8:27b';
-              active = this.sessionManager.createSession(text, model);
+              const firstAvailable = await this.modelRegistry.getDefaultOrFirstAvailableModel();
+              const model = firstAvailable?.id || '';
+              active = this.sessionManager.createSession(text, model, {
+                providerId: firstAvailable?.providerId || 'ollama',
+                modelId: model,
+                modelName: firstAvailable?.displayName || '',
+              });
             } else if (active.title === 'New Session' || active.title === 'New Section') {
               const newTitle = text.length > 36 ? text.substring(0, 36).trim() + '...' : text;
               this.sessionManager.renameSession(active.id, newTitle);
@@ -183,35 +303,38 @@ export class AgentWorkspaceEditorPanel {
             this.sessionManager.updateActiveSession((s) => {
               s.messages.push(userMsg);
               s.status = 'running';
+              s.activePhase = 'analyzing';
+              s.activePhaseSummary = getSafePhaseLabel('analyzing');
             });
-            this._panel.webview.postMessage({ type: 'addMessage', message: userMsg });
+            this.postMessageSafe({ type: 'addMessage', message: userMsg });
             this.updateTitle();
 
             try {
               const currentSession = this.sessionManager.getActiveSession();
+              this.applyWorkingFolder(this.getActiveWorkspaceRoot());
               const history = currentSession?.messages ? currentSession.messages.map((m) => ({ role: m.senderRole, content: m.content })) : [];
-              await this.orchestrator.submitTask(text, currentSession?.config, history);
+              const completedTask = await this.orchestrator.submitTask(text, currentSession?.config, history);
+              const terminalStatus =
+                completedTask.status === 'cancelled'
+                  ? 'cancelled'
+                  : completedTask.status === 'failed'
+                  ? 'failed'
+                  : 'completed';
               this.sessionManager.updateActiveSession((s) => {
-                s.status = 'completed';
-                if (s.executionGroups && s.executionGroups.length > 0) {
-                  const last = s.executionGroups[s.executionGroups.length - 1];
-                  if (last.status === 'working') {
-                    last.status = 'completed';
-                    last.completedAt = Date.now();
-                    last.durationMs = Math.max(1000, last.completedAt - last.startedAt);
-                  }
+                s.status = terminalStatus;
+                s.activePhase = terminalStatus;
+                s.activePhaseSummary = getSafePhaseLabel(terminalStatus);
+                if (currentRunId && s.activities) {
+                  s.activities = finalizeRunningActivities(s.activities, currentRunId, terminalStatus);
                 }
               });
             } catch (err: any) {
               this.sessionManager.updateActiveSession((s) => {
                 s.status = 'failed';
-                if (s.executionGroups && s.executionGroups.length > 0) {
-                  const last = s.executionGroups[s.executionGroups.length - 1];
-                  if (last.status === 'working') {
-                    last.status = 'failed';
-                    last.completedAt = Date.now();
-                    last.durationMs = Math.max(1000, last.completedAt - last.startedAt);
-                  }
+                s.activePhase = 'failed';
+                s.activePhaseSummary = getSafePhaseLabel('failed');
+                if (currentRunId && s.activities) {
+                  s.activities = finalizeRunningActivities(s.activities, currentRunId, 'failed');
                 }
               });
               vscode.window.showErrorMessage(`Agent task failed: ${err.message}`);
@@ -221,9 +344,16 @@ export class AgentWorkspaceEditorPanel {
           }
 
           case 'stopTask':
+            this._slashAbortController?.abort();
+            this._slashAbortController = undefined;
             this.orchestrator.cancelTask();
             this.sessionManager.updateActiveSession((s) => {
-              s.status = 'idle';
+              s.status = 'cancelled';
+              s.activePhase = 'cancelled';
+              s.activePhaseSummary = getSafePhaseLabel('cancelled');
+              if (currentRunId && s.activities) {
+                s.activities = finalizeRunningActivities(s.activities, currentRunId, 'cancelled');
+              }
             });
             this.syncActiveSession();
             break;
@@ -237,34 +367,56 @@ export class AgentWorkspaceEditorPanel {
             this.orchestrator.resolveApproval(data.requestId, false);
             break;
 
-          case 'switchSession':
+          case 'switchSession': {
             this.sessionManager.switchSession(data.sessionId);
-            this.syncActiveSession();
-            break;
-
-          case 'newSession':
-          case 'newSection': {
-            const models = await this.ollama.listModels();
-            const model = models[0]?.name || 'qwen3.8:27b';
-            this.sessionManager.createSession('New Session', model);
+            const switched = this.sessionManager.getActiveSession();
+            if (switched?.workspaceRoot && fs.existsSync(switched.workspaceRoot)) {
+              this.applyWorkingFolder(switched.workspaceRoot);
+            }
             this.syncActiveSession();
             break;
           }
 
+          case 'newSession':
+          case 'newSection': {
+            const firstAvailable = await this.modelRegistry.getDefaultOrFirstAvailableModel();
+            const model = firstAvailable?.id || '';
+            this.sessionManager.createSession('New Session', model, {
+              providerId: firstAvailable?.providerId || 'ollama',
+              modelId: model,
+              modelName: firstAvailable?.displayName || '',
+            });
+            await this.syncActiveSession();
+            break;
+          }
+
           case 'renameSession': {
+            if (!data.sessionId) break;
+            const providedTitle = typeof data.title === 'string' ? data.title.trim() : '';
+            if (providedTitle) {
+              this.sessionManager.renameSession(data.sessionId, providedTitle);
+              this.syncActiveSession();
+              break;
+            }
             const s = this.sessionManager.getSession(data.sessionId);
             const newTitle = await vscode.window.showInputBox({
               prompt: 'Rename session',
               value: s?.title || '',
             });
-            if (newTitle) {
-              this.sessionManager.renameSession(data.sessionId, newTitle);
+            if (newTitle && newTitle.trim()) {
+              this.sessionManager.renameSession(data.sessionId, newTitle.trim());
               this.syncActiveSession();
             }
             break;
           }
 
           case 'deleteSession': {
+            if (!data.sessionId) break;
+            if (data.confirmed === true) {
+              this.sessionManager.deleteSession(data.sessionId);
+              await this.syncActiveSession();
+              break;
+            }
             const confirm = await vscode.window.showWarningMessage(
               'Delete this coding session?',
               { modal: true },
@@ -272,8 +424,19 @@ export class AgentWorkspaceEditorPanel {
             );
             if (confirm === 'Delete') {
               this.sessionManager.deleteSession(data.sessionId);
-              this.syncActiveSession();
+              await this.syncActiveSession();
             }
+            break;
+          }
+
+          case 'refreshModels': {
+            await this.modelRegistry.refreshAll(true);
+            await this.syncActiveSession();
+            break;
+          }
+
+          case 'openModelManager': {
+            await this.openCockpitModal('models');
             break;
           }
 
@@ -282,28 +445,50 @@ export class AgentWorkspaceEditorPanel {
             if (!modelId) {
               const models = await this.modelRegistry.getAvailableModels();
               const picked = await vscode.window.showQuickPick(
-                models.map(m => ({ label: m.name, description: m.providerName + ' • ' + (m.contextWindowLabel || ''), id: m.id, provider: m.provider })),
-                { placeHolder: 'Select model for coding agent' }
+                models.map(m => ({
+                  label: m.displayName,
+                  description: `${m.providerName} | ${m.contextWindow ? Math.round(m.contextWindow / 1024) + 'k ctx' : 'Context: Unknown'} | ${m.availability}`,
+                  id: m.id,
+                  provider: m.providerId,
+                })),
+                { placeHolder: models.length > 0 ? 'Select discovered model' : 'No models discovered — configure Ollama or Cloud providers' }
               );
               if (picked) {
+                const pickedMeta = await this.modelRegistry.getModelById(picked.id);
                 this.sessionManager.updateActiveConfig((cfg) => {
                   cfg.modelId = picked.id;
                   cfg.modelName = picked.label;
                   cfg.providerId = picked.provider;
+                  if (pickedMeta?.reasoningEffortsSupported?.length && !pickedMeta.reasoningEffortsSupported.includes(cfg.reasoningEffort)) {
+                    cfg.reasoningEffort = pickedMeta.defaultReasoningEffort || pickedMeta.reasoningEffortsSupported[0];
+                  }
                 });
                 await this.modelRegistry.recordModelUsage(picked.id);
-                this.syncActiveSession();
+                await this.syncActiveSession();
               }
               return;
             }
             const model = await this.modelRegistry.getModelById(modelId);
             this.sessionManager.updateActiveConfig((cfg) => {
-              cfg.modelId = modelId;
-              cfg.modelName = model?.name || data.modelName || modelId;
-              if (model?.provider || data.provider) cfg.providerId = model?.provider || data.provider;
+              cfg.modelId = model?.id || modelId;
+              cfg.modelName = model?.displayName || data.modelName || modelId;
+              if (model?.providerId || data.provider) cfg.providerId = model?.providerId || data.provider;
+              if (model?.reasoningEffortsSupported?.length && !model.reasoningEffortsSupported.includes(cfg.reasoningEffort)) {
+                cfg.reasoningEffort = model.defaultReasoningEffort || model.reasoningEffortsSupported[0];
+              }
             });
-            await this.modelRegistry.recordModelUsage(modelId);
-            this.syncActiveSession();
+            await this.modelRegistry.recordModelUsage(model?.id || modelId);
+            await this.syncActiveSession();
+            break;
+          }
+
+          case 'setModelRuntimeParams': {
+            this.sessionManager.updateActiveConfig((cfg) => {
+              cfg.temperature = typeof data.temperature === 'number' ? data.temperature : undefined;
+              cfg.maxOutputTokens = typeof data.maxOutputTokens === 'number' ? data.maxOutputTokens : undefined;
+              cfg.contextLimit = typeof data.contextLimit === 'number' ? data.contextLimit : undefined;
+            });
+            await this.syncActiveSession();
             break;
           }
 
@@ -343,6 +528,9 @@ export class AgentWorkspaceEditorPanel {
               if (this.permissionManager) {
                 this.permissionManager.setMode(data.permissionMode);
               }
+              try {
+                await vscode.workspace.getConfiguration('localcoders').update('defaultPermissionMode', data.permissionMode, vscode.ConfigurationTarget.Global);
+              } catch {}
               this.syncActiveSession();
             }
             break;
@@ -359,7 +547,7 @@ export class AgentWorkspaceEditorPanel {
           case 'searchModels': {
             const query = data.query || '';
             const modelsGrouped = await this.modelRegistry.getGroupedModels(query);
-            this._panel.webview.postMessage({
+            this.postMessageSafe({
               type: 'modelsGroupedResponse',
               modelsGrouped,
               query,
@@ -448,24 +636,18 @@ export class AgentWorkspaceEditorPanel {
           }
 
           case 'openRules': {
-            const rulesPath = path.join(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '', '.localcoders', 'rules.md');
-            try {
-              const doc = await vscode.workspace.openTextDocument(rulesPath);
-              await vscode.window.showTextDocument(doc);
-            } catch {
-              vscode.commands.executeCommand('localcoders.projectMemoryView.focus');
-            }
+            await this.openCockpitModal('rules');
             break;
           }
 
           case 'openSkills': {
-            vscode.commands.executeCommand('localcoders.agentTeamView.focus');
+            await this.openCockpitModal('agents');
             break;
           }
 
           case 'getFileDiff': {
             const diff = await this.changesManager.getFileDiff(data.path);
-            this._panel.webview.postMessage({
+            this.postMessageSafe({
               type: 'fileDiffResponse',
               path: data.path,
               diff,
@@ -474,7 +656,7 @@ export class AgentWorkspaceEditorPanel {
           }
 
           case 'openDiff':
-            await this.changesManager.openDiff(data.path);
+            // Disabled in Agent Mode so external VS Code diff tabs never open.
             break;
 
           case 'acceptAll':
@@ -502,23 +684,210 @@ export class AgentWorkspaceEditorPanel {
             break;
 
           case 'openSecurity':
-            vscode.commands.executeCommand('localcoders.securityPermissionsView.focus');
+            await this.openCockpitModal('settings');
             break;
 
           case 'openReview':
-            vscode.commands.executeCommand('localcoders.criticReviewsView.focus');
+            this.postMessageSafe({ type: 'switchInspectorTab', tab: 'changes' });
             break;
 
           case 'openWiki':
-            vscode.commands.executeCommand('localcoders.projectMemoryView.focus');
+            await this.openCockpitModal('rules');
             break;
 
           case 'openAgents':
-            vscode.commands.executeCommand('localcoders.agentTeamView.focus');
+            await this.openCockpitModal('agents');
             break;
 
           case 'openMcp':
-            vscode.commands.executeCommand('localcoders.mcpServersView.focus');
+            await this.openCockpitModal('mcp');
+            break;
+
+          case 'loadCockpitModal':
+            await this.openCockpitModal((data.modalType || 'settings') as CockpitModalType, data.statusText);
+            break;
+
+          case 'cockpitRefreshModels':
+            await this.modelRegistry.refreshAll(true);
+            await this.syncActiveSession();
+            await this.openCockpitModal('models', 'Model discovery refreshed.');
+            break;
+
+          case 'cockpitSetOllamaEndpoint': {
+            const res = await this.modelRegistry.setOllamaEndpoint(data.url || '');
+            await this.syncActiveSession();
+            await this.openCockpitModal('models', res.ok ? 'Connected to Ollama endpoint.' : (res.error || 'Failed to connect to Ollama endpoint.'));
+            break;
+          }
+
+          case 'cockpitPullOllamaModel': {
+            const tag = String(data.modelName || '').trim();
+            if (tag) {
+              try {
+                await this.ollama.pullModel(tag, () => {});
+                await this.modelRegistry.refreshAll(true);
+                await this.syncActiveSession();
+                await this.openCockpitModal('models', `Pulled ${tag} successfully.`);
+              } catch (err: any) {
+                await this.openCockpitModal('models', `Pull failed: ${err?.message || String(err)}`);
+              }
+            }
+            break;
+          }
+
+          case 'cockpitSaveProviderKey': {
+            if (data.providerId && data.apiKey) {
+              const res = await this.modelRegistry.setProviderApiKey(data.providerId, data.apiKey);
+              await this.syncActiveSession();
+              await this.openCockpitModal('models', res.ok ? `${data.providerId} connected.` : (res.error || 'Provider validation failed.'));
+            }
+            break;
+          }
+
+          case 'cockpitToggleCritic': {
+            const reg = AgentWorkspaceEditorPanel._registry;
+            if (reg) {
+              const curr = reg.getCriticConfig();
+              reg.setCriticConfig({ enabled: !curr.enabled });
+            }
+            await this.openCockpitModal((data.returnModal || 'agents') as CockpitModalType);
+            break;
+          }
+
+          case 'cockpitUpdateCritic': {
+            const reg = AgentWorkspaceEditorPanel._registry;
+            if (reg) {
+              const updates: any = {};
+              if (typeof data.model === 'string') {
+                updates.model = data.model.trim();
+              }
+              if (typeof data.strictness === 'string' && ['lenient', 'moderate', 'strict', 'paranoid'].includes(data.strictness)) {
+                updates.strictness = data.strictness;
+              }
+              reg.setCriticConfig(updates);
+            }
+            await this.openCockpitModal('agents', 'Critic Agent configuration updated.');
+            break;
+          }
+
+          case 'cockpitAddSubagent': {
+            const reg = AgentWorkspaceEditorPanel._registry;
+            const name = String(data.name || '').trim();
+            if (reg && name) {
+              const roleName = String(data.role || 'Backend Developer');
+              const roles = AgentRegistry.getPredefinedRoles();
+              const matched = roles.find((r) => r.role === roleName);
+              const session = this.sessionManager.getActiveSession();
+              const model = String(data.model || '').trim() || session?.config?.modelId || reg.getMainAgent()?.model || '';
+              reg.addSubagent({
+                id: `sub_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+                name,
+                role: roleName as any,
+                model,
+                systemPrompt: matched?.defaultPrompt || `You are ${name}, specializing in ${roleName}.`,
+                enabled: true,
+                maxConcurrency: 1,
+                temperature: 0.2,
+                contextWindow: 32768,
+              });
+            }
+            await this.openCockpitModal('agents');
+            break;
+          }
+
+          case 'cockpitAddMcpServer': {
+            const mcp = AgentWorkspaceEditorPanel._mcpHost;
+            const name = String(data.name || '').trim();
+            const target = String(data.target || '').trim();
+            if (mcp && name && target) {
+              const id = name.toLowerCase().replace(/[^a-z0-9_-]/g, '-');
+              if (data.transport === 'sse') {
+                await mcp.addServer({ id, name, transport: 'sse', url: target, enabled: true });
+              } else {
+                const parts = target.split(/\s+/);
+                await mcp.addServer({ id, name, transport: 'stdio', command: parts[0], args: parts.slice(1), enabled: true });
+              }
+            }
+            await this.openCockpitModal('mcp');
+            break;
+          }
+
+          case 'cockpitRemoveMcpServer': {
+            const mcp = AgentWorkspaceEditorPanel._mcpHost;
+            if (mcp && data.id) {
+              await mcp.removeServer(data.id);
+            }
+            await this.openCockpitModal('mcp');
+            break;
+          }
+
+          case 'cockpitSaveRules': {
+            const wsRoot = this.getActiveWorkspaceRoot();
+            if (wsRoot) {
+              const dirPath = path.join(wsRoot, '.localcoders');
+              const rulesPath = path.join(dirPath, 'rules.md');
+              fs.mkdirSync(dirPath, { recursive: true });
+              fs.writeFileSync(rulesPath, String(data.content || ''), 'utf8');
+            }
+            await this.openCockpitModal('rules', 'Saved .localcoders/rules.md');
+            break;
+          }
+
+          case 'cockpitUpdateSetting': {
+            if (data.key) {
+              await vscode.workspace.getConfiguration('localcoders').update(data.key, data.value, vscode.ConfigurationTarget.Global);
+            }
+            await this.openCockpitModal('settings');
+            break;
+          }
+
+          case 'selectWorkspace': {
+            const currentRoot = this.getActiveWorkspaceRoot();
+            const picked = await vscode.window.showOpenDialog({
+              canSelectFiles: false,
+              canSelectFolders: true,
+              canSelectMany: false,
+              defaultUri: currentRoot ? vscode.Uri.file(currentRoot) : undefined,
+              openLabel: 'Use Folder for Agent',
+              title: 'Select Workspace Folder for Agent',
+            });
+            const selectedRoot = picked?.[0]?.fsPath;
+            if (selectedRoot) {
+              this.sessionManager.setTargetWorkspaceRoot(selectedRoot);
+              this.applyWorkingFolder(selectedRoot);
+              await this.syncActiveSession();
+            }
+            break;
+          }
+
+          case 'createTerminalTab': {
+            const cwd = this.getActiveWorkspaceRoot();
+            terminalManager.createTab(cwd);
+            break;
+          }
+
+          case 'closeTerminalTab':
+            if (data.tabId) terminalManager.closeTab(data.tabId);
+            break;
+
+          case 'clearTerminalTab':
+            if (data.tabId) terminalManager.clearTab(data.tabId);
+            break;
+
+          case 'runTerminalCommand': {
+            const shellCmd = data.cmd !== undefined ? data.cmd : data.input;
+            if (data.tabId && shellCmd !== undefined) {
+              terminalManager.runCommand(data.tabId, shellCmd);
+            }
+            break;
+          }
+
+          case 'terminateTerminalTab':
+            if (data.tabId) terminalManager.terminateTab(data.tabId);
+            break;
+
+          case 'refreshSystemTelemetry':
+            await this.pushSystemTelemetry();
             break;
         }
       },
@@ -529,23 +898,94 @@ export class AgentWorkspaceEditorPanel {
     this.syncActiveSession();
   }
 
+  private getActiveWorkspaceRoot(): string {
+    const sessionRoot = this.sessionManager.getActiveSession()?.workspaceRoot;
+    if (sessionRoot && fs.existsSync(sessionRoot)) {
+      return sessionRoot;
+    }
+    return this.orchestrator.getWorkspaceRoot() || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+  }
+
+  private applyWorkingFolder(targetRoot: string): void {
+    this.orchestrator.setWorkspace(targetRoot);
+    this.changesManager.setWorkspace(targetRoot);
+    this.permissionManager?.setWorkspace(targetRoot);
+    AgentWorkspaceEditorPanel._mcpHost?.setWorkspace(targetRoot);
+    TerminalSessionManager.getInstance().setDefaultCwd(targetRoot);
+  }
+
   public updateTitle(): void {
     const active = this.sessionManager.getActiveSession();
     if (active) {
-      this._panel.title = `💬 ${active.title}`;
+      this._panel.title = `${active.title}`;
     } else {
       this._panel.title = 'Agent Workspace';
     }
   }
 
+  private _slashAbortController?: AbortController;
+
+  private async executeSlashCommand(rawInput: string, confirmed: boolean): Promise<void> {
+    const workspaceRoot = this.getActiveWorkspaceRoot();
+    this.applyWorkingFolder(workspaceRoot);
+    this._slashAbortController?.abort();
+    const abortController = new AbortController();
+    this._slashAbortController = abortController;
+
+    const result = await runSlashCommandForWorkspace({
+      rawInput,
+      confirmed,
+      abortSignal: abortController.signal,
+      workspaceRoot,
+      viewMode: 'agent',
+      orchestrator: this.orchestrator,
+      sessionManager: this.sessionManager,
+      modelRegistry: this.modelRegistry,
+      permissionManager: this.permissionManager,
+      changesManager: this.changesManager,
+      toolManager: this.toolManager,
+      mcpHost: AgentWorkspaceEditorPanel._mcpHost,
+      registry: AgentWorkspaceEditorPanel._registry,
+      ollama: this.ollama,
+      ui: {
+        openCockpitModal: async (modal, statusText) => {
+          await this.openCockpitModal(modal, statusText);
+        },
+        switchInspectorTab: (tab) => {
+          this.postMessageSafe({ type: 'switchInspectorTab', tab, forceShow: true });
+        },
+        openFilesExplorerOrPicker: async () => {
+          await vscode.commands.executeCommand('workbench.view.explorer');
+        },
+        syncSession: async () => {
+          await this.syncActiveSession();
+        },
+        updateTitle: () => {
+          this.updateTitle();
+        },
+        applyWorkingFolder: (root) => {
+          this.applyWorkingFolder(root);
+        },
+      },
+    });
+
+    if (this._slashAbortController === abortController) {
+      this._slashAbortController = undefined;
+    }
+
+    await this.syncActiveSession();
+    this.postMessageSafe({ type: 'slashCommandResult', result });
+  }
+
   public async syncActiveSession(): Promise<void> {
-    if (!this._panel) return;
+    if (!this._panel || this._isDisposed) return;
     const session = this.sessionManager.getActiveSession();
     const allSessions = this.sessionManager.getAllSessions();
-    const workspaceName = vscode.workspace.workspaceFolders?.[0]?.name || 'LocalCoders';
+    const workspacePath = this.getActiveWorkspaceRoot();
+    const workspaceName = path.basename(workspacePath) || vscode.workspace.workspaceFolders?.[0]?.name || 'LocalCoders';
     const changesSummary = await this.changesManager.getSummary();
 
-    let modelsGrouped: Record<string, ModelMetadata[]> = {};
+    let modelsGrouped: any = { local: [], cloud: [], providers: [] };
     let allModels: ModelMetadata[] = [];
     try {
       modelsGrouped = await this.modelRegistry.getGroupedModels();
@@ -554,10 +994,15 @@ export class AgentWorkspaceEditorPanel {
       console.warn('[AgentWorkspace] Error loading models:', e);
     }
 
+    const firstAvailable = await this.modelRegistry.getDefaultOrFirstAvailableModel();
+    const fallbackModelId = session?.model || firstAvailable?.id || '';
+    const fallbackModelName = firstAvailable?.displayName || fallbackModelId || 'Select Model';
+
     const currentConfig = session?.config || {
-      providerId: 'ollama',
-      modelId: session?.model || 'qwen3.8:27b',
-      reasoningEffort: 'medium',
+      providerId: firstAvailable?.providerId || 'ollama',
+      modelId: fallbackModelId,
+      modelName: fallbackModelName,
+      reasoningEffort: firstAvailable?.defaultReasoningEffort || 'medium',
       fastMode: false,
       executionMode: 'code',
       permissionMode: 'smart',
@@ -565,33 +1010,162 @@ export class AgentWorkspaceEditorPanel {
       projectContext: [],
     };
     const permissionMode = this.permissionManager?.getMode() || currentConfig.permissionMode || 'smart';
+    this.permissionManager?.setMode(permissionMode as SecurityMode);
+    const slashCommands = ensureBuiltinSlashCommandsRegistered(
+      SlashCommandRegistry.getInstance(),
+      workspacePath
+    ).getSerializableCatalog();
 
-    this._panel.webview.postMessage({
+    const telemetry = await this.collectTelemetrySafe();
+    this.postMessageSafe({
       type: 'loadSession',
       session,
       allSessions,
       workspaceName,
+      workspacePath,
       changesSummary,
       modelsGrouped,
       allModels,
       currentConfig,
       permissionMode,
+      slashCommands,
+      terminalTabs: TerminalSessionManager.getInstance().getTabs(),
+      systemTelemetry: telemetry,
     });
     this.updateTitle();
   }
 
+  private async collectTelemetrySafe(): Promise<LiveSystemTelemetry | undefined> {
+    try {
+      return await collectLiveSystemTelemetry(this.ollama.getHost());
+    } catch {
+      return undefined;
+    }
+  }
+
+  public async pushSystemTelemetry(): Promise<void> {
+    if (this._isDisposed || this._telemetryInFlight) return;
+    this._telemetryInFlight = true;
+    try {
+      const telemetry = await this.collectTelemetrySafe();
+      if (telemetry && !this._isDisposed) {
+        this.postMessageSafe({ type: 'systemTelemetry', telemetry });
+      }
+    } finally {
+      this._telemetryInFlight = false;
+    }
+  }
+
   public focusPrompt(): void {
-    this._panel.webview.postMessage({ type: 'focusPrompt' });
+    this.postMessageSafe({ type: 'focusPrompt' });
+  }
+
+  public async openCockpitModal(modalType: CockpitModalType, statusText?: string): Promise<void> {
+    if (this._isDisposed) return;
+
+    const session = this.sessionManager.getActiveSession();
+    const activeModelId = session?.config?.modelId || this.modelRegistry.getDefaultModelId() || '';
+
+    if (modalType === 'models') {
+      const [providers, models] = await Promise.all([
+        this.modelRegistry.getProviderStatuses(false),
+        this.modelRegistry.getAvailableModels({ includeDisabled: false }),
+      ]);
+      this.postMessageSafe({
+        type: 'cockpitModalData',
+        modalType,
+        data: { providers, models, activeModelId, statusText },
+      });
+      return;
+    }
+
+    if (modalType === 'agents') {
+      const reg = AgentWorkspaceEditorPanel._registry;
+      const availableModels = await this.modelRegistry.getAvailableModels({ includeDisabled: false }).catch(() => []);
+      this.postMessageSafe({
+        type: 'cockpitModalData',
+        modalType,
+        data: {
+          mainAgent: reg?.getMainAgent() || null,
+          critic: reg?.getCriticConfig() || { enabled: true },
+          subagents: reg?.getSubagents() || [],
+          availableModels,
+          activeModelId,
+        },
+      });
+      return;
+    }
+
+    if (modalType === 'mcp') {
+      const mcp = AgentWorkspaceEditorPanel._mcpHost;
+      const servers = (mcp?.getAllServers() || []).map((s: any) => ({
+        id: s.config?.id || '',
+        name: s.config?.name || s.config?.id || 'MCP Server',
+        transport: s.config?.transport || 'stdio',
+        target: s.config?.url || [s.config?.command, ...(s.config?.args || [])].filter(Boolean).join(' '),
+        connected: Boolean(s.connected || s.status === 'connected'),
+        toolCount: Array.isArray(s.tools) ? s.tools.length : 0,
+      }));
+      this.postMessageSafe({
+        type: 'cockpitModalData',
+        modalType,
+        data: { servers },
+      });
+      return;
+    }
+
+    if (modalType === 'rules') {
+      const wsRoot = this.getActiveWorkspaceRoot();
+      const rulesPath = wsRoot ? path.join(wsRoot, '.localcoders', 'rules.md') : '';
+      let content = '';
+      if (rulesPath && fs.existsSync(rulesPath)) {
+        try {
+          content = fs.readFileSync(rulesPath, 'utf8');
+        } catch {}
+      }
+      this.postMessageSafe({
+        type: 'cockpitModalData',
+        modalType,
+        data: { content, statusText },
+      });
+      return;
+    }
+
+    if (modalType === 'settings') {
+      const cfg = vscode.workspace.getConfiguration('localcoders');
+      const reg = AgentWorkspaceEditorPanel._registry;
+      this.postMessageSafe({
+        type: 'cockpitModalData',
+        modalType,
+        data: {
+          defaultView: cfg.get<'agent' | 'ide'>('defaultView', 'agent'),
+          permissionMode: this.permissionManager?.getMode() || session?.config?.permissionMode || 'smart',
+          stopOllamaOnExit: cfg.get<boolean>('stopOllamaOnExit', true),
+          criticEnabled: reg ? reg.getCriticConfig().enabled : true,
+        },
+      });
+    }
   }
 
   public dispose(): void {
+    const wasInternal = AgentWorkspaceEditorPanel._closingInternally;
+    this._isDisposed = true;
+    if (this._telemetryTimer) {
+      clearInterval(this._telemetryTimer);
+      this._telemetryTimer = undefined;
+    }
     AgentWorkspaceEditorPanel.currentPanel = undefined;
-    this._panel.dispose();
     while (this._disposables.length) {
       const d = this._disposables.pop();
       if (d) {
         d.dispose();
       }
+    }
+    try {
+      this._panel.dispose();
+    } catch {}
+    if (!wasInternal && AgentWorkspaceEditorPanel.onDidDisposeUnexpected) {
+      AgentWorkspaceEditorPanel.onDidDisposeUnexpected();
     }
   }
 
@@ -600,31 +1174,40 @@ export class AgentWorkspaceEditorPanel {
   }
 
   private _getHtmlForWebview(): string {
-    const username = process.env.USER || process.env.USERNAME || 'local';
-    const avatarInitials = username.substring(0, 2).toLowerCase();
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>LocalCoders Agent Workspace</title>
+  <title>LocalCoders</title>
   <style>
     :root {
-      --bg: var(--vscode-editor-background, #121214);
-      --fg: var(--vscode-editor-foreground, #ececec);
-      --card-bg: var(--vscode-sideBar-background, #18181b);
-      --card-border: rgba(255, 255, 255, 0.08);
-      --border: var(--vscode-widget-border, #27272a);
-      --hover-bg: rgba(255, 255, 255, 0.06);
-      --input-bg: rgba(24, 24, 27, 0.95);
-      --accent: #38bdf8;
-      --accent-glow: rgba(56, 189, 248, 0.25);
+      --bg: var(--vscode-editor-background, #111214);
+      --fg: var(--vscode-editor-foreground, #e4e4e7);
+      --card-bg: var(--vscode-sideBar-background, #16171a);
+      --card-border: var(--vscode-widget-border, rgba(161, 161, 170, 0.16));
+      --border: var(--vscode-widget-border, rgba(161, 161, 170, 0.16));
+      --hover-bg: color-mix(in srgb, var(--vscode-editor-foreground, #e4e4e7) 6%, transparent);
+      --input-bg: var(--vscode-input-background, #18191d);
+      --accent: var(--vscode-textLink-foreground, #60a5fa);
+      --accent-glow: rgba(96, 165, 250, 0.14);
       --success: #22c55e;
       --danger: #ef4444;
       --warning: #f59e0b;
-      --text-muted: #94a3b8;
+      --text-muted: var(--vscode-descriptionForeground, #8b8f98);
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    ${getLucideCss()}
+    .btn-toggle-pane, .btn-switch-ide, .workspace-pill, .execution-title-wrap, .session-item-time, .nav-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .icon-btn-xs, .btn-send, .btn-stop, .tool-btn-icon, .attached-chip-remove, .popover-icon, .option-icon, .option-check, .pill-arrow, .chevron {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
     body {
       background-color: var(--bg);
       color: var(--fg);
@@ -632,15 +1215,94 @@ export class AgentWorkspaceEditorPanel {
       font-size: 13.5px;
       line-height: 1.6;
       height: 100vh;
+      display: flex;
+      flex-direction: column;
       overflow: hidden;
       user-select: text;
+    }
+
+    /* Local System Hardware Telemetry Bar (replaces single-tab strip in Agent Mode) */
+    .lc-sys-bar {
+      height: 30px;
+      min-height: 30px;
+      padding: 0 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      background: color-mix(in srgb, var(--card-bg) 92%, #000 8%);
+      border-bottom: 1px solid var(--border);
+      font-size: 11px;
+      color: var(--text-muted);
+      flex-shrink: 0;
+      overflow: hidden;
+    }
+    .lc-sys-metrics {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .lc-sys-metrics::-webkit-scrollbar {
+      display: none;
+    }
+    .lc-sys-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 2px 8px;
+      border-radius: 5px;
+      background: rgba(255, 255, 255, 0.035);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      white-space: nowrap;
+      line-height: 1.3;
+    }
+    .lc-sys-badge.local-runtime {
+      border-color: rgba(34, 197, 94, 0.25);
+      background: rgba(34, 197, 94, 0.07);
+      color: var(--fg);
+    }
+    .lc-sys-badge.local-runtime.offline {
+      border-color: rgba(148, 163, 184, 0.18);
+      background: rgba(148, 163, 184, 0.06);
+      color: var(--text-muted);
+    }
+    .lc-sys-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #22c55e;
+      flex-shrink: 0;
+    }
+    .lc-sys-dot.warn { background: #f59e0b; }
+    .lc-sys-dot.hot { background: #ef4444; }
+    .lc-sys-dot.idle { background: #64748b; }
+    .lc-sys-k {
+      font-weight: 600;
+      color: var(--text-muted);
+      letter-spacing: 0.2px;
+    }
+    .lc-sys-v {
+      font-family: var(--vscode-editor-font-family, monospace);
+      color: var(--fg);
+      font-size: 11px;
+    }
+    .lc-sys-actions {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
     }
 
     /* Devin 3-Column Workspace Layout */
     .devin-workspace-layout {
       display: flex;
       width: 100vw;
-      height: 100vh;
+      flex: 1;
+      min-height: 0;
+      height: 100%;
       overflow: hidden;
     }
 
@@ -665,74 +1327,52 @@ export class AgentWorkspaceEditorPanel {
       opacity: 0;
       pointer-events: none;
     }
-    .user-profile-header {
-      padding: 12px 14px;
+    .sidebar-brand-header {
+      padding: 10px 12px;
       display: flex;
       align-items: center;
-      gap: 10px;
+      justify-content: space-between;
       border-bottom: 1px solid var(--border);
     }
-    .user-avatar {
-      width: 32px;
-      height: 32px;
-      border-radius: 50%;
-      background: #22c55e;
-      color: #052e16;
-      font-weight: 700;
-      font-size: 13px;
-      display: flex;
+    .sidebar-brand-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--fg);
+      letter-spacing: 0.01em;
+      display: inline-flex;
       align-items: center;
-      justify-content: center;
-      flex-shrink: 0;
-      text-transform: lowercase;
-    }
-    .user-meta {
-      flex: 1;
-      overflow: hidden;
+      gap: 7px;
     }
     .user-header-icons {
       display: flex;
       align-items: center;
       gap: 2px;
     }
-    .user-name {
-      font-size: 13px;
-      font-weight: 600;
-      color: #f1f5f9;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .user-role {
-      font-size: 11px;
-      color: var(--text-muted);
-    }
     .btn-new-session {
-      margin: 12px 14px;
-      padding: 8px 12px;
-      background: rgba(56, 189, 248, 0.12);
-      border: 1px solid rgba(56, 189, 248, 0.35);
+      margin: 10px 12px 6px 12px;
+      padding: 7px 10px;
+      background: color-mix(in srgb, var(--fg) 5%, transparent);
+      border: 1px solid var(--border);
       border-radius: 6px;
-      color: var(--accent);
-      font-weight: 600;
-      font-size: 12.5px;
+      color: var(--fg);
+      font-weight: 500;
+      font-size: 12px;
       cursor: pointer;
       display: flex;
       align-items: center;
       justify-content: center;
       gap: 6px;
-      transition: all 0.15s ease;
+      transition: background 0.15s ease, border-color 0.15s ease;
     }
     .btn-new-session:hover {
-      background: rgba(56, 189, 248, 0.22);
-      border-color: rgba(56, 189, 248, 0.6);
-      color: #ffffff;
+      background: var(--hover-bg);
+      border-color: color-mix(in srgb, var(--fg) 26%, transparent);
     }
     .devin-nav {
       display: flex;
       flex-direction: column;
       gap: 2px;
-      padding: 0 8px 12px 8px;
+      padding: 6px 8px 8px 8px;
       border-bottom: 1px solid var(--border);
     }
     .nav-item {
@@ -791,9 +1431,9 @@ export class AgentWorkspaceEditorPanel {
       background: rgba(255, 255, 255, 0.05);
     }
     .mode-tab.active {
-      color: var(--accent);
-      background: rgba(56, 189, 248, 0.12);
-      border-color: rgba(56, 189, 248, 0.35);
+      color: var(--fg);
+      background: color-mix(in srgb, var(--fg) 8%, transparent);
+      border-color: var(--border);
       font-weight: 600;
     }
     .diff-header-actions {
@@ -852,20 +1492,92 @@ export class AgentWorkspaceEditorPanel {
       background: var(--hover-bg);
     }
     .session-item.active {
-      background: rgba(56, 189, 248, 0.12);
-      border-left: 2px solid var(--accent);
+      background: var(--hover-bg);
+      border-left: 2px solid var(--fg);
     }
     .session-item-title {
       font-size: 12px;
-      color: #f1f5f9;
+      color: var(--fg);
       font-weight: 500;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
     }
     .session-item.active .session-item-title {
-      color: var(--accent);
+      color: var(--fg);
       font-weight: 600;
+    }
+    .session-item-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 6px;
+      min-width: 0;
+    }
+    .session-item-header .session-item-title {
+      flex: 1;
+      min-width: 0;
+    }
+    .session-item-actions {
+      display: inline-flex;
+      align-items: center;
+      gap: 2px;
+      opacity: 0.45;
+      flex-shrink: 0;
+      transition: opacity 0.12s ease;
+    }
+    .session-item:hover .session-item-actions,
+    .session-item.active .session-item-actions,
+    .session-item.confirming .session-item-actions {
+      opacity: 1;
+    }
+    .session-act-btn {
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--text-muted);
+      border-radius: 4px;
+      padding: 2px;
+      width: 20px;
+      height: 20px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+    }
+    .session-act-btn:hover {
+      color: var(--fg);
+      background: rgba(255, 255, 255, 0.08);
+    }
+    .session-act-btn.btn-delete-session:hover {
+      color: #f87171;
+      background: rgba(248, 113, 113, 0.14);
+    }
+    .session-confirm-btn {
+      background: rgba(239, 68, 68, 0.18);
+      border: 1px solid rgba(248, 113, 113, 0.4);
+      color: #fca5a5;
+      border-radius: 4px;
+      padding: 1px 6px;
+      font-size: 10.5px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    .session-confirm-btn:hover {
+      background: rgba(239, 68, 68, 0.32);
+      color: #ffffff;
+    }
+    .session-rename-input {
+      width: 100%;
+      flex: 1;
+      min-width: 0;
+      background: #090b10;
+      border: 1px solid #38bdf8;
+      border-radius: 4px;
+      color: var(--fg);
+      font-size: 12px;
+      font-family: inherit;
+      padding: 2px 6px;
+      outline: none;
     }
     .session-item-time {
       font-size: 10.5px;
@@ -877,7 +1589,8 @@ export class AgentWorkspaceEditorPanel {
       flex: 1;
       display: flex;
       flex-direction: column;
-      height: 100vh;
+      min-height: 0;
+      height: 100%;
       overflow: hidden;
       position: relative;
       background: var(--bg);
@@ -886,101 +1599,109 @@ export class AgentWorkspaceEditorPanel {
 
     /* Top Session Bar */
     .top-session-bar {
-      height: 44px;
-      min-height: 44px;
-      padding: 0 16px;
+      height: 40px;
+      min-height: 40px;
+      padding: 0 14px;
       display: flex;
       align-items: center;
       justify-content: space-between;
       border-bottom: 1px solid var(--border);
-      background: rgba(18, 18, 20, 0.85);
-      backdrop-filter: blur(8px);
+      background: var(--bg);
       z-index: 10;
     }
     .session-left-meta {
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 8px;
       overflow: hidden;
     }
     .btn-toggle-pane {
       background: transparent;
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      border-radius: 4px;
-      color: #cbd5e1;
-      padding: 4px 8px;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      color: var(--text-muted);
+      padding: 3px 8px;
       font-size: 11.5px;
       cursor: pointer;
       display: inline-flex;
       align-items: center;
       gap: 4px;
+      transition: background 0.12s ease, color 0.12s ease;
     }
     .btn-toggle-pane:hover {
-      background: rgba(255, 255, 255, 0.08);
-      color: #ffffff;
+      background: var(--hover-bg);
+      color: var(--fg);
     }
     .session-title {
-      font-size: 13.5px;
+      font-size: 13px;
       font-weight: 600;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      color: #f1f5f9;
+      color: var(--fg);
     }
     .workspace-pill {
       display: inline-flex;
       align-items: center;
-      gap: 5px;
-      padding: 2px 8px;
-      background: rgba(255, 255, 255, 0.06);
-      border: 1px solid var(--card-border);
+      gap: 4px;
+      padding: 2px 7px;
+      background: transparent;
+      border: 1px solid var(--border);
       border-radius: 4px;
-      font-size: 11.5px;
+      font-size: 11px;
       color: var(--text-muted);
       font-family: var(--vscode-editor-font-family, monospace);
+      cursor: pointer;
+      user-select: none;
+    }
+    .workspace-pill:hover {
+      background: rgba(255, 255, 255, 0.08);
+      color: var(--fg);
+      border-color: rgba(255, 255, 255, 0.18);
     }
     .top-actions {
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
     }
     .status-badge {
       font-size: 11px;
-      padding: 3px 9px;
-      border-radius: 999px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-weight: 500;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      background: transparent;
     }
-    .status-ready { background: rgba(34, 197, 94, 0.15); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.3); }
-    .status-running { background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.3); }
-    .status-failed { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+    .status-ready { color: #22c55e; border-color: color-mix(in srgb, #22c55e 28%, transparent); }
+    .status-running { color: var(--fg); border-color: var(--border); }
+    .status-failed { color: #ef4444; border-color: color-mix(in srgb, #ef4444 28%, transparent); }
 
     .btn-switch-ide {
-      background: rgba(168, 85, 247, 0.15);
-      border: 1px solid rgba(168, 85, 247, 0.4);
-      color: #d8b4fe;
-      padding: 4px 10px;
-      border-radius: 4px;
-      font-size: 12px;
-      font-weight: 600;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
+      padding: 3px 8px;
+      border-radius: 5px;
+      font-size: 11.5px;
+      font-weight: 500;
       cursor: pointer;
       display: inline-flex;
       align-items: center;
       gap: 5px;
-      transition: all 0.15s ease;
+      transition: background 0.12s ease, color 0.12s ease;
     }
     .btn-switch-ide:hover {
-      background: rgba(168, 85, 247, 0.28);
-      border-color: rgba(168, 85, 247, 0.7);
-      color: #ffffff;
+      background: var(--hover-bg);
+      color: var(--fg);
     }
 
     /* Scrollable Conversation Workspace */
     .workspace-scroll {
       flex: 1;
+      min-height: 0;
       overflow-y: auto;
-      padding: 24px 20px 140px 20px;
+      padding: 24px 20px 20px 20px;
       display: flex;
       flex-direction: column;
       align-items: center;
@@ -1006,39 +1727,38 @@ export class AgentWorkspaceEditorPanel {
     }
     .message-user-bubble {
       align-self: flex-end;
-      background: rgba(56, 189, 248, 0.12);
-      border: 1px solid rgba(56, 189, 248, 0.28);
-      border-radius: 12px 12px 2px 12px;
-      padding: 12px 16px;
-      max-width: 82%;
-      color: #f8fafc;
-      font-size: 13.5px;
-      line-height: 1.5;
+      background: color-mix(in srgb, var(--fg) 7%, transparent);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 14px;
+      max-width: 78%;
+      color: var(--fg);
+      font-size: 13px;
+      line-height: 1.55;
     }
     .message-agent-wrap {
       display: flex;
-      gap: 12px;
+      gap: 10px;
       width: 100%;
     }
     .agent-avatar {
-      width: 30px;
-      height: 30px;
-      border-radius: 50%;
-      background: linear-gradient(135deg, #0284c7, #38bdf8);
+      width: 22px;
+      height: 22px;
+      border-radius: 5px;
+      background: color-mix(in srgb, var(--fg) 7%, transparent);
+      border: 1px solid var(--border);
       display: flex;
       align-items: center;
       justify-content: center;
-      color: #ffffff;
-      font-weight: 700;
-      font-size: 12px;
+      color: var(--text-muted);
       flex-shrink: 0;
-      box-shadow: 0 2px 8px rgba(56, 189, 248, 0.3);
+      margin-top: 2px;
     }
     .agent-content-area {
       flex: 1;
       display: flex;
       flex-direction: column;
-      gap: 10px;
+      gap: 6px;
       min-width: 0;
     }
     .agent-header {
@@ -1048,21 +1768,32 @@ export class AgentWorkspaceEditorPanel {
     }
     .agent-name {
       font-weight: 600;
-      font-size: 13px;
-      color: #f1f5f9;
-    }
-    .agent-role-pill {
-      font-size: 11px;
-      padding: 1px 7px;
-      background: rgba(255, 255, 255, 0.08);
-      border-radius: 4px;
+      font-size: 12px;
       color: var(--text-muted);
     }
     .agent-text {
-      color: #e2e8f0;
+      color: var(--fg);
       font-size: 13.5px;
       line-height: 1.6;
       word-break: break-word;
+    }
+    .lc-empty-workspace {
+      margin: 12vh auto 0 auto;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      text-align: center;
+      color: var(--text-muted);
+    }
+    .lc-empty-workspace-title {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--fg);
+    }
+    .lc-empty-workspace-sub {
+      font-size: 12px;
+      color: var(--text-muted);
     }
     .agent-text pre {
       background: #09090b;
@@ -1213,29 +1944,26 @@ export class AgentWorkspaceEditorPanel {
     .plan-in_progress { background: rgba(56, 189, 248, 0.2); color: #38bdf8; }
     .plan-completed { background: rgba(34, 197, 94, 0.2); color: #4ade80; }
 
-    /* Floating Bottom Prompt Bar (Devin Style) */
+    /* Minimalist Matte Bottom Prompt Bar (docked flex footer — never covers chat content) */
     .floating-prompt-bar {
-      position: absolute;
-      bottom: 20px;
-      left: 50%;
-      transform: translateX(-50%);
+      position: relative;
+      flex-shrink: 0;
       width: calc(100% - 40px);
-      max-width: 820px;
+      max-width: 780px;
+      margin: 8px auto 14px auto;
       background: var(--input-bg);
-      backdrop-filter: blur(16px);
-      border: 1px solid rgba(255, 255, 255, 0.12);
-      border-radius: 12px;
-      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
-      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      box-shadow: 0 4px 18px rgba(0, 0, 0, 0.22);
+      padding: 9px 12px;
       display: flex;
       flex-direction: column;
-      gap: 8px;
+      gap: 6px;
       z-index: 30;
-      transition: border-color 0.2s ease, box-shadow 0.2s ease;
+      transition: border-color 0.15s ease;
     }
     .floating-prompt-bar:focus-within {
-      border-color: rgba(56, 189, 248, 0.5);
-      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6), 0 0 20px rgba(56, 189, 248, 0.15);
+      border-color: color-mix(in srgb, var(--fg) 32%, transparent);
     }
     .prompt-tip {
       font-size: 10.5px;
@@ -1259,62 +1987,91 @@ export class AgentWorkspaceEditorPanel {
       display: flex;
       align-items: center;
       justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
       border-top: 1px solid rgba(255, 255, 255, 0.06);
-      padding-top: 6px;
+      padding-top: 8px;
     }
     .prompt-left-tools {
       display: flex;
       align-items: center;
       gap: 6px;
-    }
-    .tool-btn {
-      width: 26px;
-      height: 26px;
-      border-radius: 5px;
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      background: rgba(255, 255, 255, 0.04);
-      color: var(--text-muted);
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 13px;
-    }
-    .tool-btn:hover {
-      background: rgba(255, 255, 255, 0.1);
-      color: #ffffff;
-    }
-    .code-context-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      padding: 2px 8px;
-      border-radius: 999px;
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      font-size: 11px;
-      color: #cbd5e1;
+      flex-wrap: wrap;
+      min-width: 0;
     }
     .prompt-right-tools {
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
+      flex-shrink: 0;
     }
-    .model-selector-pill {
+    .tool-btn {
+      width: 28px;
+      height: 28px;
+      box-sizing: border-box;
+      border-radius: 6px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      background: rgba(255, 255, 255, 0.05);
+      color: var(--text-muted);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      line-height: 1;
+      flex-shrink: 0;
+      transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+    }
+    .tool-btn:hover {
+      background: rgba(255, 255, 255, 0.1);
+      border-color: rgba(255, 255, 255, 0.2);
+      color: #ffffff;
+    }
+    .tool-btn-pill,
+    .code-context-pill,
+    .model-selector-pill,
+    .effort-selector-pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+      height: 28px;
+      box-sizing: border-box;
+      padding: 0 10px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      color: #e2e8f0;
+      font-family: inherit;
+      font-size: 11.5px;
+      font-weight: 500;
+      line-height: 1;
+      white-space: nowrap;
+      user-select: none;
+      cursor: pointer;
+      flex-shrink: 0;
+      transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+    }
+    .tool-btn-pill:hover,
+    .code-context-pill:hover,
+    .model-selector-pill:hover,
+    .effort-selector-pill:hover {
+      background: rgba(255, 255, 255, 0.1);
+      border-color: rgba(255, 255, 255, 0.2);
+      color: #ffffff;
+    }
+    .lc-icon-gap {
       display: inline-flex;
       align-items: center;
       gap: 5px;
-      padding: 3px 10px;
-      border-radius: 6px;
-      background: rgba(255, 255, 255, 0.06);
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      font-size: 11.5px;
-      color: #f1f5f9;
-      cursor: pointer;
-      font-weight: 500;
     }
-    .model-selector-pill:hover {
-      background: rgba(255, 255, 255, 0.12);
+    .model-provider-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 14px;
+      height: 14px;
+      flex-shrink: 0;
     }
     .btn-send {
       width: 28px;
@@ -1631,272 +2388,8 @@ export class AgentWorkspaceEditorPanel {
       margin: 6px 0;
     }
 
-    /* Model Selector Modal */
-    .modal-search-header {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 10px 12px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-    }
-    .modal-search-input {
-      flex: 1;
-      background: transparent;
-      border: none;
-      outline: none;
-      font-size: 13px;
-      color: #f1f5f9;
-      font-family: inherit;
-    }
-    .modal-search-input::placeholder {
-      color: #64748b;
-    }
-    .kbd-badge {
-      font-size: 10.5px;
-      padding: 2px 5px;
-      border-radius: 4px;
-      background: rgba(255, 255, 255, 0.08);
-      color: #94a3b8;
-      font-family: var(--vscode-editor-font-family, monospace);
-      border: 1px solid rgba(255, 255, 255, 0.1);
-    }
-    .clear-search-btn {
-      background: none;
-      border: none;
-      color: #94a3b8;
-      cursor: pointer;
-      font-size: 12px;
-    }
-    .model-categories-scroll {
-      flex: 1;
-      overflow-y: auto;
-      max-height: 440px;
-      padding: 6px 4px;
-    }
-    .model-category-header {
-      font-size: 10px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.6px;
-      color: #64748b;
-      padding: 8px 10px 4px 10px;
-    }
-    .model-item-row {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      padding: 7px 10px;
-      border-radius: 6px;
-      cursor: pointer;
-      transition: background 0.1s ease;
-    }
-    .model-item-row:hover {
-      background: rgba(255, 255, 255, 0.06);
-    }
-    .model-item-row.selected {
-      background: rgba(56, 189, 248, 0.12);
-    }
-    .model-item-icon {
-      width: 24px;
-      height: 24px;
-      border-radius: 5px;
-      background: rgba(255, 255, 255, 0.05);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 13px;
-      flex-shrink: 0;
-    }
-    .model-item-info {
-      flex: 1;
-      min-width: 0;
-    }
-    .model-item-name-row {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-    .model-item-name {
-      font-size: 12.5px;
-      font-weight: 600;
-      color: #f8fafc;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .model-tag {
-      font-size: 9.5px;
-      padding: 1px 4px;
-      border-radius: 3px;
-      font-weight: 600;
-    }
-    .model-tag.local { background: rgba(56, 189, 248, 0.18); color: #38bdf8; }
-    .model-tag.new { background: rgba(34, 197, 94, 0.2); color: #4ade80; }
-    .model-tag.free { background: rgba(168, 85, 247, 0.2); color: #c084fc; }
-    .model-item-meta-row {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 11px;
-      color: #94a3b8;
-      margin-top: 2px;
-    }
-    .status-dot-available {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: #22c55e;
-      display: inline-block;
-    }
-    .model-fav-btn {
-      background: none;
-      border: none;
-      font-size: 14px;
-      color: #64748b;
-      cursor: pointer;
-      padding: 2px 4px;
-      transition: color 0.1s ease;
-    }
-    .model-fav-btn:hover, .model-fav-btn.is-fav {
-      color: #fbbf24;
-    }
-    .model-check {
-      font-size: 13px;
-      font-weight: 700;
-      color: #38bdf8;
-      width: 16px;
-      text-align: center;
-    }
-
-    /* Model Config Popover */
-    .config-popover-header {
-      padding: 8px 10px 10px 10px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-    }
-    .config-popover-title {
-      font-size: 13px;
-      font-weight: 600;
-      color: #f8fafc;
-    }
-    .config-model-name {
-      font-size: 11.5px;
-      color: var(--accent);
-      font-family: var(--vscode-editor-font-family, monospace);
-      margin-top: 2px;
-    }
-    .config-section {
-      padding: 10px 10px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-    }
-    .config-section-label {
-      font-size: 10px;
-      font-weight: 700;
-      letter-spacing: 0.6px;
-      color: #64748b;
-      margin-bottom: 8px;
-      text-transform: uppercase;
-    }
-    .effort-segmented-bar {
-      display: flex;
-      background: rgba(255, 255, 255, 0.05);
-      border-radius: 6px;
-      padding: 2px;
-      gap: 2px;
-    }
-    .effort-seg-btn {
-      flex: 1;
-      background: transparent;
-      border: none;
-      color: #94a3b8;
-      font-size: 11px;
-      font-weight: 500;
-      padding: 5px 0;
-      border-radius: 4px;
-      cursor: pointer;
-      transition: all 0.1s ease;
-    }
-    .effort-seg-btn:hover {
-      color: #ffffff;
-    }
-    .effort-seg-btn.active {
-      background: var(--accent);
-      color: #0f172a;
-      font-weight: 700;
-    }
-    .fast-mode-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    .fast-mode-title {
-      font-size: 12.5px;
-      font-weight: 600;
-      color: #f8fafc;
-    }
-    .fast-mode-desc {
-      font-size: 11px;
-      color: #94a3b8;
-      margin-top: 2px;
-    }
-    .toggle-switch {
-      position: relative;
-      display: inline-block;
-      width: 36px;
-      height: 20px;
-      flex-shrink: 0;
-    }
-    .toggle-switch input {
-      opacity: 0;
-      width: 0;
-      height: 0;
-    }
-    .toggle-slider {
-      position: absolute;
-      cursor: pointer;
-      top: 0; left: 0; right: 0; bottom: 0;
-      background-color: rgba(255, 255, 255, 0.15);
-      transition: .2s;
-      border-radius: 20px;
-    }
-    .toggle-slider:before {
-      position: absolute;
-      content: "";
-      height: 14px;
-      width: 14px;
-      left: 3px;
-      bottom: 3px;
-      background-color: white;
-      transition: .2s;
-      border-radius: 50%;
-    }
-    input:checked + .toggle-slider {
-      background-color: var(--accent);
-    }
-    input:checked + .toggle-slider:before {
-      transform: translateX(16px);
-      background-color: #0f172a;
-    }
-    .resource-card {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      background: rgba(255, 255, 255, 0.03);
-      padding: 8px 10px;
-      border-radius: 6px;
-      border: 1px solid rgba(255, 255, 255, 0.06);
-    }
-    .resource-icon {
-      font-size: 16px;
-    }
-    .resource-title {
-      font-size: 12px;
-      font-weight: 600;
-      color: #f1f5f9;
-    }
-    .resource-desc {
-      font-size: 11px;
-      color: #94a3b8;
-    }
+    /* Model Selector & Configuration Popovers */
+    ${getModelSelectorStyles()}
 
     /* Attached Context Chips Bar */
     .composer-attached-row {
@@ -1929,113 +2422,104 @@ export class AgentWorkspaceEditorPanel {
       color: #f87171;
     }
 
-    /* Controls Pills */
-    .tool-btn-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      padding: 3px 10px;
-      border-radius: 6px;
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      color: #cbd5e1;
-      font-size: 11.5px;
-      font-weight: 500;
-      cursor: pointer;
-      transition: all 0.12s ease;
-    }
-    .tool-btn-pill:hover {
-      background: rgba(255, 255, 255, 0.1);
-      color: #ffffff;
-    }
-    .effort-selector-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      padding: 3px 8px;
-      border-radius: 5px;
-      background: rgba(56, 189, 248, 0.1);
-      border: 1px solid rgba(56, 189, 248, 0.2);
-      color: #38bdf8;
-      font-size: 11px;
-      font-weight: 600;
-      cursor: pointer;
-    }
-    .effort-selector-pill:hover {
-      background: rgba(56, 189, 248, 0.2);
-    }
+    /* Controls Pills (see unified composer controls above) */
     .tool-btn-icon {
-      background: none;
-      border: none;
+      width: 28px;
+      height: 28px;
+      box-sizing: border-box;
+      background: transparent;
+      border: 1px solid transparent;
       color: #94a3b8;
       cursor: pointer;
       font-size: 15px;
-      display: flex;
+      display: inline-flex;
       align-items: center;
       justify-content: center;
-      padding: 3px 6px;
-      border-radius: 4px;
+      padding: 0;
+      border-radius: 6px;
+      flex-shrink: 0;
+      transition: background 0.12s ease, color 0.12s ease;
     }
     .tool-btn-icon:hover {
       color: #ffffff;
       background: rgba(255, 255, 255, 0.08);
     }
     .pill-arrow {
-      font-size: 9px;
-      opacity: 0.7;
+      display: inline-flex;
+      align-items: center;
+      opacity: 0.72;
+      flex-shrink: 0;
     }
-
+    ${getActivityStreamStyles()}
+    ${getCockpitModalStyles()}
+    ${getSlashCommandStyles()}
+    ${getSessionsBarStyles()}
   </style>
 </head>
 <body>
+
+  <header class="lc-sys-bar" id="systemTelemetryBar">
+    <div class="lc-sys-metrics" id="systemTelemetryMetrics">
+      <span class="lc-sys-badge local-runtime idle"><span class="lc-sys-dot idle"></span><span class="lc-sys-k">LOCAL</span><span class="lc-sys-v">Detecting hardware...</span></span>
+    </div>
+    <div class="lc-sys-actions">
+      <button type="button" class="icon-btn-xs" id="btnRefreshTelemetry" title="Refresh System Hardware Stats">${lucideSvg('refresh-cw', 12)}</button>
+    </div>
+  </header>
 
   <div class="devin-workspace-layout">
 
     <!-- 1. LEFT SESSIONS SIDEBAR -->
     <aside class="devin-sidebar" id="devinSidebar">
-      <div class="user-profile-header">
-        <div class="user-avatar">${avatarInitials}</div>
-        <div class="user-meta">
-          <div class="user-name">${username}</div>
-          <div class="user-role">@${username}</div>
-        </div>
+      <div class="sidebar-brand-header">
+        <span class="sidebar-brand-title">${getLocalCodersLogoSvg(18)}<span>LocalCoders</span></span>
         <div class="user-header-icons">
-          <button class="icon-btn-xs" id="btnSearchHeader" title="Search">🔍</button>
-          <button class="icon-btn-xs" id="btnSettingsHeader" title="Notifications &amp; Settings">🔔</button>
+          <button class="icon-btn-xs" id="btnSettingsHeader" title="Settings">${lucideSvg('settings', 14)}</button>
         </div>
-      </div>
-
-      <button class="btn-new-session" id="btnNewSession">
-        <span>+</span> New session
-      </button>
-
-      <div class="session-search-box">
-        <input type="text" class="session-search-input" id="sessionSearchInput" placeholder="Search sessions...">
       </div>
 
       <nav class="devin-nav">
-        <div class="nav-item" id="navAutomations"><span>⚡</span> Automations</div>
-        <div class="nav-item" id="navSecurity"><span>🛡</span> Security</div>
-        <div class="nav-item" id="navReview"><span>👁</span> Review</div>
-        <div class="nav-item" id="navWiki"><span>📖</span> Wiki</div>
-        <div class="nav-item" id="navCustomize"><span>⚙</span> Customize</div>
-        <div class="nav-item" id="navAgents"><span>🤖</span> Agent Team</div>
-        <div class="nav-item" id="navMcp"><span>🔌</span> MCP Servers</div>
+        <div class="nav-item" id="navReview">${lucideSvg('eye', 14)} <span>Changes Review</span></div>
+        <div class="nav-item" id="navAgents">${lucideSvg('users', 14)} <span>Agents</span></div>
+        <div class="nav-item" id="navMcp">${lucideSvg('plug', 14)} <span>MCP Servers</span></div>
+        <div class="nav-item" id="navWiki">${lucideSvg('file-text', 14)} <span>Project Rules</span></div>
       </nav>
 
-      <div class="sessions-heading-row">
-        <span>Sessions</span>
-        <div class="sessions-heading-actions">
-          <button class="icon-btn-xs" id="btnHeaderNewSession" title="New Session">+</button>
-          <button class="icon-btn-xs" id="btnHeaderFilter" title="Sort / Filter">⇅</button>
+      <div class="lc-sessions-header">
+        <span class="lc-sessions-heading">Sessions</span>
+        <div class="lc-sessions-hdr-actions">
+          <button type="button" class="lc-sess-hdr-btn" id="btnHeaderNewSession" title="New Session">${lucideSvg('plus', 15)}</button>
+          <button type="button" class="lc-sess-hdr-btn" id="btnHeaderFilter" title="Filter &amp; Sort">${lucideSvg('sliders-horizontal', 14)}</button>
+          <button type="button" class="lc-sess-hdr-btn" id="btnHeaderMore" title="Session Options">${lucideSvg('ellipsis', 14)}</button>
+          <div class="lc-sessions-menu" id="sessionsMoreMenu">
+            <button type="button" class="lc-sessions-menu-item" data-sess-action="new">${lucideSvg('plus', 12)}<span>New Session</span></button>
+            <button type="button" class="lc-sessions-menu-item" data-sess-action="toggleGroup">${lucideSvg('folder', 12)}<span id="sessGroupMenuLabel">Group by Folder</span></button>
+            <button type="button" class="lc-sessions-menu-item" data-sess-action="toggleSort">${lucideSvg('arrow-up-down', 12)}<span id="sessSortMenuLabel">Sort: Alphabetical</span></button>
+            <div class="lc-sessions-menu-sep"></div>
+            <button type="button" class="lc-sessions-menu-item" data-sess-action="renameActive">${lucideSvg('pencil', 12)}<span>Rename Active</span></button>
+            <button type="button" class="lc-sessions-menu-item danger" data-sess-action="deleteActive">${lucideSvg('trash-2', 12)}<span>Delete Active</span></button>
+          </div>
         </div>
       </div>
 
-      <div class="sessions-subgroup" style="padding: 4px 14px 2px 14px; font-size: 11px; color: #94a3b8; font-weight: 600;">
-        ▾ Recent
+      <div class="lc-sessions-filter-bar" id="sessionsFilterBar">
+        <div class="lc-sessions-search-wrap">
+          <span class="lc-sessions-search-ico">${lucideSvg('search', 12)}</span>
+          <input type="text" class="lc-sessions-filter-input" id="sessionSearchInput" placeholder="Filter sessions...">
+        </div>
+        <div class="lc-sessions-filter-pills">
+          <button type="button" class="lc-sess-filter-pill active" id="pillSortRecent">Recent</button>
+          <button type="button" class="lc-sess-filter-pill" id="pillSortAlpha">A–Z</button>
+          <button type="button" class="lc-sess-filter-pill" id="pillGroupFolder">By Folder</button>
+        </div>
       </div>
 
-      <div class="sessions-list-scroll" id="sessionsList">
+      <button type="button" class="lc-recent-subheader" id="btnToggleRecentGroup" title="Collapse / Expand Recent">
+        ${lucideSvg('clock', 12)}
+        <span>Recent</span>
+      </button>
+
+      <div class="lc-sessions-scroll" id="sessionsList">
         <!-- Sessions dynamically rendered -->
       </div>
     </aside>
@@ -2044,14 +2528,16 @@ export class AgentWorkspaceEditorPanel {
     <main class="devin-main">
       <div class="top-session-bar">
         <div class="session-left-meta">
-          <button class="btn-toggle-pane" id="btnToggleSidebar" title="Toggle Sessions Sidebar">☵ Sessions</button>
-          <span class="session-title" id="topSessionTitle">LocalCoders Multi-Agent Workspace</span>
-          <span class="workspace-pill" id="topWorkspacePill">🗁 workspace</span>
+          <button class="btn-toggle-pane" id="btnToggleSidebar" title="Toggle Sessions Sidebar">${lucideSvg('panel-left', 14)}</button>
+          <span class="session-title" id="topSessionTitle" title="Double-click to rename session">New session</span>
+          <button class="icon-btn-xs" id="btnRenameActiveSession" title="Rename active session">${lucideSvg('pencil', 12)}</button>
+          <button type="button" class="workspace-pill" id="topWorkspacePill" title="Choose Working Folder for Agent">${lucideSvg('folder', 12)} <span>workspace</span></button>
         </div>
         <div class="top-actions">
           <span class="status-badge status-ready" id="topStatusBadge">Ready</span>
-          <button class="btn-switch-ide" id="btnSwitchToIde" title="Switch to standard IDE Editor &amp; File Tree">💻 IDE View</button>
-          <button class="btn-toggle-pane" id="btnToggleChanges" title="Toggle Changes &amp; Review Panel">◫ Changes</button>
+          <button class="btn-toggle-pane" id="btnToggleTerminal" title="Terminal">${lucideSvg('terminal', 13)} <span>Terminal</span></button>
+          <button class="btn-toggle-pane" id="btnToggleChanges" title="Changes">${lucideSvg('panel-right', 13)} <span>Changes</span></button>
+          <button class="btn-switch-ide" id="btnSwitchToIde" title="Switch to IDE Editor View">${lucideSvg('code', 13)} <span>IDE</span></button>
         </div>
       </div>
 
@@ -2069,47 +2555,47 @@ export class AgentWorkspaceEditorPanel {
         <!-- 1. Attachment / Context Popover (Screenshot 1) -->
         <div class="popover-menu" id="attachMenuPopover">
           <div class="popover-menu-item" data-action="attachFiles">
-            <span class="popover-icon">📎</span>
+            <span class="popover-icon">${lucideSvg('paperclip', 14)}</span>
             <span class="popover-label">Attach files</span>
           </div>
           <div class="popover-menu-item" data-action="quickFile">
-            <span class="popover-icon">📄</span>
+            <span class="popover-icon">${lucideSvg('file-text', 14)}</span>
             <span class="popover-label">Files</span>
           </div>
           <div class="popover-menu-item" data-action="quickDirectory">
-            <span class="popover-icon">📁</span>
+            <span class="popover-icon">${lucideSvg('folder', 14)}</span>
             <span class="popover-label">Directories</span>
           </div>
           <div class="popover-menu-item" data-action="attachGit">
-            <span class="popover-icon">⎇</span>
+            <span class="popover-icon">${lucideSvg('git-branch', 14)}</span>
             <span class="popover-label">Git</span>
           </div>
           <div class="popover-menu-item" data-action="openMcp">
-            <span class="popover-icon">⚡</span>
+            <span class="popover-icon">${lucideSvg('plug', 14)}</span>
             <span class="popover-label">MCP servers</span>
           </div>
           <div class="popover-menu-item" data-action="openRules">
-            <span class="popover-icon">📜</span>
+            <span class="popover-icon">${lucideSvg('scroll-text', 14)}</span>
             <span class="popover-label">Rules</span>
           </div>
           <div class="popover-menu-item" data-action="openSkills">
-            <span class="popover-icon">💡</span>
+            <span class="popover-icon">${lucideSvg('lightbulb', 14)}</span>
             <span class="popover-label">Skills</span>
           </div>
           <div class="popover-menu-item" data-action="attachPlan">
-            <span class="popover-icon">📋</span>
+            <span class="popover-icon">${lucideSvg('list-checks', 14)}</span>
             <span class="popover-label">Plans</span>
           </div>
           <div class="popover-menu-item" data-action="attachConversation">
-            <span class="popover-icon">💬</span>
+            <span class="popover-icon">${lucideSvg('message-square', 14)}</span>
             <span class="popover-label">Conversations</span>
           </div>
           <div class="popover-menu-item" data-action="attachTerminal">
-            <span class="popover-icon">⌨</span>
+            <span class="popover-icon">${lucideSvg('terminal', 14)}</span>
             <span class="popover-label">Terminal</span>
           </div>
           <div class="popover-menu-item" data-action="attachCodemap">
-            <span class="popover-icon">🗺</span>
+            <span class="popover-icon">${lucideSvg('map', 14)}</span>
             <span class="popover-label">Codemaps</span>
           </div>
         </div>
@@ -2122,129 +2608,81 @@ export class AgentWorkspaceEditorPanel {
               <div class="option-title">Code</div>
               <div class="option-desc">Write and edit code</div>
             </div>
-            <div class="option-check" id="checkExec_code">✓</div>
+            <div class="option-check" id="checkExec_code">${lucideSvg('check', 13)}</div>
           </div>
           <div class="popover-card-option" data-exec="smart">
-            <div class="option-icon">✦</div>
+            <div class="option-icon">${lucideSvg('sparkles', 14)}</div>
             <div class="option-content">
               <div class="option-title">Smart</div>
               <div class="option-desc">Auto-approve actions the model judges safe</div>
             </div>
-            <div class="option-check" id="checkExec_smart">✓</div>
+            <div class="option-check" id="checkExec_smart">${lucideSvg('check', 13)}</div>
           </div>
           <div class="popover-card-option" data-exec="ask">
-            <div class="option-icon">💬</div>
+            <div class="option-icon">${lucideSvg('message-square', 14)}</div>
             <div class="option-content">
               <div class="option-title">Ask</div>
               <div class="option-desc">Answer questions without code changes</div>
             </div>
-            <div class="option-check" id="checkExec_ask">✓</div>
+            <div class="option-check" id="checkExec_ask">${lucideSvg('check', 13)}</div>
           </div>
           <div class="popover-card-option" data-exec="plan">
-            <div class="option-icon">📋</div>
+            <div class="option-icon">${lucideSvg('list-checks', 14)}</div>
             <div class="option-content">
               <div class="option-title">Plan</div>
               <div class="option-desc">Plan changes before implementing</div>
             </div>
-            <div class="option-check" id="checkExec_plan">✓</div>
+            <div class="option-check" id="checkExec_plan">${lucideSvg('check', 13)}</div>
           </div>
           <div class="popover-divider"></div>
           <div class="popover-card-option" data-perm="bypass" id="optBypassPerms">
-            <div class="option-icon">🛡</div>
+            <div class="option-icon">${lucideSvg('shield', 14)}</div>
             <div class="option-content">
               <div class="option-title">Bypass Permissions</div>
               <div class="option-desc">Auto-approve all tool calls unless blocked by hard safety boundaries</div>
             </div>
-            <div class="option-check" id="checkPerm_bypass">✓</div>
+            <div class="option-check" id="checkPerm_bypass">${lucideSvg('check', 13)}</div>
           </div>
         </div>
 
         <!-- 3. Permission Mode Popover -->
         <div class="popover-card" id="permModePopover" style="width: 300px;">
           <div class="popover-card-option" data-perm="ask">
-            <div class="option-icon">🛡</div>
+            <div class="option-icon">${lucideSvg('shield', 14)}</div>
             <div class="option-content">
               <div class="option-title">Ask Before Actions</div>
               <div class="option-desc">Prompt for manual confirmation before every tool call or edit</div>
             </div>
-            <div class="option-check" id="checkPerm_ask">✓</div>
+            <div class="option-check" id="checkPerm_ask">${lucideSvg('check', 13)}</div>
           </div>
           <div class="popover-card-option" data-perm="smart">
-            <div class="option-icon">⚡</div>
+            <div class="option-icon">${lucideSvg('shield-check', 14)}</div>
             <div class="option-content">
               <div class="option-title">Smart Approval</div>
               <div class="option-desc">Auto-approve safe reads; prompt on file modifications and terminal runs</div>
             </div>
-            <div class="option-check" id="checkPerm_smart">✓</div>
+            <div class="option-check" id="checkPerm_smart">${lucideSvg('check', 13)}</div>
           </div>
           <div class="popover-card-option" data-perm="bypass">
-            <div class="option-icon">🚀</div>
+            <div class="option-icon">${lucideSvg('shield-alert', 14)}</div>
             <div class="option-content">
               <div class="option-title">Bypass Permissions</div>
               <div class="option-desc">Auto-approve all tool calls unless your organization's policy requires approval</div>
             </div>
-            <div class="option-check" id="checkPerm_bypass_modal">✓</div>
+            <div class="option-check" id="checkPerm_bypass_modal">${lucideSvg('check', 13)}</div>
           </div>
         </div>
 
-        <!-- 4. Advanced Model Selector Popover (Antigravity Reference Screenshot 4) -->
-        <div class="popover-card model-selector-modal" id="modelSelectorPopover" style="width: 380px; max-height: 520px;">
-          <div class="modal-search-header">
-            <span class="search-icon">🔍</span>
-            <input type="text" id="modelSearchInput" class="modal-search-input" placeholder="Search all models..." autocomplete="off" />
-            <span class="kbd-badge">Ctrl+K</span>
-            <button class="clear-search-btn" id="btnClearModelSearch" style="display:none;">✕</button>
-          </div>
-          <div class="model-categories-scroll" id="modelCategoriesContainer">
-            <!-- Categories rendered dynamically -->
-          </div>
-        </div>
-
-        <!-- 5. Model Configuration Popover (Reasoning Effort, Fast Mode, Context/Billing) -->
-        <div class="popover-card" id="modelConfigPopover" style="width: 320px;">
-          <div class="config-popover-header">
-            <div class="config-popover-title">Model Configuration</div>
-            <div class="config-model-name" id="cfgActiveModelName">qwen3.8:27b</div>
-          </div>
-          
-          <div class="config-section">
-            <div class="config-section-label">REASONING EFFORT</div>
-            <div class="effort-segmented-bar" id="effortSegmentedBar">
-              <button class="effort-seg-btn" data-effort="minimal">Minimal</button>
-              <button class="effort-seg-btn" data-effort="low">Low</button>
-              <button class="effort-seg-btn active" data-effort="medium">Medium</button>
-              <button class="effort-seg-btn" data-effort="high">High</button>
-              <button class="effort-seg-btn" data-effort="extra_high">Extra High</button>
-            </div>
-          </div>
-
-          <div class="config-section">
-            <div class="fast-mode-row">
-              <div class="fast-mode-text">
-                <div class="fast-mode-title">Fast Mode</div>
-                <div class="fast-mode-desc">Prioritize generation speed and lower latency</div>
-              </div>
-              <label class="toggle-switch">
-                <input type="checkbox" id="chkFastMode" />
-                <span class="toggle-slider"></span>
-              </label>
-            </div>
-          </div>
-
-          <div class="config-section">
-            <div class="config-section-label">RESOURCE &amp; BILLING</div>
-            <div class="resource-card" id="cfgResourceCard">
-              <div class="resource-icon">🖥</div>
-              <div class="resource-details">
-                <div class="resource-title" id="cfgResourceTitle">Local Model (Ollama)</div>
-                <div class="resource-desc" id="cfgResourceDesc">100% On-Device / No API billing</div>
-              </div>
-            </div>
-          </div>
-        </div>
+        ${getSlashCommandPopupMarkup()}
+        ${getModelSelectorMarkup({ compact: false })}
 
         <!-- Attached Chips Row -->
         <div class="composer-attached-row" id="attachedChipsRow" style="display:none;"></div>
+
+        <div class="lc-bypass-indicator" id="bypassModeBanner">
+          <span class="lc-bypass-indicator-left">${lucideSvg('shield-alert', 12)}<span>Bypass Permissions Active — Supported actions auto-approved (core security enforced)</span></span>
+          <button type="button" class="lc-bypass-reset-btn" id="btnResetBypass">Return to Normal</button>
+        </div>
 
         <div class="composer-modes-row">
           <button class="mode-tab active" data-mode="agent">Agent</button>
@@ -2258,68 +2696,106 @@ export class AgentWorkspaceEditorPanel {
           <div class="prompt-left-tools">
             <button class="tool-btn" id="btnAttachment" title="Add File / Context (Attach, Git, MCP, Rules, Skills)">+</button>
             <button class="tool-btn-pill" id="btnExecMode" title="Change Execution Mode">
-              <span id="execModeLabel">&lt;/&gt; Code</span>
-              <span class="pill-arrow">▾</span>
+              <span id="execModeLabel" class="lc-icon-gap">${lucideSvg('code', 13)}<span>Code</span></span>
+              <span class="pill-arrow">${lucideSvg('chevron-down', 11)}</span>
             </button>
             <button class="tool-btn-pill" id="btnPermMode" title="Change Security Permission Policy">
-              <span id="permModeLabel">🛡 Smart Approval</span>
-              <span class="pill-arrow">▾</span>
+              <span id="permModeLabel" class="lc-icon-gap">${lucideSvg('shield-check', 13)}<span>Smart Approval</span></span>
+              <span class="pill-arrow">${lucideSvg('chevron-down', 11)}</span>
             </button>
-            <div class="code-context-pill" id="btnWorkspaceContext" title="Current Workspace Folder">
-              <span>📁</span>
+            <button type="button" class="code-context-pill" id="btnWorkspaceContext" title="Choose Folder for Model to Work In">
+              ${lucideSvg('folder', 13)}
               <span id="promptWorkspaceLabel">workspace</span>
-            </div>
+              <span class="pill-arrow">${lucideSvg('chevron-down', 11)}</span>
+            </button>
           </div>
           <div class="prompt-right-tools">
-            <div class="model-selector-pill" id="modelSelector" title="Select AI Model (Ctrl+K)">
-              <span class="model-provider-icon" id="modelProviderIcon">🦙</span>
-              <span id="activeModelLabel">qwen3.8:27b</span>
-              <span class="pill-arrow">▾</span>
-            </div>
-            <div class="effort-selector-pill" id="btnEffortConfig" title="Configure Reasoning Effort &amp; Fast Mode">
-              <span id="activeEffortLabel">Medium</span>
-            </div>
-            <button class="tool-btn-icon" id="btnMic" title="Voice Input (Dictation)">🎙</button>
-            <button class="btn-send" id="btnSend" title="Send Prompt (Enter)">↑</button>
-            <button class="btn-stop" id="btnStop" style="display:none;" title="Stop Execution">■</button>
+            <button type="button" class="model-selector-pill" id="modelSelector" title="Select AI Model (Ctrl+K)">
+              <span class="model-provider-icon" id="modelProviderIcon"></span>
+              <span id="activeModelLabel">Select Model</span>
+              <span class="pill-arrow">${lucideSvg('chevron-down', 11)}</span>
+            </button>
+            <button type="button" class="effort-selector-pill" id="btnEffortConfig" title="Configure Model Effort &amp; Parameters">
+              <span id="activeEffortLabel">Params</span>
+              <span class="pill-arrow">${lucideSvg('chevron-down', 11)}</span>
+            </button>
+            <button type="button" class="tool-btn-icon" id="btnMic" title="Voice Input (Dictation)">${lucideSvg('mic', 14)}</button>
+            <button type="button" class="btn-send" id="btnSend" title="Send Prompt (Enter)">${lucideSvg('arrow-up', 14)}</button>
+            <button type="button" class="btn-stop" id="btnStop" style="display:none;" title="Stop Execution">${lucideSvg('square', 12, '', 'currentColor')}</button>
           </div>
         </div>
       </div>
     </main>
 
-    <!-- 3. RIGHT CHANGES & DIFF PANEL -->
-    <aside class="devin-changes" id="devinChanges">
-      <div class="changes-header-bar">
-        <div class="changes-title-row">
-          <span class="changes-title">Changes</span>
-          <span class="changes-stats-badge" id="changesStats">0 files</span>
-        </div>
-        <div class="changes-actions-row">
-          <button class="btn-action-sm btn-accept" id="btnAcceptAll">Accept All</button>
-          <button class="btn-action-sm btn-reject" id="btnRejectAll">Reject All</button>
-          <button class="btn-action-sm btn-review-critic" id="btnCriticReview">Critic Review</button>
-        </div>
+    <!-- 3. RIGHT INSPECTOR DOCK (TERMINAL | CHANGES PANEL — COLLAPSED BY DEFAULT) -->
+    <aside class="devin-changes lc-inspector-dock hidden" id="devinChanges">
+      <div class="lc-inspector-tabs" id="inspectorTabBar">
+        <button class="lc-inspector-tab" data-inspector-tab="terminal" id="tabBtnTerminal">
+          ${inspectorTabIcon('terminal')}
+          <span>Terminal</span>
+        </button>
+        <button class="lc-inspector-tab active" data-inspector-tab="changes" id="tabBtnChanges">
+          ${inspectorTabIcon('changes')}
+          <span>Changes</span>
+          <span class="lc-tab-count" id="changesCountBadge">0</span>
+        </button>
       </div>
 
-      <div class="changes-files-scroll" id="changesFilesList">
-        <!-- Changed files injected dynamically -->
-      </div>
-
-      <div class="diff-viewer-area">
-        <div class="diff-header-tab">
-          <span id="diffActiveFileLabel">No file selected</span>
-          <div class="diff-header-actions">
-            <button class="icon-btn-xs" id="btnRevertFile" title="Revert Changes to this File">↺ Revert</button>
-            <button class="icon-btn-xs" id="btnOpenInEditor" title="Open in VS Code Diff Editor">↗ Diff Editor</button>
+      <!-- AREA C: INTERACTIVE MULTI-TAB TERMINAL PANE -->
+      <div class="lc-inspector-pane" id="inspectorPaneTerminal">
+        <div class="lc-term-tabs-bar" id="termTabsBar"></div>
+        <div class="lc-term-meta-bar">
+          <span class="lc-term-cwd" id="termCwdLabel">workspace</span>
+          <div class="lc-term-controls">
+            <span class="lc-act-status-pill completed" id="termStatusBadge">Idle</span>
+            <button class="icon-btn-xs" id="btnTermStop" title="Terminate Running Process" style="display:none;">${lucideSvg('square', 11, '', 'currentColor')} <span>Stop</span></button>
+            <button class="icon-btn-xs" id="btnTermClear" title="Clear Terminal Output">${lucideSvg('trash-2', 12)}</button>
+            <button class="icon-btn-xs" id="btnTermNew" title="New Terminal Tab">${lucideSvg('plus', 13)}</button>
           </div>
         </div>
-        <div class="diff-code-scroll" id="diffCodeContainer">
-          <div class="diff-line info">// Select a changed file above to inspect live diff</div>
+        <div class="lc-term-output" id="termOutputScroll"></div>
+        <div class="lc-term-input-row">
+          <span class="lc-term-prompt-sym">$</span>
+          <input type="text" class="lc-term-input" id="termCmdInput" placeholder="Run command in workspace..." autocomplete="off" />
+          <button type="button" class="icon-btn-xs" id="btnTermRun" title="Run Command (Enter)">${lucideSvg('play', 11)}</button>
+        </div>
+      </div>
+
+      <!-- AREA D: CHANGES & DIFF VIEWER PANE -->
+      <div class="lc-inspector-pane active" id="inspectorPaneChanges">
+        <div class="changes-header-bar">
+          <div class="changes-title-row">
+            <span class="changes-title">Changes</span>
+            <span class="changes-stats-badge" id="changesStats">0 files</span>
+          </div>
+          <div class="changes-actions-row">
+            <button class="btn-action-sm btn-accept" id="btnAcceptAll">Accept All</button>
+            <button class="btn-action-sm btn-reject" id="btnRejectAll">Reject All</button>
+            <button class="btn-action-sm btn-review-critic" id="btnCriticReview">Critic Review</button>
+          </div>
+        </div>
+
+        <div class="changes-files-scroll" id="changesFilesList">
+          <!-- Changed files injected dynamically -->
+        </div>
+
+        <div class="diff-viewer-area">
+          <div class="diff-header-tab">
+            <span id="diffActiveFileLabel">No file selected</span>
+            <div class="diff-header-actions">
+              <button class="icon-btn-xs" id="btnRevertFile" title="Revert Changes to this File">${lucideSvg('rotate-ccw', 13)} <span>Revert</span></button>
+            </div>
+          </div>
+          <div class="diff-code-scroll" id="diffCodeContainer">
+            <div class="diff-line info">// Select a changed file above to inspect live diff</div>
+          </div>
         </div>
       </div>
     </aside>
 
   </div>
+
+  ${getCockpitModalMarkup(lucideSvg('x', 14))}
 
   <script>
     const vscode = acquireVsCodeApi();
@@ -2327,12 +2803,52 @@ export class AgentWorkspaceEditorPanel {
     let currentSession = null;
     let allSessionsList = [];
     let activePlan = [];
+    let planExplicit = false;
     let isWorking = false;
     let currentChanges = { totalFiles: 0, totalAdded: 0, totalRemoved: 0, files: [] };
     let selectedDiffFile = null;
+    let currentActivities = [];
+    let slashCommandsCatalog = [];
+    let currentCommandResults = [];
+    let ephemeralCommandResults = [];
+    let lastLoadedSessionId = null;
+    let activeActivityFilter = 'all';
+    const expandedActivityIds = new Set();
+    const expandedTurnIds = new Set();
+    const streamingMessages = {};
+    let liveStatusState = { active: false, phase: 'idle', summary: '' };
+    let activeInspectorTab = 'changes';
+    let terminalTabsState = [];
+    let activeTermTabId = null;
+    const termCmdHistory = [];
+    let termHistoryIdx = -1;
 
     const conversationFlow = document.getElementById('conversationFlow');
+    ${getLucideClientScript()}
+    ${getActivityClientScript()}
+    ${getSlashCommandClientScript()}
+    ${getSessionsBarClientScript()}
+    let sessionSortMode = 'recent';
+    let groupSessionsByFolder = false;
+    let sessionsRecentCollapsed = false;
+    const collapsedFolderGroups = new Set();
     const scrollContainer = document.getElementById('scrollContainer');
+    const floatingPromptBar = document.querySelector('.floating-prompt-bar');
+    let chatPinnedToBottom = true;
+    if (scrollContainer && typeof scrollContainer.addEventListener === 'function') {
+      scrollContainer.addEventListener('scroll', () => {
+        const gap = scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight;
+        chatPinnedToBottom = gap <= 32;
+      });
+    }
+    if (floatingPromptBar && scrollContainer && typeof ResizeObserver !== 'undefined') {
+      const promptBarResizeObserver = new ResizeObserver(() => {
+        if (chatPinnedToBottom) {
+          scrollContainer.scrollTop = scrollContainer.scrollHeight;
+        }
+      });
+      promptBarResizeObserver.observe(floatingPromptBar);
+    }
     const promptInput = document.getElementById('promptInput');
     const btnSend = document.getElementById('btnSend');
     const btnStop = document.getElementById('btnStop');
@@ -2343,36 +2859,276 @@ export class AgentWorkspaceEditorPanel {
     const activeModelLabel = document.getElementById('activeModelLabel');
     const modelSelector = document.getElementById('modelSelector');
 
-    // Panes
+    const btnWorkspaceContext = document.getElementById('btnWorkspaceContext');
+    if (btnWorkspaceContext) {
+      btnWorkspaceContext.addEventListener('click', (e) => {
+        e.stopPropagation();
+        vscode.postMessage({ command: 'selectWorkspace' });
+      });
+    }
+    if (topWorkspacePill) {
+      topWorkspacePill.addEventListener('click', (e) => {
+        e.stopPropagation();
+        vscode.postMessage({ command: 'selectWorkspace' });
+      });
+    }
+
+    // Panes & Inspector Tabs
     const devinSidebar = document.getElementById('devinSidebar');
     const devinChanges = document.getElementById('devinChanges');
     const btnToggleSidebar = document.getElementById('btnToggleSidebar');
+    const btnToggleActivity = document.getElementById('btnToggleActivity');
+    const btnToggleTerminal = document.getElementById('btnToggleTerminal');
     const btnToggleChanges = document.getElementById('btnToggleChanges');
     const btnSwitchToIde = document.getElementById('btnSwitchToIde');
+
+    function switchInspectorTab(tabName, forceShow = false) {
+      const targetTab = tabName === 'terminal' ? 'terminal' : 'changes';
+      activeInspectorTab = targetTab;
+      if (forceShow) devinChanges.classList.remove('hidden');
+      document.querySelectorAll('.lc-inspector-tab').forEach((btn) => {
+        btn.classList.toggle('active', btn.getAttribute('data-inspector-tab') === targetTab);
+      });
+      document.getElementById('inspectorPaneTerminal')?.classList.toggle('active', targetTab === 'terminal');
+      document.getElementById('inspectorPaneChanges')?.classList.toggle('active', targetTab === 'changes');
+      if (targetTab === 'terminal') {
+        const termInput = document.getElementById('termCmdInput');
+        if (termInput) setTimeout(() => termInput.focus(), 20);
+      }
+    }
+
+    document.querySelectorAll('.lc-inspector-tab').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        switchInspectorTab(btn.getAttribute('data-inspector-tab') || 'changes', true);
+      });
+    });
 
     btnToggleSidebar.addEventListener('click', () => {
       devinSidebar.classList.toggle('hidden');
     });
+    if (btnToggleActivity) {
+      btnToggleActivity.addEventListener('click', () => {
+        if (devinChanges.classList.contains('hidden') || activeInspectorTab !== 'activity') {
+          switchInspectorTab('activity', true);
+        } else {
+          devinChanges.classList.add('hidden');
+        }
+      });
+    }
+    if (btnToggleTerminal) {
+      btnToggleTerminal.addEventListener('click', () => {
+        if (devinChanges.classList.contains('hidden') || activeInspectorTab !== 'terminal') {
+          switchInspectorTab('terminal', true);
+        } else {
+          devinChanges.classList.add('hidden');
+        }
+      });
+    }
     btnToggleChanges.addEventListener('click', () => {
-      devinChanges.classList.toggle('hidden');
+      if (devinChanges.classList.contains('hidden') || activeInspectorTab !== 'changes') {
+        switchInspectorTab('changes', true);
+      } else {
+        devinChanges.classList.add('hidden');
+      }
     });
     btnSwitchToIde.addEventListener('click', () => {
       vscode.postMessage({ command: 'switchToIde' });
     });
 
-    // Nav items
-    document.getElementById('navSecurity').addEventListener('click', () => vscode.postMessage({ command: 'openSecurity' }));
-    document.getElementById('navReview').addEventListener('click', () => vscode.postMessage({ command: 'openReview' }));
-    document.getElementById('navWiki').addEventListener('click', () => vscode.postMessage({ command: 'openWiki' }));
-    document.getElementById('navCustomize').addEventListener('click', () => vscode.postMessage({ command: 'openAgents' }));
-    const navAgents = document.getElementById('navAgents');
-    if (navAgents) {
-      navAgents.addEventListener('click', () => vscode.postMessage({ command: 'openAgents' }));
-    }
-    document.getElementById('navMcp').addEventListener('click', () => vscode.postMessage({ command: 'openMcp' }));
+    // Activity Filter Pills
+    document.querySelectorAll('#activityFilterRow .lc-filter-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('#activityFilterRow .lc-filter-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        activeActivityFilter = btn.getAttribute('data-act-filter') || 'all';
+        renderActivityPane();
+      });
+    });
 
-    // Session search
+    // Terminal Interactive Controls
+    const termCmdInput = document.getElementById('termCmdInput');
+    const termOutputScroll = document.getElementById('termOutputScroll');
+    const btnTermRun = document.getElementById('btnTermRun');
+    const btnTermNew = document.getElementById('btnTermNew');
+    const btnTermClear = document.getElementById('btnTermClear');
+    const btnTermStop = document.getElementById('btnTermStop');
+
+    function submitTerminalCommand() {
+      if (!termCmdInput) return;
+      const cmd = termCmdInput.value;
+      if (!activeTermTabId && terminalTabsState && terminalTabsState.length > 0) {
+        activeTermTabId = terminalTabsState[0].id;
+      }
+      if (!activeTermTabId) return;
+      const activeTab = terminalTabsState.find((t) => t.id === activeTermTabId);
+      const isRunningTab = activeTab && activeTab.status === 'running';
+      if (!cmd.trim() && !isRunningTab) return;
+      if (cmd.trim()) {
+        termCmdHistory.push(cmd);
+        termHistoryIdx = termCmdHistory.length;
+      }
+      termCmdInput.value = '';
+      vscode.postMessage({ command: 'runTerminalCommand', tabId: activeTermTabId, cmd: cmd });
+    }
+
+    if (btnTermNew) {
+      btnTermNew.addEventListener('click', () => {
+        vscode.postMessage({ command: 'createTerminalTab' });
+        if (termCmdInput) setTimeout(() => termCmdInput.focus(), 40);
+      });
+    }
+    if (btnTermClear) {
+      btnTermClear.addEventListener('click', () => {
+        if (activeTermTabId) vscode.postMessage({ command: 'clearTerminalTab', tabId: activeTermTabId });
+      });
+    }
+    if (btnTermStop) {
+      btnTermStop.addEventListener('click', () => {
+        if (activeTermTabId) vscode.postMessage({ command: 'terminateTerminalTab', tabId: activeTermTabId });
+      });
+    }
+    if (btnTermRun) {
+      btnTermRun.addEventListener('click', () => {
+        submitTerminalCommand();
+        if (termCmdInput) termCmdInput.focus();
+      });
+    }
+    if (termOutputScroll && termCmdInput) {
+      termOutputScroll.addEventListener('click', () => {
+        const sel = typeof window !== 'undefined' && typeof window.getSelection === 'function'
+          ? String(window.getSelection()?.toString() || '')
+          : '';
+        if (!sel) termCmdInput.focus();
+      });
+    }
+    if (termCmdInput) {
+      termCmdInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.isComposing) {
+          e.preventDefault();
+          submitTerminalCommand();
+        } else if (e.key === 'ArrowUp') {
+          if (termCmdHistory.length > 0 && termHistoryIdx > 0) {
+            e.preventDefault();
+            termHistoryIdx--;
+            termCmdInput.value = termCmdHistory[termHistoryIdx] || '';
+          }
+        } else if (e.key === 'ArrowDown') {
+          if (termHistoryIdx < termCmdHistory.length - 1) {
+            e.preventDefault();
+            termHistoryIdx++;
+            termCmdInput.value = termCmdHistory[termHistoryIdx] || '';
+          } else {
+            termHistoryIdx = termCmdHistory.length;
+            termCmdInput.value = '';
+          }
+        }
+      });
+    }
+
+    // Sidebar header actions (stay inside single Agent tab)
+    const sessionsFilterBar = document.getElementById('sessionsFilterBar');
+    const btnHeaderFilter = document.getElementById('btnHeaderFilter');
+    const btnHeaderMore = document.getElementById('btnHeaderMore');
+    const sessionsMoreMenu = document.getElementById('sessionsMoreMenu');
+
+    document.getElementById('btnSearchHeader')?.addEventListener('click', () => {
+      if (sessionsFilterBar) sessionsFilterBar.classList.add('open');
+      if (btnHeaderFilter) btnHeaderFilter.classList.add('active');
+      document.getElementById('sessionSearchInput')?.focus();
+    });
+    document.getElementById('btnSettingsHeader')?.addEventListener('click', () => {
+      requestCockpitModal('settings');
+    });
+
+    // Nav items
+    document.getElementById('navSecurity')?.addEventListener('click', () => vscode.postMessage({ command: 'openSecurity' }));
+    document.getElementById('navReview')?.addEventListener('click', () => vscode.postMessage({ command: 'openReview' }));
+    document.getElementById('navWiki')?.addEventListener('click', () => vscode.postMessage({ command: 'openWiki' }));
+    document.getElementById('navCustomize')?.addEventListener('click', () => vscode.postMessage({ command: 'openAgents' }));
+    document.getElementById('navAgents')?.addEventListener('click', () => vscode.postMessage({ command: 'openAgents' }));
+    document.getElementById('navMcp')?.addEventListener('click', () => vscode.postMessage({ command: 'openMcp' }));
+
+    // Session search & filter bar
     const sessionSearchInput = document.getElementById('sessionSearchInput');
+    function syncSessionsFilterUI() {
+      document.getElementById('pillSortRecent')?.classList.toggle('active', sessionSortMode === 'recent');
+      document.getElementById('pillSortAlpha')?.classList.toggle('active', sessionSortMode === 'alpha');
+      document.getElementById('pillGroupFolder')?.classList.toggle('active', groupSessionsByFolder);
+      const sortLbl = document.getElementById('sessSortMenuLabel');
+      if (sortLbl) sortLbl.textContent = sessionSortMode === 'recent' ? 'Sort: Alphabetical' : 'Sort: Most Recent';
+      const grpLbl = document.getElementById('sessGroupMenuLabel');
+      if (grpLbl) grpLbl.textContent = groupSessionsByFolder ? 'Ungroup Sessions' : 'Group by Folder';
+    }
+    if (btnHeaderFilter) {
+      btnHeaderFilter.addEventListener('click', (e) => {
+        e.stopPropagation();
+        sessionsMoreMenu?.classList.remove('open');
+        const nextOpen = sessionsFilterBar ? !sessionsFilterBar.classList.contains('open') : false;
+        sessionsFilterBar?.classList.toggle('open', nextOpen);
+        btnHeaderFilter.classList.toggle('active', nextOpen);
+        if (nextOpen) {
+          sessionSearchInput?.focus();
+        } else if (sessionSearchInput && sessionSearchInput.value) {
+          sessionSearchInput.value = '';
+          renderSessionsList('');
+        }
+      });
+    }
+    if (btnHeaderMore && sessionsMoreMenu) {
+      btnHeaderMore.addEventListener('click', (e) => {
+        e.stopPropagation();
+        syncSessionsFilterUI();
+        sessionsMoreMenu.classList.toggle('open');
+      });
+      document.addEventListener('click', (e) => {
+        if (!sessionsMoreMenu.contains(e.target) && e.target !== btnHeaderMore) {
+          sessionsMoreMenu.classList.remove('open');
+        }
+      });
+      sessionsMoreMenu.querySelectorAll('.lc-sessions-menu-item[data-sess-action]').forEach((item) => {
+        item.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const act = item.getAttribute('data-sess-action');
+          sessionsMoreMenu.classList.remove('open');
+          if (act === 'new') {
+            vscode.postMessage({ command: 'newSession' });
+          } else if (act === 'toggleGroup') {
+            groupSessionsByFolder = !groupSessionsByFolder;
+            syncSessionsFilterUI();
+            renderSessionsList(sessionSearchInput?.value.trim() || '');
+          } else if (act === 'toggleSort') {
+            sessionSortMode = sessionSortMode === 'recent' ? 'alpha' : 'recent';
+            syncSessionsFilterUI();
+            renderSessionsList(sessionSearchInput?.value.trim() || '');
+          } else if (act === 'renameActive' && currentSession?.id) {
+            beginInlineSessionRename(currentSession.id);
+          } else if (act === 'deleteActive' && currentSession?.id) {
+            confirmingDeleteSessionId = currentSession.id;
+            renderSessionsList(sessionSearchInput?.value.trim() || '');
+          }
+        });
+      });
+    }
+    document.getElementById('pillSortRecent')?.addEventListener('click', () => {
+      sessionSortMode = 'recent';
+      syncSessionsFilterUI();
+      renderSessionsList(sessionSearchInput?.value.trim() || '');
+    });
+    document.getElementById('pillSortAlpha')?.addEventListener('click', () => {
+      sessionSortMode = 'alpha';
+      syncSessionsFilterUI();
+      renderSessionsList(sessionSearchInput?.value.trim() || '');
+    });
+    document.getElementById('pillGroupFolder')?.addEventListener('click', () => {
+      groupSessionsByFolder = !groupSessionsByFolder;
+      syncSessionsFilterUI();
+      renderSessionsList(sessionSearchInput?.value.trim() || '');
+    });
+    document.getElementById('btnToggleRecentGroup')?.addEventListener('click', () => {
+      sessionsRecentCollapsed = !sessionsRecentCollapsed;
+      const listEl = document.getElementById('sessionsList');
+      if (listEl) listEl.style.display = sessionsRecentCollapsed ? 'none' : 'flex';
+    });
     if (sessionSearchInput) {
       sessionSearchInput.addEventListener('input', () => {
         renderSessionsList(sessionSearchInput.value.trim());
@@ -2383,15 +3139,23 @@ export class AgentWorkspaceEditorPanel {
     let activeComposerMode = 'agent';
     document.querySelectorAll('.mode-tab').forEach((tab) => {
       tab.addEventListener('click', () => {
-        document.querySelectorAll('.mode-tab').forEach(t => t.classList.remove('active'));
-        tab.classList.add('active');
-        activeComposerMode = tab.getAttribute('data-mode') || 'agent';
+        const m = tab.getAttribute('data-mode') || 'agent';
+        activeComposerMode = m;
+        document.querySelectorAll('.mode-tab').forEach((t) => t.classList.toggle('active', t === tab));
+        if (m === 'review') {
+          if (typeof switchInspectorTab === 'function') switchInspectorTab('changes');
+          vscode.postMessage({ command: 'reviewCritic' });
+          return;
+        }
+        const mappedExec = m === 'plan' ? 'plan' : m === 'ask' ? 'ask' : 'code';
+        setExecutionModeUI(mappedExec);
+        vscode.postMessage({ command: 'setExecutionMode', executionMode: mappedExec });
       });
     });
 
     // New Session
-    document.getElementById('btnNewSession').addEventListener('click', () => vscode.postMessage({ command: 'newSession' }));
-    document.getElementById('btnHeaderNewSession').addEventListener('click', () => vscode.postMessage({ command: 'newSession' }));
+    document.getElementById('btnNewSession')?.addEventListener('click', () => vscode.postMessage({ command: 'newSession' }));
+    document.getElementById('btnHeaderNewSession')?.addEventListener('click', () => vscode.postMessage({ command: 'newSession' }));
 
     // Changes actions
     document.getElementById('btnAcceptAll').addEventListener('click', () => vscode.postMessage({ command: 'acceptAll' }));
@@ -2404,9 +3168,32 @@ export class AgentWorkspaceEditorPanel {
         vscode.postMessage({ command: 'rejectFile', path: selectedDiffFile });
       });
     }
-    document.getElementById('btnOpenInEditor').addEventListener('click', () => {
-      if (selectedDiffFile) {
-        vscode.postMessage({ command: 'openDiff', path: selectedDiffFile });
+
+    const slashPopupEl = document.getElementById('slashCommandPopup');
+    function dispatchSlashCommand(rawCmd) {
+      if (!rawCmd) return;
+      if (slashCtrl) slashCtrl.close();
+      promptInput.value = '';
+      promptInput.style.height = 'auto';
+      vscode.postMessage({ command: 'runSlashCommand', text: rawCmd });
+    }
+
+    const slashCtrl = lcCreateSlashController({
+      promptEl: promptInput,
+      popupEl: slashPopupEl,
+      getCatalog: () => slashCommandsCatalog,
+      getModels: () => (typeof cachedAllModelsList !== 'undefined' ? cachedAllModelsList : []),
+      onSubmitSlash: (cmdLine) => dispatchSlashCommand(cmdLine),
+    });
+
+    document.getElementById('btnResetBypass')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      dispatchSlashCommand('/normal');
+    });
+
+    document.addEventListener('click', (e) => {
+      if (slashPopupEl && !slashPopupEl.contains(e.target) && e.target !== promptInput) {
+        slashCtrl.close();
       }
     });
 
@@ -2414,9 +3201,13 @@ export class AgentWorkspaceEditorPanel {
     promptInput.addEventListener('input', () => {
       promptInput.style.height = 'auto';
       promptInput.style.height = Math.min(promptInput.scrollHeight, 160) + 'px';
+      slashCtrl.refreshFromInput();
     });
 
     promptInput.addEventListener('keydown', (e) => {
+      if (slashCtrl.handleKeyDown(e)) {
+        return;
+      }
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         submitPrompt();
@@ -2432,17 +3223,19 @@ export class AgentWorkspaceEditorPanel {
       vscode.postMessage({ command: 'selectModel' });
     });
 
-    document.getElementById('btnAttachment').addEventListener('click', () => {
-      devinChanges.classList.remove('hidden');
-    });
-
     function submitPrompt() {
-      if (isWorking) return;
       const text = promptInput.value.trim();
       if (!text) return;
+      if (lcIsSlashCommandInput(text)) {
+        dispatchSlashCommand(text);
+        return;
+      }
+      if (isWorking) return;
+      slashCtrl.close();
       promptInput.value = '';
       promptInput.style.height = 'auto';
       isWorking = true;
+      liveStatusState = { active: true, phase: 'analyzing', summary: 'Analyzing the task' };
       updateStatusUI();
       vscode.postMessage({ command: 'sendMessage', text });
     }
@@ -2452,7 +3245,7 @@ export class AgentWorkspaceEditorPanel {
         btnSend.style.display = 'none';
         btnStop.style.display = 'flex';
         topStatusBadge.className = 'status-badge status-running';
-        topStatusBadge.textContent = 'Working...';
+        topStatusBadge.textContent = 'Running';
       } else {
         btnSend.style.display = 'flex';
         btnStop.style.display = 'none';
@@ -2462,48 +3255,216 @@ export class AgentWorkspaceEditorPanel {
     }
 
     function formatTimeAgo(ts) {
-      if (!ts) return '';
-      const diffSec = Math.floor((Date.now() - ts) / 1000);
-      if (diffSec < 60) return 'Just now';
-      if (diffSec < 3600) return Math.floor(diffSec / 60) + 'm ago';
-      if (diffSec < 86400) return Math.floor(diffSec / 3600) + 'h ago';
-      const days = Math.floor(diffSec / 86400);
-      return days + (days === 1 ? ' day ago' : ' days ago');
+      return lcFormatSessionTimeAgo(ts);
+    }
+
+    let renamingSessionId = null;
+    let confirmingDeleteSessionId = null;
+
+    function beginInlineSessionRename(sessionId) {
+      if (!sessionId) return;
+      confirmingDeleteSessionId = null;
+      renamingSessionId = sessionId;
+      renderSessionsList(document.getElementById('sessionSearchInput')?.value.trim() || '');
+    }
+
+    document.getElementById('btnRenameActiveSession')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (currentSession?.id) {
+        beginInlineSessionRename(currentSession.id);
+      }
+    });
+    document.getElementById('topSessionTitle')?.addEventListener('dblclick', () => {
+      if (currentSession?.id) {
+        beginInlineSessionRename(currentSession.id);
+      }
+    });
+
+    function buildSessionRowElement(s, filterQuery, isChild = false) {
+      const isRenaming = renamingSessionId === s.id;
+      const isConfirmingDelete = confirmingDeleteSessionId === s.id;
+      const isRunningSess = s.status === 'running';
+      const item = document.createElement('div');
+      item.className = 'lc-sess-row' +
+        (currentSession && s.id === currentSession.id ? ' active' : '') +
+        (isConfirmingDelete ? ' confirming' : '') +
+        (isChild ? ' child' : '');
+
+      const actionsHtml = isConfirmingDelete
+        ? '<button class="session-confirm-btn" type="button" title="Confirm delete">Delete</button>' +
+          '<button class="session-act-btn btn-cancel-delete" type="button" title="Cancel">' + lcIcon('x', 12) + '</button>'
+        : '<button class="session-act-btn btn-rename-session" type="button" title="Rename session">' + lcIcon('pencil', 12) + '</button>' +
+          '<button class="session-act-btn btn-delete-session" type="button" title="Delete session">' + lcIcon('trash-2', 12) + '</button>';
+
+      const titleHtml = isRenaming
+        ? '<input class="session-rename-input" type="text" value="' + escapeHtml(s.title) + '" />'
+        : '<div class="lc-sess-name" title="' + escapeHtml(s.title) + '">' + escapeHtml(s.title) + '</div>';
+
+      item.innerHTML =
+        '<span class="lc-sess-gutter"><span class="lc-sess-dot' + (isRunningSess ? ' running' : '') + '"></span></span>' +
+        '<div class="lc-sess-main">' +
+          '<div class="lc-sess-top">' +
+            titleHtml +
+            '<div class="lc-sess-row-actions">' + actionsHtml + '</div>' +
+          '</div>' +
+          '<div class="lc-sess-meta">' +
+            '<span class="lc-sess-meta-icon">' + lcIcon('session-node', 11) + '</span>' +
+            '<span class="lc-sess-time">' + escapeHtml(formatTimeAgo(s.updatedAt || s.createdAt)) + '</span>' +
+          '</div>' +
+        '</div>';
+
+      if (isRenaming) {
+        const input = item.querySelector('.session-rename-input');
+        let committed = false;
+        const finishRename = (save) => {
+          if (committed) return;
+          committed = true;
+          const nextTitle = input ? input.value.trim() : '';
+          renamingSessionId = null;
+          if (save && nextTitle && nextTitle !== s.title) {
+            vscode.postMessage({ command: 'renameSession', sessionId: s.id, title: nextTitle });
+          } else {
+            renderSessionsList(filterQuery);
+          }
+        };
+        if (input) {
+          input.addEventListener('click', (e) => e.stopPropagation());
+          input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              finishRename(true);
+            } else if (e.key === 'Escape') {
+              e.preventDefault();
+              finishRename(false);
+            }
+          });
+          input.addEventListener('blur', () => finishRename(true));
+          setTimeout(() => {
+            input.focus();
+            input.select();
+          }, 0);
+        }
+      } else {
+        item.querySelector('.lc-sess-name')?.addEventListener('dblclick', (e) => {
+          e.stopPropagation();
+          beginInlineSessionRename(s.id);
+        });
+        item.querySelector('.btn-rename-session')?.addEventListener('click', (e) => {
+          e.stopPropagation();
+          beginInlineSessionRename(s.id);
+        });
+        item.querySelector('.btn-delete-session')?.addEventListener('click', (e) => {
+          e.stopPropagation();
+          renamingSessionId = null;
+          confirmingDeleteSessionId = s.id;
+          renderSessionsList(filterQuery);
+        });
+        item.querySelector('.session-confirm-btn')?.addEventListener('click', (e) => {
+          e.stopPropagation();
+          confirmingDeleteSessionId = null;
+          vscode.postMessage({ command: 'deleteSession', sessionId: s.id, confirmed: true });
+        });
+        item.querySelector('.btn-cancel-delete')?.addEventListener('click', (e) => {
+          e.stopPropagation();
+          confirmingDeleteSessionId = null;
+          renderSessionsList(filterQuery);
+        });
+        item.addEventListener('click', (e) => {
+          if (e.target.closest('.lc-sess-row-actions')) return;
+          confirmingDeleteSessionId = null;
+          vscode.postMessage({ command: 'switchSession', sessionId: s.id });
+        });
+      }
+
+      return item;
     }
 
     function renderSessionsList(filterQuery = '') {
       const container = document.getElementById('sessionsList');
+      if (!container) return;
       container.innerHTML = '';
-      const list = filterQuery
-        ? allSessionsList.filter(s => (s.title || '').toLowerCase().includes(filterQuery.toLowerCase()))
-        : allSessionsList;
+
+      let list = filterQuery
+        ? allSessionsList.filter((s) => (s.title || '').toLowerCase().includes(filterQuery.toLowerCase()))
+        : allSessionsList.slice();
+
+      if (sessionSortMode === 'alpha') {
+        list.sort((a, b) => (a.title || '').localeCompare(b.title || ''));
+      } else {
+        list.sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+      }
 
       if (list.length === 0) {
-        container.innerHTML = '<div style="padding:10px;font-size:11.5px;color:var(--text-muted);text-align:center;">No sessions found</div>';
+        container.innerHTML = '<div class="lc-sess-empty">No sessions found</div>';
+        return;
+      }
+
+      if (groupSessionsByFolder) {
+        const byFolder = new Map();
+        list.forEach((s) => {
+          const root = s.workspaceRoot || 'Workspace';
+          const folderLabel = root.split(/[\\/]/).filter(Boolean).pop() || 'Workspace';
+          if (!byFolder.has(folderLabel)) byFolder.set(folderLabel, []);
+          byFolder.get(folderLabel).push(s);
+        });
+
+        for (const [folderName, groupItems] of byFolder.entries()) {
+          if (groupItems.length === 1) {
+            container.appendChild(buildSessionRowElement(groupItems[0], filterQuery, false));
+            continue;
+          }
+          const isCollapsed = collapsedFolderGroups.has(folderName);
+          const groupHdr = document.createElement('div');
+          groupHdr.className = 'lc-sess-group-header';
+          const latestTs = groupItems[0]?.updatedAt || groupItems[0]?.createdAt;
+          groupHdr.innerHTML =
+            '<span class="lc-sess-gutter">' + lcIcon(isCollapsed ? 'chevron-right' : 'chevron-down', 12) + '</span>' +
+            '<div class="lc-sess-main">' +
+              '<div class="lc-sess-top"><div class="lc-sess-name">' + escapeHtml(folderName) + ' (' + groupItems.length + ')</div></div>' +
+              '<div class="lc-sess-meta"><span class="lc-sess-meta-icon">' + lcIcon('session-node', 11) + '</span><span class="lc-sess-time">' + escapeHtml(formatTimeAgo(latestTs)) + '</span></div>' +
+            '</div>';
+          groupHdr.addEventListener('click', () => {
+            if (collapsedFolderGroups.has(folderName)) collapsedFolderGroups.delete(folderName);
+            else collapsedFolderGroups.add(folderName);
+            renderSessionsList(filterQuery);
+          });
+          container.appendChild(groupHdr);
+
+          if (!isCollapsed) {
+            const childrenWrap = document.createElement('div');
+            childrenWrap.className = 'lc-sess-group-children';
+            groupItems.forEach((s) => childrenWrap.appendChild(buildSessionRowElement(s, filterQuery, true)));
+            container.appendChild(childrenWrap);
+          }
+        }
         return;
       }
 
       list.forEach((s) => {
-        const item = document.createElement('div');
-        item.className = 'session-item' + (currentSession && s.id === currentSession.id ? ' active' : '');
-        item.innerHTML = '<div class="session-item-title">' + escapeHtml(s.title) + '</div>' +
-          '<div class="session-item-time">🕒 ' + formatTimeAgo(s.updatedAt || s.createdAt) + '</div>';
-        item.addEventListener('click', () => {
-          vscode.postMessage({ command: 'switchSession', sessionId: s.id });
-        });
-        container.appendChild(item);
+        container.appendChild(buildSessionRowElement(s, filterQuery, false));
       });
     }
 
     function renderChangesList() {
       const statsBadge = document.getElementById('changesStats');
       statsBadge.textContent = currentChanges.totalFiles + ' files +' + currentChanges.totalAdded + ' -' + currentChanges.totalRemoved;
+      const changesCountBadge = document.getElementById('changesCountBadge');
+      if (changesCountBadge) changesCountBadge.textContent = String(currentChanges.totalFiles || 0);
 
       const listContainer = document.getElementById('changesFilesList');
       listContainer.innerHTML = '';
       if (!currentChanges.files || currentChanges.files.length === 0) {
+        selectedDiffFile = null;
+        const lbl = document.getElementById('diffActiveFileLabel');
+        if (lbl) lbl.textContent = 'Select a file to view live diff';
+        const diffEl = document.getElementById('diffCodeContainer');
+        if (diffEl) diffEl.innerHTML = '<div class="diff-line info">// No diff available</div>';
         listContainer.innerHTML = '<div style="padding:10px;font-size:11.5px;color:#64748b;text-align:center;">No changes in workspace</div>';
         return;
+      }
+
+      if (selectedDiffFile && !currentChanges.files.some((f) => f.path === selectedDiffFile)) {
+        selectedDiffFile = null;
       }
 
       currentChanges.files.forEach((f) => {
@@ -2556,19 +3517,255 @@ export class AgentWorkspaceEditorPanel {
       });
     }
 
+    function renderActivityPane() {
+      const countBadge = document.getElementById('activityCountBadge');
+      if (countBadge) countBadge.textContent = String(currentActivities.length);
+
+      const planMini = document.getElementById('activityPlanMini');
+      if (planMini) {
+        if (activePlan && activePlan.length > 0) {
+          planMini.style.display = 'flex';
+          planMini.innerHTML = activePlan.map((p) => {
+            const done = p.status === 'completed';
+            return '<div class="lc-plan-mini-item' + (done ? ' completed' : '') + '">' +
+              '<span>' + escapeHtml(p.title || p.description) + '</span>' +
+              '<span class="lc-act-status-pill ' + escapeHtml(p.status === 'in_progress' ? 'running' : p.status) + '">' + escapeHtml(p.status) + '</span>' +
+              '</div>';
+          }).join('');
+        } else {
+          planMini.style.display = 'none';
+          planMini.innerHTML = '';
+        }
+      }
+
+      const feed = document.getElementById('activityFeedList');
+      if (!feed) return;
+
+      const filtered = currentActivities.filter((item) => {
+        if (activeActivityFilter === 'all') return true;
+        if (activeActivityFilter === 'tool') {
+          return item.category === 'tool' || item.category === 'mcp' || item.category === 'browser';
+        }
+        return item.category === activeActivityFilter;
+      });
+
+      if (filtered.length === 0) {
+        feed.innerHTML = '<div class="lc-empty-pane">' + lcIcon('zap', 20) + '<span>No activity recorded for this filter.</span></div>';
+        return;
+      }
+
+      feed.innerHTML = '';
+      filtered.forEach((item) => {
+        const card = lcBuildActivityCardElement(
+          item,
+          expandedActivityIds.has(item.id),
+          (id, isOpen) => {
+            if (isOpen) expandedActivityIds.add(id);
+            else expandedActivityIds.delete(id);
+          }
+        );
+        feed.appendChild(card);
+      });
+      feed.scrollTop = feed.scrollHeight;
+    }
+
+    document.getElementById('btnRefreshTelemetry')?.addEventListener('click', () => {
+      vscode.postMessage({ command: 'refreshSystemTelemetry' });
+    });
+
+    function telemetryLoadDotClass(pct) {
+      if (typeof pct !== 'number' || !Number.isFinite(pct)) return 'idle';
+      if (pct >= 90) return 'hot';
+      if (pct >= 75) return 'warn';
+      return '';
+    }
+
+    function renderSystemTelemetry(t) {
+      const container = document.getElementById('systemTelemetryMetrics');
+      if (!container || !t) return;
+      const parts = [];
+      const ol = t.ollama || {};
+      const activeList = Array.isArray(ol.activeModels) ? ol.activeModels : [];
+      const olLabel = ol.running
+        ? (activeList.length > 0 ? activeList.join(', ') + (ol.totalVramGb ? ' (' + ol.totalVramGb + ' GB VRAM)' : '') : 'Ollama Ready')
+        : 'Ollama Offline';
+      parts.push(
+        '<span class="lc-sys-badge local-runtime' + (ol.running ? '' : ' offline') + '" title="Local Ollama Runtime">' +
+        '<span class="lc-sys-dot ' + (ol.running ? '' : 'idle') + '"></span>' +
+        '<span class="lc-sys-k">LOCAL</span>' +
+        '<span class="lc-sys-v">' + escapeHtml(olLabel) + '</span>' +
+        '</span>'
+      );
+
+      if (t.cpu) {
+        const cpuPct = typeof t.cpu.usagePercent === 'number' ? t.cpu.usagePercent : 0;
+        parts.push(
+          '<span class="lc-sys-badge" title="' + escapeHtml(t.cpu.model || 'CPU') + ' (' + (t.cpu.cores || 0) + ' threads)">' +
+          lcIcon('cpu', 11) +
+          '<span class="lc-sys-dot ' + telemetryLoadDotClass(cpuPct) + '"></span>' +
+          '<span class="lc-sys-k">CPU</span>' +
+          '<span class="lc-sys-v">' + escapeHtml(t.cpu.shortModel || 'CPU') + ' (' + (t.cpu.cores || 0) + 'c) · ' + cpuPct + '%</span>' +
+          '</span>'
+        );
+      }
+
+      if (t.ram) {
+        const ramPct = typeof t.ram.usagePercent === 'number' ? t.ram.usagePercent : 0;
+        parts.push(
+          '<span class="lc-sys-badge" title="System Memory Used / Total">' +
+          lcIcon('server', 11) +
+          '<span class="lc-sys-dot ' + telemetryLoadDotClass(ramPct) + '"></span>' +
+          '<span class="lc-sys-k">RAM</span>' +
+          '<span class="lc-sys-v">' + (t.ram.usedGb ?? 0) + ' / ' + (t.ram.totalGb ?? 0) + ' GB (' + ramPct + '%)</span>' +
+          '</span>'
+        );
+      }
+
+      if (t.gpu) {
+        const usedGb = (t.gpu.memoryUsedMb / 1024).toFixed(1);
+        const totalGb = (t.gpu.memoryTotalMb / 1024).toFixed(1);
+        const vramPct = t.gpu.memoryTotalMb > 0 ? Math.round((t.gpu.memoryUsedMb / t.gpu.memoryTotalMb) * 100) : 0;
+        const util = typeof t.gpu.utilizationPercent === 'number' ? t.gpu.utilizationPercent : 0;
+        const tempStr = typeof t.gpu.temperatureC === 'number' ? ' · ' + t.gpu.temperatureC + '°C' : '';
+        parts.push(
+          '<span class="lc-sys-badge" title="' + escapeHtml(t.gpu.name || 'GPU') + ' | VRAM ' + t.gpu.memoryUsedMb + '/' + t.gpu.memoryTotalMb + ' MB">' +
+          lcIcon('zap', 11) +
+          '<span class="lc-sys-dot ' + telemetryLoadDotClass(Math.max(vramPct, util)) + '"></span>' +
+          '<span class="lc-sys-k">GPU</span>' +
+          '<span class="lc-sys-v">' + escapeHtml(t.gpu.shortName || 'GPU') + ' · ' + usedGb + ' / ' + totalGb + ' GB · ' + util + '%' + tempStr + '</span>' +
+          '</span>'
+        );
+      } else {
+        parts.push(
+          '<span class="lc-sys-badge" title="No discrete NVIDIA GPU detected via nvidia-smi">' +
+          lcIcon('zap', 11) +
+          '<span class="lc-sys-dot idle"></span>' +
+          '<span class="lc-sys-k">GPU</span>' +
+          '<span class="lc-sys-v">CPU / Integrated</span>' +
+          '</span>'
+        );
+      }
+
+      container.innerHTML = parts.join('');
+    }
+
+    function updateTerminalTabs(nextTabs) {
+      const prevIds = new Set((terminalTabsState || []).map((t) => t.id));
+      terminalTabsState = Array.isArray(nextTabs) ? nextTabs : [];
+      if (prevIds.size > 0) {
+        const addedTab = terminalTabsState.find((t) => !prevIds.has(t.id));
+        if (addedTab) {
+          activeTermTabId = addedTab.id;
+        }
+      }
+      renderTerminalPane();
+    }
+
+    function renderTerminalPane() {
+      const tabsBar = document.getElementById('termTabsBar');
+      const outputEl = document.getElementById('termOutputScroll');
+      const cwdEl = document.getElementById('termCwdLabel');
+      const statusEl = document.getElementById('termStatusBadge');
+      const stopBtn = document.getElementById('btnTermStop');
+      if (!tabsBar || !outputEl) return;
+
+      if (!terminalTabsState || terminalTabsState.length === 0) {
+        tabsBar.innerHTML = '';
+        outputEl.innerHTML = '<div class="lc-term-line system">Initializing terminal...</div>';
+        return;
+      }
+
+      let activeTab = terminalTabsState.find((t) => t.id === activeTermTabId);
+      if (!activeTab) {
+        activeTab = terminalTabsState[0];
+        activeTermTabId = activeTab.id;
+      }
+
+      tabsBar.innerHTML = '';
+      terminalTabsState.forEach((t) => {
+        const btn = document.createElement('div');
+        btn.className = 'lc-term-tab' + (t.id === activeTab.id ? ' active' : '');
+        btn.innerHTML = '<span>' + escapeHtml(t.name) + '</span>' +
+          (terminalTabsState.length > 1 ? '<span class="lc-term-tab-close" data-close-tab="' + escapeHtml(t.id) + '" title="Close">' + lcIcon('x', 11) + '</span>' : '');
+        btn.addEventListener('click', (e) => {
+          const closeEl = e.target.closest('[data-close-tab]');
+          if (closeEl) {
+            e.stopPropagation();
+            vscode.postMessage({ command: 'closeTerminalTab', tabId: t.id });
+            return;
+          }
+          activeTermTabId = t.id;
+          renderTerminalPane();
+        });
+        tabsBar.appendChild(btn);
+      });
+
+      if (cwdEl) cwdEl.textContent = activeTab.cwd || 'workspace';
+      if (statusEl) {
+        const st = activeTab.status || 'idle';
+        statusEl.className = 'lc-act-status-pill ' + (st === 'running' ? 'running' : st === 'failed' ? 'failed' : st === 'killed' ? 'cancelled' : 'completed');
+        statusEl.textContent = st === 'running' ? 'Running' : st === 'killed' ? 'Stopped' : st === 'failed' ? 'Failed' : 'Ready';
+      }
+      if (stopBtn) {
+        stopBtn.style.display = activeTab.status === 'running' ? 'inline-flex' : 'none';
+      }
+      if (termCmdInput) {
+        termCmdInput.placeholder = activeTab.status === 'running'
+          ? 'Send input to running process (Enter)...'
+          : 'Run command in workspace...';
+      }
+
+      outputEl.innerHTML = (activeTab.lines || []).map((line) => {
+        return '<div class="lc-term-line ' + escapeHtml(line.stream || 'stdout') + '">' + escapeHtml(line.text) + '</div>';
+      }).join('');
+      outputEl.scrollTop = outputEl.scrollHeight;
+    }
+
+    function createAssistantCardElement(msg) {
+      const card = document.createElement('div');
+      card.className = 'message-card ' + (msg.senderRole || 'assistant');
+      card.setAttribute('data-msg-id', msg.id || '');
+      card.innerHTML = '<div class="message-agent-wrap">' +
+        '<div class="agent-avatar">' + lcIcon('bot', 13) + '</div>' +
+        '<div class="agent-content-area">' +
+        '<div class="agent-header">' +
+        '<span class="agent-name">' + escapeHtml(msg.senderName || 'Main Agent') + '</span>' +
+        '</div>' +
+        '<div class="agent-text">' + formatMarkdown(msg.content) + '</div>' +
+        '</div>' +
+        '</div>';
+      return card;
+    }
+
+    function updateOrAppendSafeStatus() {
+      let row = document.getElementById('liveSafeStatusRow');
+      if (liveStatusState.active && isWorking) {
+        if (!row) {
+          row = document.createElement('div');
+          row.id = 'liveSafeStatusRow';
+          row.className = 'lc-live-status-row';
+          conversationFlow.appendChild(row);
+        }
+        row.innerHTML = '<span class="lc-status-pulse"></span>' +
+          '<span class="lc-live-status-text">' + escapeHtml(liveStatusState.summary || 'Agent is working') + '</span>';
+      } else if (row) {
+        row.remove();
+      }
+    }
+
     function renderFullConversation() {
       conversationFlow.innerHTML = '';
 
-      if (activePlan && activePlan.length > 0) {
+      if (planExplicit && activePlan && activePlan.length > 0) {
         const planCard = document.createElement('div');
         planCard.className = 'plan-card';
-        let planHtml = '<div class="plan-header"><span>Execution Checklist</span><span>' +
+        let planHtml = '<div class="plan-header"><span>Execution Plan</span><span>' +
           activePlan.filter(p => p.status === 'completed').length + '/' + activePlan.length + ' Done</span></div><ul class="plan-list">';
         activePlan.forEach((p) => {
           const isDone = p.status === 'completed';
           const badgeClass = p.status === 'completed' ? 'plan-completed' : p.status === 'in_progress' ? 'plan-in_progress' : 'plan-pending';
           planHtml += '<li class="plan-item' + (isDone ? ' completed' : '') + '">' +
-            '<span>' + escapeHtml(p.description) + '</span>' +
+            '<span>' + escapeHtml(p.description || p.title) + '</span>' +
             '<span class="plan-badge ' + badgeClass + '">' + p.status + '</span>' +
             '</li>';
         });
@@ -2577,68 +3774,149 @@ export class AgentWorkspaceEditorPanel {
         conversationFlow.appendChild(planCard);
       }
 
+      const displayMessages = [];
       if (currentSession && currentSession.messages) {
+        const seenIds = new Set();
+        let prevUserText = '';
         currentSession.messages.forEach((msg) => {
-          const card = document.createElement('div');
-          card.className = 'message-card ' + msg.senderRole;
-
+          if (msg.id) {
+            if (seenIds.has(msg.id)) return;
+            seenIds.add(msg.id);
+          }
           if (msg.senderRole === 'user') {
-            card.innerHTML = '<div class="message-user-bubble">' + escapeHtml(msg.content) + '</div>';
+            const trimmed = (msg.content || '').trim();
+            if (trimmed && trimmed === prevUserText) {
+              return;
+            }
+            prevUserText = trimmed;
           } else {
-            const avatarLetter = (msg.senderName || 'LC').substring(0, 2).toUpperCase();
-            card.innerHTML = '<div class="message-agent-wrap">' +
-              '<div class="agent-avatar">' + avatarLetter + '</div>' +
-              '<div class="agent-content-area">' +
-              '<div class="agent-header">' +
-              '<span class="agent-name">' + escapeHtml(msg.senderName || 'Main Agent') + '</span>' +
-              '<span class="agent-role-pill">' + escapeHtml(msg.senderRole || 'agent') + '</span>' +
-              '</div>' +
-              '<div class="agent-text">' + formatMarkdown(msg.content) + '</div>' +
-              '</div>' +
-              '</div>';
+            prevUserText = '';
           }
+          displayMessages.push(msg);
+        });
+      }
+
+      const turnGrouping = lcGroupActivitiesByUserTurn(displayMessages, currentActivities);
+      let renderedLatestLiveBlock = false;
+
+      const mergedCmdMap = new Map();
+      (Array.isArray(currentCommandResults) ? currentCommandResults : []).forEach((cr) => {
+        if (cr && cr.id) mergedCmdMap.set(cr.id, cr);
+      });
+      (Array.isArray(ephemeralCommandResults) ? ephemeralCommandResults : []).forEach((cr) => {
+        if (cr && cr.id) mergedCmdMap.set(cr.id, cr);
+      });
+      const allCmdResults = Array.from(mergedCmdMap.values()).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+      let nextCmdIdx = 0;
+      const appendCmdCard = (cr) => {
+        conversationFlow.appendChild(lcBuildCommandResultElement(cr, {
+          onConfirm: (commandLine, cardId) => {
+            ephemeralCommandResults = ephemeralCommandResults.filter((x) => x.id !== cardId);
+            vscode.postMessage({ command: 'confirmSlashCommand', text: commandLine });
+          },
+          onCancel: (cardId) => {
+            ephemeralCommandResults = ephemeralCommandResults.filter((x) => x.id !== cardId);
+            renderFullConversation();
+          },
+        }));
+      };
+
+      displayMessages.forEach((msg, idx) => {
+        const msgTs = msg.timestamp || 0;
+        while (nextCmdIdx < allCmdResults.length && msgTs > 0 && (allCmdResults[nextCmdIdx].timestamp || 0) <= msgTs) {
+          appendCmdCard(allCmdResults[nextCmdIdx++]);
+        }
+        if (msg.senderRole === 'user') {
+          const card = document.createElement('div');
+          card.className = 'message-card user';
+          card.setAttribute('data-msg-id', msg.id || '');
+          card.innerHTML = '<div class="message-user-bubble">' + escapeHtml(msg.content) + '</div>';
           conversationFlow.appendChild(card);
-        });
+
+          const turnActs = turnGrouping.byMsgIndex[idx] || [];
+          const isLatestTurn = idx === turnGrouping.lastTurnMsgIndex;
+          const turnPlan = isLatestTurn && !planExplicit ? activePlan : [];
+          if (turnActs.length > 0 || (isLatestTurn && isWorking) || turnPlan.length > 0) {
+            if (isLatestTurn && isWorking) renderedLatestLiveBlock = true;
+            const turnKey = msg.id || ('turn_' + idx);
+            conversationFlow.appendChild(lcBuildInlineThinkingGroup({
+              turnKey,
+              activities: turnActs,
+              planItems: turnPlan,
+              isLive: isLatestTurn && isWorking,
+              isExpanded: expandedTurnIds.has(turnKey),
+              statusSummary: isLatestTurn ? liveStatusState.summary : '',
+              expandedActivityIds,
+              onToggleTurn: (k, open) => {
+                if (open) expandedTurnIds.add(k);
+                else expandedTurnIds.delete(k);
+              },
+              onToggleActivity: (id, open) => {
+                if (open) expandedActivityIds.add(id);
+                else expandedActivityIds.delete(id);
+              },
+            }));
+          }
+        } else {
+          conversationFlow.appendChild(createAssistantCardElement(msg));
+        }
+      });
+
+      if (turnGrouping.lastTurnMsgIndex === -1 && (currentActivities.length > 0 || isWorking)) {
+        if (isWorking) renderedLatestLiveBlock = true;
+        conversationFlow.appendChild(lcBuildInlineThinkingGroup({
+          turnKey: 'turn_fallback',
+          activities: currentActivities,
+          planItems: !planExplicit ? activePlan : [],
+          isLive: isWorking,
+          isExpanded: expandedTurnIds.has('turn_fallback'),
+          statusSummary: liveStatusState.summary,
+          expandedActivityIds,
+          onToggleTurn: (k, open) => {
+            if (open) expandedTurnIds.add(k);
+            else expandedTurnIds.delete(k);
+          },
+          onToggleActivity: (id, open) => {
+            if (open) expandedActivityIds.add(id);
+            else expandedActivityIds.delete(id);
+          },
+        }));
       }
 
-      if (currentSession && currentSession.executionGroups && currentSession.executionGroups.length > 0) {
-        currentSession.executionGroups.forEach((eg) => {
-          const groupCard = document.createElement('div');
-          groupCard.className = 'execution-group-card';
-          const durationStr = formatDuration(eg.durationMs || (eg.completedAt ? eg.completedAt - eg.startedAt : Date.now() - eg.startedAt));
-          let detailsHtml = '';
-          if (eg.details && eg.details.length > 0) {
-            detailsHtml = eg.details.map(d => '<div class="cmd-row">Ran ' + escapeHtml(d) + '</div>').join('');
-          }
-          groupCard.innerHTML =
-            '<div class="execution-header">' +
-            '<div class="execution-title-wrap"><span class="chevron">›</span> <span>Worked for ' + durationStr + '</span></div>' +
-            '<span style="font-size:11px;color:var(--text-muted);">' + (eg.status || 'completed') + '</span>' +
-            '</div>' +
-            '<div class="execution-body">' + detailsHtml + '</div>';
-          const execHeader = groupCard.querySelector('.execution-header');
-          if (execHeader) {
-            execHeader.addEventListener('click', () => {
-              groupCard.classList.toggle('expanded');
-            });
-          }
-          conversationFlow.appendChild(groupCard);
-        });
+      while (nextCmdIdx < allCmdResults.length) {
+        appendCmdCard(allCmdResults[nextCmdIdx++]);
       }
 
-      const statusLine = document.createElement('div');
-      statusLine.className = 'agent-awaiting-line';
-      statusLine.style.cssText = 'display:flex;align-items:center;gap:8px;font-size:12px;color:#f59e0b;padding:8px 0;width:100%;';
-      statusLine.innerHTML = '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#f59e0b;"></span> <span>LocalCoders is awaiting instructions</span>';
-      conversationFlow.appendChild(statusLine);
+      // Render any active streaming assistant responses (in-place without duplicates)
+      Object.keys(streamingMessages).forEach((mId) => {
+        const sm = streamingMessages[mId];
+        if (sm && sm.content) {
+          conversationFlow.appendChild(createAssistantCardElement({
+            id: mId,
+            senderName: sm.agentName || 'Main Agent',
+            senderRole: sm.senderRole || 'assistant',
+            content: sm.content,
+          }));
+        }
+      });
 
-      const tipLine = document.createElement('div');
-      tipLine.className = 'agent-tip-line';
-      tipLine.style.cssText = 'font-size:11px;color:#64748b;padding-bottom:12px;width:100%;';
-      tipLine.textContent = 'Tip: Hide or show the sidebar (Ctrl B)';
-      conversationFlow.appendChild(tipLine);
+      if (!renderedLatestLiveBlock) {
+        updateOrAppendSafeStatus();
+      }
+
+      const hasMsgs = (currentSession && currentSession.messages && currentSession.messages.length > 0) || allCmdResults.length > 0 || Object.keys(streamingMessages).length > 0;
+      if (!hasMsgs && !isWorking) {
+        const wsName = document.getElementById('topWorkspacePill')?.textContent?.trim() || 'workspace';
+        const empty = document.createElement('div');
+        empty.className = 'lc-empty-workspace';
+        empty.innerHTML =
+          '<div class="lc-empty-workspace-title">' + escapeHtml(wsName) + '</div>' +
+          '<div class="lc-empty-workspace-sub">Enter a task or question below. Ctrl+K switches models.</div>';
+        conversationFlow.appendChild(empty);
+      }
 
       scrollContainer.scrollTop = scrollContainer.scrollHeight;
+      chatPinnedToBottom = true;
     }
 
     function formatDuration(ms) {
@@ -2677,9 +3955,11 @@ export class AgentWorkspaceEditorPanel {
     const cfgResourceDesc = document.getElementById('cfgResourceDesc');
     const chkFastMode = document.getElementById('chkFastMode');
 
-    let cachedGroupedModels = {};
+    let cachedGroupedModels = { local: [], cloud: [], providers: [] };
     let cachedConfig = {
-      modelId: 'qwen3.8:27b',
+      modelId: '',
+      modelName: '',
+      providerId: 'ollama',
       reasoningEffort: 'medium',
       fastMode: false,
       executionMode: 'code',
@@ -2755,136 +4035,11 @@ export class AgentWorkspaceEditorPanel {
         }, 50);
       } else if (e.key === 'Escape') {
         closeAllPopovers();
+        if (slashCtrl) slashCtrl.close();
       }
     });
 
-    // Model Search Filtering
-    modelSearchInput.addEventListener('input', () => {
-      const val = modelSearchInput.value.trim();
-      btnClearModelSearch.style.display = val ? 'block' : 'none';
-      renderModelCategories(cachedGroupedModels, val);
-    });
-
-    btnClearModelSearch.addEventListener('click', () => {
-      modelSearchInput.value = '';
-      btnClearModelSearch.style.display = 'none';
-      renderModelCategories(cachedGroupedModels, '');
-      modelSearchInput.focus();
-    });
-
-    function renderModelCategories(grouped, filterText = '') {
-      modelCategoriesContainer.innerHTML = '';
-      const filterLower = filterText.toLowerCase();
-
-      const categoryLabels = {
-        favorites: 'Favorites ★',
-        adaptive: 'Adaptive',
-        recently_used: 'Recently Used',
-        recommended: 'Recommended',
-        local: 'Local Models (Ollama)',
-        cloud: 'Cloud Models',
-      };
-
-      const providerIcons = {
-        ollama: '🦙',
-        anthropic: ' Claude',
-        openai: ' OpenAI',
-        gemini: ' Gemini',
-        custom: '🔌',
-      };
-
-      let totalRendered = 0;
-
-      for (const [catKey, label] of Object.entries(categoryLabels)) {
-        const list = grouped[catKey] || [];
-        const filteredList = list.filter(m => {
-          if (!filterLower) return true;
-          return m.name.toLowerCase().includes(filterLower) ||
-            m.providerName.toLowerCase().includes(filterLower) ||
-            (m.family && m.family.toLowerCase().includes(filterLower));
-        });
-
-        if (filteredList.length === 0) continue;
-
-        const catHeader = document.createElement('div');
-        catHeader.className = 'model-category-header';
-        catHeader.textContent = label;
-        modelCategoriesContainer.appendChild(catHeader);
-
-        for (const m of filteredList) {
-          totalRendered++;
-          const row = document.createElement('div');
-          const isSelected = m.id === cachedConfig.modelId || m.rawName === cachedConfig.modelId;
-          row.className = 'model-item-row' + (isSelected ? ' selected' : '');
-          
-          const icon = providerIcons[m.provider] || '⚡';
-          const isFav = m.category === 'favorite' || m.isFavorite;
-
-          row.innerHTML = 
-            '<div class="model-item-icon">' + icon + '</div>' +
-            '<div class="model-item-info">' +
-              '<div class="model-item-name-row">' +
-                '<span class="model-item-name">' + escapeHtml(m.name) + '</span>' +
-                (m.isLocal ? '<span class="model-tag local">Local</span>' : '') +
-                (m.isNew ? '<span class="model-tag new">New</span>' : '') +
-                (m.isFree ? '<span class="model-tag free">Free</span>' : '') +
-              '</div>' +
-              '<div class="model-item-meta-row">' +
-                '<span class="status-dot-available"></span>' +
-                '<span>' + (m.defaultEffort ? m.defaultEffort.charAt(0).toUpperCase() + m.defaultEffort.slice(1) : 'Medium') + '</span>' +
-                '<span>•</span>' +
-                '<span>' + (m.contextWindowLabel || '32k') + '</span>' +
-                (m.parameterSize ? '<span>• ' + escapeHtml(m.parameterSize) + '</span>' : '') +
-              '</div>' +
-            '</div>' +
-            '<button class="model-fav-btn' + (isFav ? ' is-fav' : '') + '" title="' + (isFav ? 'Remove Favorite' : 'Pin Favorite') + '">' +
-              (isFav ? '★' : '☆') +
-            '</button>' +
-            (isSelected ? '<div class="model-check">✓</div>' : '<div class="model-check"></div>');
-
-          row.addEventListener('click', (e) => {
-            if (e.target.closest('.model-fav-btn')) return;
-            selectModelItem(m);
-            closeAllPopovers();
-          });
-
-          const favBtn = row.querySelector('.model-fav-btn');
-          favBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            vscode.postMessage({ command: 'toggleFavorite', modelId: m.id });
-          });
-
-          modelCategoriesContainer.appendChild(row);
-        }
-      }
-
-      if (totalRendered === 0) {
-        modelCategoriesContainer.innerHTML = '<div style="padding: 24px; text-align: center; color: #64748b; font-size: 12px;">No models found matching "' + escapeHtml(filterText) + '"</div>';
-      }
-    }
-
-    function selectModelItem(m) {
-      cachedConfig.modelId = m.id;
-      cachedConfig.modelName = m.name;
-      activeModelLabel.textContent = m.name;
-      cfgActiveModelName.textContent = m.name;
-      const providerIcons = {
-        ollama: '🦙',
-        anthropic: ' Claude',
-        openai: ' OpenAI',
-        gemini: ' Gemini',
-        custom: '🔌',
-      };
-      modelProviderIcon.textContent = providerIcons[m.provider] || '⚡';
-      if (m.isLocal) {
-        cfgResourceTitle.textContent = 'Local Model (Ollama)';
-        cfgResourceDesc.textContent = '100% On-Device / No API billing';
-      } else {
-        cfgResourceTitle.textContent = m.providerName + ' API';
-        cfgResourceDesc.textContent = (m.contextWindowLabel || '200k') + ' context window';
-      }
-      vscode.postMessage({ command: 'selectModel', modelId: m.id, modelName: m.name, provider: m.provider });
-    }
+    ${getModelSelectorScript({ modelLabelElementId: 'activeModelLabel' })}
 
     // Execution Mode Handling
     document.querySelectorAll('#execModePopover .popover-card-option[data-exec]').forEach((opt) => {
@@ -2901,13 +4056,17 @@ export class AgentWorkspaceEditorPanel {
       document.querySelectorAll('#execModePopover .popover-card-option[data-exec]').forEach((el) => {
         el.classList.toggle('active', el.getAttribute('data-exec') === mode);
       });
+      const tabTarget = mode === 'plan' ? 'plan' : mode === 'ask' ? 'ask' : 'agent';
+      document.querySelectorAll('.mode-tab').forEach((t) => {
+        t.classList.toggle('active', t.getAttribute('data-mode') === tabTarget);
+      });
       const labels = {
-        code: '</> Code',
-        smart: '✦ Smart',
-        ask: '💬 Ask',
-        plan: '📋 Plan',
+        code: lcIcon('code', 13) + '<span>Code</span>',
+        smart: lcIcon('sparkles', 13) + '<span>Smart</span>',
+        ask: lcIcon('message-square', 13) + '<span>Ask</span>',
+        plan: lcIcon('list-checks', 13) + '<span>Plan</span>',
       };
-      execModeLabel.textContent = labels[mode] || '</> Code';
+      execModeLabel.innerHTML = labels[mode] || (lcIcon('code', 13) + '<span>Code</span>');
     }
 
     // Permission Mode Handling
@@ -2929,25 +4088,21 @@ export class AgentWorkspaceEditorPanel {
       if (bypassOpt) {
         bypassOpt.classList.toggle('active', mode === 'bypass');
       }
+      const btnPerm = document.getElementById('btnPermMode');
+      if (btnPerm) {
+        btnPerm.classList.toggle('bypass-active', mode === 'bypass');
+      }
+      const bypassBanner = document.getElementById('bypassModeBanner');
+      if (bypassBanner) {
+        bypassBanner.classList.toggle('active', mode === 'bypass');
+      }
       const labels = {
-        ask: '🛡 Ask Before Actions',
-        smart: '🛡 Smart Approval',
-        bypass: '🛡 Bypass Permissions',
+        ask: lcIcon('shield', 13) + '<span>Ask Before Actions</span>',
+        smart: lcIcon('shield-check', 13) + '<span>Smart Approval</span>',
+        bypass: lcIcon('shield-alert', 13) + '<span>Bypass Permissions</span>',
       };
-      permModeLabel.textContent = labels[mode] || '🛡 Smart Approval';
+      permModeLabel.innerHTML = labels[mode] || (lcIcon('shield-check', 13) + '<span>Smart Approval</span>');
     }
-
-    // Reasoning Effort Handling
-    document.querySelectorAll('.effort-seg-btn').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const effort = btn.getAttribute('data-effort');
-        document.querySelectorAll('.effort-seg-btn').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-        cachedConfig.reasoningEffort = effort;
-        activeEffortLabel.textContent = effort.charAt(0).toUpperCase() + effort.slice(1).replace('_', ' ');
-        vscode.postMessage({ command: 'setReasoningEffort', effort });
-      });
-    });
 
     chkFastMode.addEventListener('change', () => {
       cachedConfig.fastMode = chkFastMode.checked;
@@ -2994,12 +4149,12 @@ export class AgentWorkspaceEditorPanel {
         const chip = document.createElement('div');
         chip.className = 'attached-chip';
         const isSpecial = filePath.includes(':');
-        const icon = isSpecial ? '⚡' : '📄';
+        const icon = isSpecial ? lcIcon('zap', 12) : lcIcon('file-text', 12);
         const label = isSpecial ? filePath : filePath.split('/').pop() || filePath;
-        chip.innerHTML = 
-          '<span>' + icon + '</span>' +
+        chip.innerHTML =
+          '<span style="display:inline-flex;align-items:center;">' + icon + '</span>' +
           '<span>' + escapeHtml(label) + '</span>' +
-          '<span class="attached-chip-remove" data-path="' + escapeHtml(filePath) + '" title="Remove">✕</span>';
+          '<span class="attached-chip-remove" data-path="' + escapeHtml(filePath) + '" title="Remove">' + lcIcon('x', 11) + '</span>';
 
         chip.querySelector('.attached-chip-remove').addEventListener('click', (e) => {
           e.stopPropagation();
@@ -3016,23 +4171,28 @@ export class AgentWorkspaceEditorPanel {
         case 'loadSession':
           currentSession = msg.session;
           allSessionsList = msg.allSessions || [];
+          cachedAllModelsList = msg.allModels || [];
+          if (Array.isArray(msg.slashCommands)) {
+            slashCommandsCatalog = msg.slashCommands;
+            if (slashCtrl && slashCtrl.isOpen()) {
+              slashCtrl.refreshFromInput();
+            }
+          }
           if (msg.workspaceName) {
-            topWorkspacePill.textContent = '🗁 ' + msg.workspaceName;
+            topWorkspacePill.innerHTML = lcIcon('folder-open', 13) + '<span>' + escapeHtml(msg.workspaceName) + '</span>';
             promptWorkspaceLabel.textContent = msg.workspaceName;
+            if (msg.workspacePath) {
+              topWorkspacePill.title = 'Working folder: ' + msg.workspacePath + ' (click to change)';
+              if (btnWorkspaceContext) {
+                btnWorkspaceContext.title = 'Working folder: ' + msg.workspacePath + ' (click to change)';
+              }
+            }
           }
           if (msg.currentConfig) {
             cachedConfig = Object.assign({}, cachedConfig, msg.currentConfig);
             if (msg.permissionMode) cachedConfig.permissionMode = msg.permissionMode;
-            activeModelLabel.textContent = cachedConfig.modelName || cachedConfig.modelId || 'qwen3.8:27b';
-            cfgActiveModelName.textContent = activeModelLabel.textContent;
             setExecutionModeUI(cachedConfig.executionMode || 'code');
             setPermissionModeUI(cachedConfig.permissionMode || 'smart');
-            if (cachedConfig.reasoningEffort) {
-              document.querySelectorAll('.effort-seg-btn').forEach(b => {
-                b.classList.toggle('active', b.getAttribute('data-effort') === cachedConfig.reasoningEffort);
-              });
-              activeEffortLabel.textContent = cachedConfig.reasoningEffort.charAt(0).toUpperCase() + cachedConfig.reasoningEffort.slice(1).replace('_', ' ');
-            }
             chkFastMode.checked = !!cachedConfig.fastMode;
             renderAttachedChips(cachedConfig.attachedFiles || []);
           }
@@ -3040,11 +4200,55 @@ export class AgentWorkspaceEditorPanel {
             cachedGroupedModels = msg.modelsGrouped;
             renderModelCategories(cachedGroupedModels, modelSearchInput.value.trim());
           }
+          {
+            const activeModel = cachedAllModelsList.find(
+              (m) => m.id === cachedConfig.modelId || m.modelIdentifier === cachedConfig.modelId
+            );
+            activeModelLabel.textContent = activeModel?.displayName || cachedConfig.modelName || cachedConfig.modelId || 'Select Model';
+            if (modelProviderIcon) {
+              modelProviderIcon.innerHTML = activeModel
+                ? getProviderSvgIcon(activeModel.providerType === 'LOCAL' ? (activeModel.providerId === 'ollama' ? 'ollama' : 'custom') : activeModel.providerId.split('-')[0])
+                : '';
+            }
+            updateModelConfigurationUI(activeModel);
+          }
+          {
+            const nextSessionId = currentSession ? currentSession.id : null;
+            if (lastLoadedSessionId !== nextSessionId) {
+              ephemeralCommandResults = [];
+              lastLoadedSessionId = nextSessionId;
+            }
+          }
           if (currentSession) {
             topSessionTitle.textContent = currentSession.title;
             isWorking = currentSession.status === 'running';
             activePlan = currentSession.plan || [];
+            planExplicit = !!currentSession.planExplicit;
+            currentActivities = Array.isArray(currentSession.activities) ? currentSession.activities : [];
+            currentCommandResults = Array.isArray(currentSession.commandResults) ? currentSession.commandResults : [];
+            liveStatusState = {
+              active: isWorking,
+              phase: currentSession.activePhase || (isWorking ? 'working' : 'idle'),
+              summary: currentSession.activePhaseSummary || '',
+            };
             renderFullConversation();
+            renderActivityPane();
+          } else {
+            topSessionTitle.textContent = 'No active session';
+            isWorking = false;
+            activePlan = [];
+            planExplicit = false;
+            currentActivities = [];
+            currentCommandResults = [];
+            liveStatusState = { active: false, phase: 'idle', summary: '' };
+            renderFullConversation();
+            renderActivityPane();
+          }
+          if (Array.isArray(msg.terminalTabs)) {
+            updateTerminalTabs(msg.terminalTabs);
+          }
+          if (msg.systemTelemetry) {
+            renderSystemTelemetry(msg.systemTelemetry);
           }
           renderSessionsList();
           if (msg.changesSummary) {
@@ -3073,19 +4277,92 @@ export class AgentWorkspaceEditorPanel {
           break;
 
         case 'addMessage':
-          if (currentSession) {
-            currentSession.messages.push(msg.message);
+          if (currentSession && currentSession.messages) {
+            const incoming = msg.message;
+            if (!incoming) break;
+            if (incoming.id && streamingMessages[incoming.id]) {
+              delete streamingMessages[incoming.id];
+            }
+            if (incoming.id && currentSession.messages.some(m => m.id === incoming.id)) {
+              renderFullConversation();
+              break;
+            }
+            if (incoming.senderRole === 'user' && currentSession.messages.length > 0) {
+              const last = currentSession.messages[currentSession.messages.length - 1];
+              if (last.senderRole === 'user' && (last.content || '').trim() === (incoming.content || '').trim()) {
+                break; // Ignore duplicate user message
+              }
+            }
+            currentSession.messages.push(incoming);
             renderFullConversation();
+          }
+          break;
+
+        case 'messageDelta': {
+          const ev = msg.event;
+          if (!ev || !ev.messageId) break;
+          streamingMessages[ev.messageId] = {
+            agentName: ev.agentName,
+            senderRole: ev.senderRole || 'assistant',
+            content: ev.fullContent || '',
+          };
+          const existingEl = conversationFlow.querySelector('.message-card[data-msg-id="' + ev.messageId + '"] .agent-text');
+          if (existingEl) {
+            existingEl.innerHTML = formatMarkdown(ev.fullContent || '');
+            scrollContainer.scrollTop = scrollContainer.scrollHeight;
+          } else {
+            renderFullConversation();
+          }
+          break;
+        }
+
+        case 'streamStatus': {
+          const ev = msg.event;
+          if (!ev) break;
+          const terminal = ev.phase === 'completed' || ev.phase === 'failed' || ev.phase === 'cancelled';
+          isWorking = !terminal;
+          liveStatusState = { active: !terminal, phase: ev.phase, summary: ev.summary || '' };
+          updateStatusUI();
+          const activeLabel = conversationFlow.querySelector('.lc-thinking-group:last-of-type .lc-thinking-label');
+          if (!terminal && activeLabel) {
+            const grouped = lcGroupActivitiesByUserTurn(currentSession?.messages || [], currentActivities);
+            const turnActs = grouped.lastTurnMsgIndex >= 0 ? (grouped.byMsgIndex[grouped.lastTurnMsgIndex] || []) : currentActivities;
+            activeLabel.textContent = lcFormatTurnThinkingLabel({
+              activities: turnActs,
+              isLive: true,
+              statusSummary: liveStatusState.summary,
+            });
+          } else {
+            renderFullConversation();
+          }
+          break;
+        }
+
+        case 'activityUpsert':
+          if (msg.item) {
+            currentActivities = lcUpsertActivityList(currentActivities, msg.item);
+            if (currentSession) currentSession.activities = currentActivities;
+            renderFullConversation();
+          }
+          break;
+
+        case 'terminalTabs':
+          updateTerminalTabs(msg.tabs);
+          break;
+
+        case 'systemTelemetry':
+          if (msg.telemetry) {
+            renderSystemTelemetry(msg.telemetry);
           }
           break;
 
         case 'planUpdate':
           activePlan = msg.plan || [];
+          if (msg.explicit !== undefined) planExplicit = !!msg.explicit;
           renderFullConversation();
           break;
 
         case 'activity':
-          renderFullConversation();
           break;
 
         case 'approvalRequest':
@@ -3097,13 +4374,68 @@ export class AgentWorkspaceEditorPanel {
             promptInput.focus();
           }
           break;
+
+        case 'switchInspectorTab':
+          if (typeof switchInspectorTab === 'function') {
+            switchInspectorTab(msg.tab || 'changes', msg.forceShow !== false);
+          }
+          break;
+
+        case 'slashCommandResult': {
+          const res = msg.result;
+          if (!res) break;
+          if (res.status === 'confirmation_required') {
+            ephemeralCommandResults = ephemeralCommandResults.filter(
+              (x) => x.status !== 'confirmation_required' || x.command !== res.command
+            );
+            ephemeralCommandResults.push(res);
+          } else if (res.command === 'clear' && res.ok) {
+            ephemeralCommandResults = [res];
+            currentCommandResults = [];
+          } else if (res.command === 'delete-session' && res.ok) {
+            ephemeralCommandResults = [res];
+          } else {
+            if (!currentCommandResults.some((x) => x.id === res.id)) {
+              currentCommandResults.push(res);
+            }
+          }
+          renderFullConversation();
+          if (res.uiAction) {
+            const act = res.uiAction.type;
+            if (act === 'openModelSelector' && typeof togglePopover === 'function' && typeof modelSelectorPopover !== 'undefined') {
+              togglePopover(modelSelectorPopover, modelSelector, true);
+              setTimeout(() => {
+                modelSearchInput?.focus();
+                modelSearchInput?.select();
+              }, 50);
+            } else if (act === 'openTerminal' && typeof switchInspectorTab === 'function') {
+              switchInspectorTab('terminal', true);
+            } else if (act === 'openChanges' && typeof switchInspectorTab === 'function') {
+              switchInspectorTab('changes', true);
+            } else if (act === 'focusSessions') {
+              if (devinSidebar) devinSidebar.classList.remove('hidden');
+              if (sessionsFilterBar) sessionsFilterBar.classList.add('open');
+              if (btnHeaderFilter) btnHeaderFilter.classList.add('active');
+              document.getElementById('sessionSearchInput')?.focus();
+            } else if (act === 'focusPrompt' && promptInput) {
+              promptInput.focus();
+            }
+          }
+          break;
+        }
+
+        case 'cockpitModalData':
+          renderCockpitModal(msg.modalType, msg.data);
+          break;
       }
     });
+
+    ${getCockpitModalScript()}
 
     function renderApprovalPrompt(req) {
       const card = document.createElement('div');
       card.className = 'approval-card';
-      card.innerHTML = '<div style="font-weight:700;color:#f59e0b;font-size:12.5px;">⚠️ Security Approval Required</div>' +
+      card.innerHTML = '<div style="font-weight:700;color:#f59e0b;font-size:12.5px;display:flex;align-items:center;gap:6px;">' + lcIcon('triangle-alert', 14) + '<span>Security Approval Required</span></div>' +
         '<div style="font-size:12px;color:#f1f5f9;">' + escapeHtml(req.description) + '</div>' +
         '<div style="font-family:monospace;font-size:11.5px;background:rgba(0,0,0,0.4);padding:6px 10px;border-radius:4px;color:#38bdf8;">' +
         escapeHtml(req.tool || req.toolName || 'tool') + ' ' + escapeHtml(JSON.stringify(req.args || req.params || {})) +
@@ -3136,29 +4468,7 @@ export class AgentWorkspaceEditorPanel {
     }
 
     function formatMarkdown(text) {
-      if (!text) return '';
-      let html = escapeHtml(text);
-      // Code blocks
-      const codeBlockRegex = new RegExp(String.fromCharCode(96, 96, 96) + '([\\\\s\\\\S]*?)' + String.fromCharCode(96, 96, 96), 'g');
-      html = html.replace(codeBlockRegex, (match, p1) => {
-        return '<pre><code>' + p1.trim() + '</code></pre>';
-      });
-      // Inline code
-      const tick = String.fromCharCode(96);
-      const parts = html.split(tick);
-      if (parts.length > 1) {
-        html = parts.map((part, index) => {
-          if (index % 2 === 1) {
-            return '<code>' + part + '</code>';
-          }
-          return part;
-        }).join('');
-      }
-      // Bold
-      html = html.replace(/\\*\\*(.*?)\\*\\*/g, '<strong>$1</strong>');
-      // Linebreaks
-      html = html.replace(/\\n/g, '<br/>');
-      return html;
+      return lcRenderMarkdown(text);
     }
   </script>
 </body>

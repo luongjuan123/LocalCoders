@@ -11,6 +11,9 @@ export interface WorkspaceSummary {
 
 export class CodebaseIndexer {
   private workspaceRoot: string;
+  private cachedSummary: WorkspaceSummary | null = null;
+  private cacheTimestamp = 0;
+  private static readonly CACHE_TTL_MS = 10_000;
 
   constructor(workspaceRoot: string) {
     this.workspaceRoot = workspaceRoot;
@@ -18,9 +21,18 @@ export class CodebaseIndexer {
 
   setWorkspace(root: string) {
     this.workspaceRoot = root;
+    this.cachedSummary = null;
+    this.cacheTimestamp = 0;
   }
 
-  async index(): Promise<WorkspaceSummary> {
+  async index(forceRefresh: boolean = false): Promise<WorkspaceSummary> {
+    if (
+      !forceRefresh &&
+      this.cachedSummary &&
+      Date.now() - this.cacheTimestamp < CodebaseIndexer.CACHE_TTL_MS
+    ) {
+      return this.cachedSummary;
+    }
     const rootName = path.basename(this.workspaceRoot);
     let packageDependencies: Record<string, string> = {};
     let projectType = 'general';
@@ -58,10 +70,10 @@ export class CodebaseIndexer {
         const rel = path.relative(dir, path.join(dir, entry.name));
 
         if (entry.isDirectory()) {
-          treeLines.push(`${indent}📁 ${entry.name}/`);
+          treeLines.push(`${indent}${entry.name}/`);
           await scan(path.join(dir, entry.name), depth + 1);
         } else {
-          treeLines.push(`${indent}📄 ${entry.name}`);
+          treeLines.push(`${indent}${entry.name}`);
           if (
             entry.name.endsWith('.json') ||
             entry.name.endsWith('.md') ||
@@ -82,13 +94,16 @@ export class CodebaseIndexer {
       // ignore
     }
 
-    return {
+    const result: WorkspaceSummary = {
       rootName,
       packageDependencies,
       projectType,
       keyFiles: keyFiles.slice(0, 20),
       fileTreeSummary: treeLines.slice(0, 60).join('\n'),
     };
+    this.cachedSummary = result;
+    this.cacheTimestamp = Date.now();
+    return result;
   }
 
   // Token budgeting estimation (~4 characters per token)

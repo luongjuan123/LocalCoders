@@ -30,26 +30,21 @@
         {
           "id": "localcoders-activitybar",
           "title": "LocalCoders",
-          "icon": "resources/icon.svg"
-        },
-        {
-          "id": "localcoders-agents-activitybar",
-          "title": "Agent Team",
-          "icon": "resources/icon.svg"
+          "icon": "resources/activitybar-icon.svg"
         }
       ],
       "secondarySidebar": [
         {
           "id": "localcoders-auxiliary",
           "title": "LocalCoders AI",
-          "icon": "resources/icon.svg"
+          "icon": "resources/activitybar-icon.svg"
         }
       ],
       "panel": [
         {
           "id": "localcoders-panel",
           "title": "LocalCoders Execution",
-          "icon": "resources/icon.svg"
+          "icon": "resources/activitybar-icon.svg"
         }
       ]
     },
@@ -61,8 +56,24 @@
           "name": "Sessions & Navigation"
         },
         {
+          "id": "localcoders.agentTeamView",
+          "name": "Agent Team"
+        },
+        {
+          "id": "localcoders.modelManagerView",
+          "name": "Model Manager"
+        },
+        {
+          "id": "localcoders.mcpServersView",
+          "name": "MCP Servers & Tools"
+        },
+        {
           "id": "localcoders.taskMonitorView",
           "name": "Task Monitor"
+        },
+        {
+          "id": "localcoders.criticReviewsView",
+          "name": "Critic Audits"
         },
         {
           "id": "localcoders.securityPermissionsView",
@@ -71,24 +82,6 @@
         {
           "id": "localcoders.projectMemoryView",
           "name": "Project Rules & Memory"
-        }
-      ],
-      "localcoders-agents-activitybar": [
-        {
-          "id": "localcoders.agentTeamView",
-          "name": "Agent Team"
-        },
-        {
-          "id": "localcoders.mcpServersView",
-          "name": "MCP Servers & Tools"
-        },
-        {
-          "id": "localcoders.modelManagerView",
-          "name": "Model Manager"
-        },
-        {
-          "id": "localcoders.criticReviewsView",
-          "name": "Critic Audits"
         }
       ],
       "localcoders-auxiliary": [
@@ -318,6 +311,16 @@
           "default": "http://127.0.0.1:11434",
           "description": "URL endpoint for local Ollama service"
         },
+        "localcoders.stopOllamaOnExit": {
+          "type": "boolean",
+          "default": true,
+          "description": "Stop all loaded Ollama models and local Ollama server processes when closing LocalCoders to free GPU/VRAM and memory"
+        },
+        "localcoders.autoStartOllamaOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically start local Ollama server on LocalCoders startup when installed and not yet running"
+        },
         "localcoders.mainAgentModel": {
           "type": "string",
           "default": "",
@@ -343,6 +346,12 @@
           "type": "boolean",
           "default": true,
           "description": "Require user approval before applying agent file modifications"
+        },
+        "localcoders.defaultPermissionMode": {
+          "type": "string",
+          "enum": ["ask", "smart", "bypass"],
+          "default": "smart",
+          "description": "Default permission policy for tool and terminal execution"
         },
         "localcoders.maxConcurrentSubagents": {
           "type": "number",

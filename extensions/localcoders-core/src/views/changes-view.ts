@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { ChangesManager, ChangesSummary, ChangedFile } from '../context/changes-manager';
+import { getLucideCss, lucideSvg } from './lucide-icons';
 
 export class ChangesViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'localcoders.changesView';
@@ -245,9 +246,12 @@ export class ChangesViewProvider implements vscode.WebviewViewProvider {
       gap: 10px;
     }
     .empty-icon {
-      font-size: 28px;
-      opacity: 0.5;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      opacity: 0.55;
     }
+    ${getLucideCss()}
   </style>
 </head>
 <body>
@@ -269,7 +273,7 @@ export class ChangesViewProvider implements vscode.WebviewViewProvider {
 
   <div class="files-list" id="files-list">
     <div class="empty-state">
-      <div class="empty-icon">✓</div>
+      <div class="empty-icon">${lucideSvg('circle-check', 24)}</div>
       <div>No changes yet</div>
     </div>
   </div>
@@ -304,7 +308,7 @@ export class ChangesViewProvider implements vscode.WebviewViewProvider {
       pillRem.textContent = '-' + summary.totalRemoved;
 
       if (!summary.files || summary.files.length === 0) {
-        filesList.innerHTML = '<div class="empty-state"><div class="empty-icon">✓</div><div>No changes yet</div></div>';
+        filesList.innerHTML = '<div class="empty-state"><div class="empty-icon">${lucideSvg('circle-check', 24)}</div><div>No changes yet</div></div>';
         return;
       }
 

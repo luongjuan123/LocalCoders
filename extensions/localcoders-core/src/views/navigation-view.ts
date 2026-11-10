@@ -1,6 +1,9 @@
 import * as vscode from 'vscode';
+import { getLucideCss, getLucideClientScript, lucideSvg, getLocalCodersLogoSvg } from './lucide-icons';
+import { getSessionsBarStyles, getSessionsBarClientScript } from './sessions-bar-ui';
 import { SessionManager, SessionData } from '../sessions/session-manager';
 import { OllamaClient } from '../ollama/client';
+import { ModelProviderRegistry } from '../models/model-provider-registry';
 
 export class NavigationViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'localcoders.navigationView';
@@ -9,7 +12,8 @@ export class NavigationViewProvider implements vscode.WebviewViewProvider {
   constructor(
     private readonly _extensionUri: vscode.Uri,
     private readonly sessionManager: SessionManager,
-    private readonly ollama: OllamaClient
+    private readonly ollama: OllamaClient,
+    private readonly modelRegistry?: ModelProviderRegistry
   ) {
     this.sessionManager.onDidChangeSessions(() => {
       this.refresh();
@@ -34,9 +38,22 @@ export class NavigationViewProvider implements vscode.WebviewViewProvider {
       switch (data.command) {
         case 'newSession':
         case 'newSection': {
-          const models = await this.ollama.listModels();
-          const model = models[0]?.name || 'qwen3.8:27b';
-          this.sessionManager.createSession('New Section', model);
+          let model = '';
+          let providerId = 'ollama';
+          let modelName = '';
+          if (this.modelRegistry) {
+            const firstAvailable = await this.modelRegistry.getDefaultOrFirstAvailableModel();
+            if (firstAvailable) {
+              model = firstAvailable.id;
+              providerId = firstAvailable.providerId;
+              modelName = firstAvailable.displayName;
+            }
+          } else {
+            const models = await this.ollama.listModels();
+            model = models[0]?.name ? `ollama/${models[0].name}` : '';
+            modelName = models[0]?.name || '';
+          }
+          this.sessionManager.createSession('New Section', model, { providerId, modelId: model, modelName });
           vscode.commands.executeCommand('localcoders.openChat');
           break;
         }
@@ -47,18 +64,29 @@ export class NavigationViewProvider implements vscode.WebviewViewProvider {
           break;
 
         case 'renameSession': {
+          if (!data.sessionId) break;
+          const providedTitle = typeof data.title === 'string' ? data.title.trim() : '';
+          if (providedTitle) {
+            this.sessionManager.renameSession(data.sessionId, providedTitle);
+            break;
+          }
           const s = this.sessionManager.getSession(data.sessionId);
           const newTitle = await vscode.window.showInputBox({
             prompt: 'Rename session',
             value: s?.title || '',
           });
-          if (newTitle) {
-            this.sessionManager.renameSession(data.sessionId, newTitle);
+          if (newTitle && newTitle.trim()) {
+            this.sessionManager.renameSession(data.sessionId, newTitle.trim());
           }
           break;
         }
 
         case 'deleteSession': {
+          if (!data.sessionId) break;
+          if (data.confirmed === true) {
+            this.sessionManager.deleteSession(data.sessionId);
+            break;
+          }
           const confirm = await vscode.window.showWarningMessage(
             'Delete this coding session?',
             { modal: true },
@@ -83,7 +111,7 @@ export class NavigationViewProvider implements vscode.WebviewViewProvider {
           break;
 
         case 'openModelManager':
-          vscode.commands.executeCommand('localcoders.modelManagerView.focus');
+          vscode.commands.executeCommand('localcoders.manageModels');
           break;
 
         case 'openCriticReviews':
@@ -130,6 +158,7 @@ export class NavigationViewProvider implements vscode.WebviewViewProvider {
       --text-muted: #888888;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    ${getLucideCss()}
     body {
       background-color: var(--bg);
       color: var(--fg);
@@ -145,87 +174,57 @@ export class NavigationViewProvider implements vscode.WebviewViewProvider {
 
     /* 1. Profile Section */
     .profile-card {
-      padding: 12px 14px;
+      padding: 10px 12px;
       border-bottom: 1px solid var(--border);
       display: flex;
       align-items: center;
       justify-content: space-between;
     }
-    .profile-left {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    .avatar {
-      width: 28px;
-      height: 28px;
-      border-radius: 50%;
-      background: linear-gradient(135deg, #0284c7, #38bdf8);
-      color: #0f172a;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-weight: 700;
-      font-size: 13px;
-    }
-    .profile-info {
-      display: flex;
-      flex-direction: column;
-    }
     .profile-name {
       font-weight: 600;
       color: var(--fg);
       font-size: 12px;
-    }
-    .profile-role {
-      font-size: 10px;
-      color: var(--text-muted);
-      display: flex;
+      letter-spacing: 0.01em;
+      display: inline-flex;
       align-items: center;
-      gap: 4px;
-    }
-    .status-dot {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--success);
-      display: inline-block;
+      gap: 7px;
     }
     .btn-icon {
       background: transparent;
       border: none;
       color: var(--text-muted);
       cursor: pointer;
-      font-size: 14px;
       padding: 4px;
       border-radius: 4px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
     }
     .btn-icon:hover { color: var(--fg); background: var(--hover-bg); }
 
     /* 2. New Session Action */
     .action-container {
-      padding: 10px 14px;
+      padding: 8px 12px;
       border-bottom: 1px solid var(--border);
     }
     .btn-new-session {
       width: 100%;
-      padding: 7px 12px;
-      background: rgba(56, 189, 248, 0.12);
-      border: 1px solid rgba(56, 189, 248, 0.3);
-      color: var(--accent);
+      padding: 6px 10px;
+      background: color-mix(in srgb, var(--fg) 5%, transparent);
+      border: 1px solid var(--border);
+      color: var(--fg);
       border-radius: 6px;
       font-size: 12px;
-      font-weight: 600;
+      font-weight: 500;
       cursor: pointer;
       display: flex;
       align-items: center;
       justify-content: center;
       gap: 6px;
-      transition: all 0.15s ease;
+      transition: background 0.15s ease;
     }
     .btn-new-session:hover {
-      background: rgba(56, 189, 248, 0.22);
-      border-color: var(--accent);
+      background: var(--hover-bg);
     }
 
     /* 3. Navigation List */
@@ -245,10 +244,11 @@ export class NavigationViewProvider implements vscode.WebviewViewProvider {
     }
     .nav-item:hover { background: var(--hover-bg); }
     .nav-icon {
-      font-size: 14px;
       color: var(--text-muted);
       width: 16px;
-      text-align: center;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
     }
 
     /* 4. Sessions Section */
@@ -314,11 +314,14 @@ export class NavigationViewProvider implements vscode.WebviewViewProvider {
       color: var(--text-muted);
     }
     .session-actions {
-      display: none;
-      gap: 4px;
-    }
-    .session-item:hover .session-actions {
       display: flex;
+      opacity: 0.45;
+      gap: 4px;
+      transition: opacity 0.12s ease;
+    }
+    .session-item:hover .session-actions,
+    .session-item.active .session-actions {
+      opacity: 1;
     }
     .act-btn {
       background: transparent;
@@ -330,57 +333,76 @@ export class NavigationViewProvider implements vscode.WebviewViewProvider {
       border-radius: 3px;
     }
     .act-btn:hover { color: var(--fg); background: rgba(255, 255, 255, 0.1); }
+    ${getSessionsBarStyles()}
   </style>
 </head>
 <body>
-  <!-- 1. Profile -->
   <div class="profile-card">
-    <div class="profile-left">
-      <div class="avatar">LC</div>
-      <div class="profile-info">
-        <span class="profile-name">Local Developer</span>
-        <span class="profile-role"><span class="status-dot"></span> Offline / Local-First</span>
-      </div>
-    </div>
-    <button class="btn-icon" id="btn-settings" title="LocalCoders Settings">⚙</button>
+    <span class="profile-name">${getLocalCodersLogoSvg(18)}<span>LocalCoders</span></span>
+    <button class="btn-icon" id="btn-settings" title="Settings">${lucideSvg('settings', 14)}</button>
   </div>
 
-  <!-- 2. New Section -->
-  <div class="action-container">
-    <button class="btn-new-session" id="btn-new-session">
-      <span>+</span> New Section
-    </button>
-  </div>
-
-  <!-- 3. Navigation -->
   <div class="nav-list">
     <div class="nav-item" id="nav-team">
-      <span class="nav-icon">👥</span>
-      <span>Agent Team</span>
+      <span class="nav-icon">${lucideSvg('users', 14)}</span>
+      <span>Agents</span>
     </div>
     <div class="nav-item" id="nav-models">
-      <span class="nav-icon">🧠</span>
-      <span>Model Manager</span>
+      <span class="nav-icon">${lucideSvg('cpu', 14)}</span>
+      <span>Models</span>
     </div>
     <div class="nav-item" id="nav-reviews">
-      <span class="nav-icon">🛡️</span>
-      <span>Code Reviews</span>
+      <span class="nav-icon">${lucideSvg('eye', 14)}</span>
+      <span>Changes Review</span>
     </div>
     <div class="nav-item" id="nav-wiki">
-      <span class="nav-icon">📖</span>
-      <span>Project Rules & Wiki</span>
+      <span class="nav-icon">${lucideSvg('file-text', 14)}</span>
+      <span>Project Rules</span>
     </div>
   </div>
 
-  <!-- 4. Sections History Section -->
-  <div class="sessions-header">
-    <span>Chat Sections (History)</span>
+  <div class="lc-sessions-header">
+    <span class="lc-sessions-heading">Sessions</span>
+    <div class="lc-sessions-hdr-actions">
+      <button type="button" class="lc-sess-hdr-btn" id="btn-new-session" title="New Session">${lucideSvg('plus', 15)}</button>
+      <button type="button" class="lc-sess-hdr-btn" id="btn-nav-filter" title="Filter &amp; Sort">${lucideSvg('sliders-horizontal', 14)}</button>
+      <button type="button" class="lc-sess-hdr-btn" id="btn-nav-more" title="Session Options">${lucideSvg('ellipsis', 14)}</button>
+      <div class="lc-sessions-menu" id="nav-sessions-menu">
+        <button type="button" class="lc-sessions-menu-item" data-nav-sess-act="new">${lucideSvg('plus', 12)}<span>New Session</span></button>
+        <button type="button" class="lc-sessions-menu-item" data-nav-sess-act="toggleSort">${lucideSvg('arrow-up-down', 12)}<span id="nav-sort-lbl">Sort: Alphabetical</span></button>
+      </div>
+    </div>
   </div>
-  <div class="session-list" id="session-list"></div>
+
+  <div class="lc-sessions-filter-bar" id="nav-filter-bar">
+    <div class="lc-sessions-search-wrap">
+      <span class="lc-sessions-search-ico">${lucideSvg('search', 12)}</span>
+      <input type="text" class="lc-sessions-filter-input" id="nav-search-input" placeholder="Filter sessions...">
+    </div>
+  </div>
+
+  <button type="button" class="lc-recent-subheader" id="btn-nav-recent">
+    ${lucideSvg('clock', 12)}
+    <span>Recent</span>
+  </button>
+
+  <div class="lc-sessions-scroll" id="session-list"></div>
 
   <script>
     const vscode = acquireVsCodeApi();
+    ${getLucideClientScript()}
+    ${getSessionsBarClientScript()}
     const sessionList = document.getElementById('session-list');
+    const navFilterBar = document.getElementById('nav-filter-bar');
+    const navSearchInput = document.getElementById('nav-search-input');
+    const btnNavFilter = document.getElementById('btn-nav-filter');
+    const btnNavMore = document.getElementById('btn-nav-more');
+    const navMenu = document.getElementById('nav-sessions-menu');
+
+    let navSessionsCache = [];
+    let navActiveId = null;
+    let navSortMode = 'recent';
+    let navRecentCollapsed = false;
 
     document.getElementById('btn-new-session').addEventListener('click', () => {
       vscode.postMessage({ command: 'newSession' });
@@ -401,60 +423,163 @@ export class NavigationViewProvider implements vscode.WebviewViewProvider {
       vscode.postMessage({ command: 'openProjectWiki' });
     });
 
-    window.addEventListener('message', (event) => {
-      const msg = event.data;
-      if (msg.type === 'updateState') {
-        renderSessions(msg.sessions || [], msg.activeSessionId);
+    btnNavFilter?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      navMenu?.classList.remove('open');
+      const next = navFilterBar ? !navFilterBar.classList.contains('open') : false;
+      navFilterBar?.classList.toggle('open', next);
+      btnNavFilter.classList.toggle('active', next);
+      if (next) navSearchInput?.focus();
+      else if (navSearchInput && navSearchInput.value) {
+        navSearchInput.value = '';
+        renderSessions(navSessionsCache, navActiveId);
       }
     });
 
+    btnNavMore?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const lbl = document.getElementById('nav-sort-lbl');
+      if (lbl) lbl.textContent = navSortMode === 'recent' ? 'Sort: Alphabetical' : 'Sort: Most Recent';
+      navMenu?.classList.toggle('open');
+    });
+
+    document.addEventListener('click', (e) => {
+      if (navMenu && !navMenu.contains(e.target) && e.target !== btnNavMore) {
+        navMenu.classList.remove('open');
+      }
+    });
+
+    navMenu?.querySelectorAll('.lc-sessions-menu-item[data-nav-sess-act]').forEach((item) => {
+      item.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const act = item.getAttribute('data-nav-sess-act');
+        navMenu.classList.remove('open');
+        if (act === 'new') vscode.postMessage({ command: 'newSession' });
+        if (act === 'toggleSort') {
+          navSortMode = navSortMode === 'recent' ? 'alpha' : 'recent';
+          renderSessions(navSessionsCache, navActiveId);
+        }
+      });
+    });
+
+    navSearchInput?.addEventListener('input', () => {
+      renderSessions(navSessionsCache, navActiveId);
+    });
+
+    document.getElementById('btn-nav-recent')?.addEventListener('click', () => {
+      navRecentCollapsed = !navRecentCollapsed;
+      if (sessionList) sessionList.style.display = navRecentCollapsed ? 'none' : 'flex';
+    });
+
+    window.addEventListener('message', (event) => {
+      const msg = event.data;
+      if (msg.type === 'updateState') {
+        navSessionsCache = msg.sessions || [];
+        navActiveId = msg.activeSessionId;
+        renderSessions(navSessionsCache, navActiveId);
+      }
+    });
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
     function formatTimeAgo(ts) {
-      const diff = Date.now() - ts;
-      const mins = Math.floor(diff / 60000);
-      if (mins < 1) return 'just now';
-      if (mins < 60) return mins + 'm ago';
-      const hours = Math.floor(mins / 60);
-      if (hours < 24) return hours + 'h ago';
-      return Math.floor(hours / 24) + 'd ago';
+      return lcFormatSessionTimeAgo(ts);
     }
 
     function renderSessions(sessions, activeId) {
-      if (sessions.length === 0) {
-        sessionList.innerHTML = '<div style="padding: 20px 14px; color: var(--text-muted); text-align: center;">No sessions yet. Click New Session to begin.</div>';
+      const q = (navSearchInput?.value || '').trim().toLowerCase();
+      let filtered = q
+        ? (sessions || []).filter((s) => (s.title || '').toLowerCase().includes(q))
+        : (sessions || []).slice();
+
+      if (navSortMode === 'alpha') {
+        filtered.sort((a, b) => (a.title || '').localeCompare(b.title || ''));
+      } else {
+        filtered.sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+      }
+
+      if (filtered.length === 0) {
+        sessionList.innerHTML = '<div class="lc-sess-empty">No sessions found</div>';
         return;
       }
 
       sessionList.innerHTML = '';
-      sessions.forEach((s) => {
+      filtered.forEach((s) => {
+        const isRunningSess = s.status === 'running';
         const item = document.createElement('div');
-        item.className = 'session-item' + (s.id === activeId ? ' active' : '');
-        item.innerHTML = \`
-          <div class="session-row-top">
-            <span class="session-title" title="\${s.title}">\${s.title}</span>
-            <span class="session-badge badge-\${s.status}">\${s.status}</span>
-          </div>
-          <div class="session-meta">
-            <span>\${s.model || 'qwen3.8:27b'} • \${formatTimeAgo(s.updatedAt)}</span>
-            <div class="session-actions">
-              <button class="act-btn btn-rename" title="Rename">✏️</button>
-              <button class="act-btn btn-delete" title="Delete">🗑️</button>
-            </div>
-          </div>
-        \`;
+        item.className = 'lc-sess-row' + (s.id === activeId ? ' active' : '');
+        item.innerHTML =
+          '<span class="lc-sess-gutter"><span class="lc-sess-dot' + (isRunningSess ? ' running' : '') + '"></span></span>' +
+          '<div class="lc-sess-main">' +
+            '<div class="lc-sess-top">' +
+              '<span class="lc-sess-name" title="' + escapeHtml(s.title) + '">' + escapeHtml(s.title) + '</span>' +
+              '<div class="lc-sess-row-actions">' +
+                '<button class="session-act-btn btn-rename" type="button" title="Rename">' + lcIcon('pencil', 12) + '</button>' +
+                '<button class="session-act-btn btn-delete-session btn-delete" type="button" title="Delete">' + lcIcon('trash-2', 12) + '</button>' +
+              '</div>' +
+            '</div>' +
+            '<div class="lc-sess-meta">' +
+              '<span class="lc-sess-meta-icon">' + lcIcon('session-node', 11) + '</span>' +
+              '<span class="lc-sess-time">' + escapeHtml(formatTimeAgo(s.updatedAt || s.createdAt)) + '</span>' +
+            '</div>' +
+          '</div>';
 
         item.addEventListener('click', (e) => {
-          if (e.target.closest('.act-btn')) return;
+          if (e.target.closest('.lc-sess-row-actions')) return;
           vscode.postMessage({ command: 'switchSession', sessionId: s.id });
         });
 
         item.querySelector('.btn-rename').addEventListener('click', (e) => {
           e.stopPropagation();
-          vscode.postMessage({ command: 'renameSession', sessionId: s.id });
+          const titleEl = item.querySelector('.lc-sess-name');
+          if (!titleEl) return;
+          const input = document.createElement('input');
+          input.type = 'text';
+          input.className = 'session-rename-input';
+          input.value = s.title || '';
+          let done = false;
+          const finish = (save) => {
+            if (done) return;
+            done = true;
+            const next = input.value.trim();
+            if (save && next && next !== s.title) {
+              vscode.postMessage({ command: 'renameSession', sessionId: s.id, title: next });
+            } else {
+              renderSessions(sessions, activeId);
+            }
+          };
+          input.addEventListener('click', (ev) => ev.stopPropagation());
+          input.addEventListener('keydown', (ev) => {
+            if (ev.key === 'Enter') { ev.preventDefault(); finish(true); }
+            if (ev.key === 'Escape') { ev.preventDefault(); finish(false); }
+          });
+          input.addEventListener('blur', () => finish(true));
+          titleEl.replaceWith(input);
+          input.focus();
+          input.select();
         });
 
         item.querySelector('.btn-delete').addEventListener('click', (e) => {
           e.stopPropagation();
-          vscode.postMessage({ command: 'deleteSession', sessionId: s.id });
+          const actionsEl = item.querySelector('.lc-sess-row-actions');
+          if (!actionsEl) {
+            vscode.postMessage({ command: 'deleteSession', sessionId: s.id, confirmed: true });
+            return;
+          }
+          item.classList.add('confirming');
+          actionsEl.innerHTML = '<button class="session-confirm-btn btn-confirm-del" type="button">Delete</button><button class="session-act-btn btn-cancel-del" type="button">' + lcIcon('x', 12) + '</button>';
+          actionsEl.querySelector('.btn-confirm-del')?.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            vscode.postMessage({ command: 'deleteSession', sessionId: s.id, confirmed: true });
+          });
+          actionsEl.querySelector('.btn-cancel-del')?.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            item.classList.remove('confirming');
+            renderSessions(sessions, activeId);
+          });
         });
 
         sessionList.appendChild(item);

@@ -25,7 +25,13 @@ export class ProcessManager {
     return ProcessManager.instance;
   }
 
-  public startProcess(id: string, command: string, cwd: string, env?: Record<string, string>): ManagedProcess {
+  public startProcess(
+    id: string,
+    command: string,
+    cwd: string,
+    env?: NodeJS.ProcessEnv,
+    shell: string | boolean = true
+  ): ManagedProcess {
     // If process with this ID is already running, terminate it first
     if (this.processes.has(id)) {
       this.terminateProcess(id);
@@ -33,8 +39,9 @@ export class ProcessManager {
 
     const child = spawn(command, {
       cwd,
-      shell: true,
-      env: { ...process.env, ...env },
+      shell,
+      detached: process.platform !== 'win32',
+      env: env || { ...process.env },
     });
 
     const managed: ManagedProcess = {
@@ -97,8 +104,9 @@ export class ProcessManager {
 
   public writeStdin(id: string, input: string): boolean {
     const p = this.processes.get(id);
-    if (!p || p.status !== 'running' || !p.child.stdin) return false;
-    p.child.stdin.write(input.endsWith('\n') ? input : input + '\n');
+    if (!p || p.status !== 'running' || !p.child.stdin || p.child.stdin.destroyed) return false;
+    const text = String(input ?? '');
+    p.child.stdin.write(text.endsWith('\n') ? text : text + '\n');
     return true;
   }
 
@@ -107,10 +115,14 @@ export class ProcessManager {
     if (!p) return false;
     if (p.status === 'running') {
       try {
-        if (p.child.pid) {
+        if (p.child.pid && process.platform !== 'win32') {
           try {
-            require('child_process').execSync(`pkill -P ${p.child.pid} 2>/dev/null || true; kill -9 ${p.child.pid} 2>/dev/null || true`);
-          } catch {}
+            process.kill(-p.child.pid, 'SIGKILL');
+          } catch {
+            try {
+              require('child_process').execSync(`pkill -P ${p.child.pid} 2>/dev/null || true; kill -9 ${p.child.pid} 2>/dev/null || true`);
+            } catch {}
+          }
         }
         p.child.kill('SIGKILL');
       } catch {

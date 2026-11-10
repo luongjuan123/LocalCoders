@@ -22,7 +22,16 @@ export class BrowserManager {
     try {
       return require('playwright');
     } catch {
-      return require('/home/juan/localcoders-oss/node_modules/playwright');
+      const candidates = [
+        path.resolve(__dirname, '../../../node_modules/playwright'),
+        path.resolve(__dirname, '../../../../vscode-src/node_modules/playwright'),
+      ];
+      for (const candidate of candidates) {
+        if (fsSync.existsSync(candidate)) {
+          return require(candidate);
+        }
+      }
+      throw new Error('playwright module not found in extension or vscode-src node_modules');
     }
   }
 

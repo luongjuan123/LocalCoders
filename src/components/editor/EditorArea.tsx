@@ -21,17 +21,14 @@ export const EditorArea: React.FC = () => {
 
   if (openTabs.length === 0) {
     return (
-      <div className="flex-1 bg-[#0f172a] flex flex-col items-center justify-center text-[#64748b] select-none p-6">
-        <div className="w-16 h-16 rounded-2xl bg-gradient-to-tr from-sky-500/20 to-indigo-500/20 border border-sky-500/30 flex items-center justify-center text-sky-400 mb-4">
-          <FileCode size={32} />
-        </div>
-        <h2 className="text-base font-semibold text-[#f8fafc] mb-1">LocalCoders Multi-Agent IDE</h2>
-        <p className="text-xs text-[#94a3b8] max-w-sm text-center mb-4">
-          Open a file from the explorer on the left or submit a prompt in the AI sidebar to orchestrate tasks across agents.
+      <div className="flex-1 bg-[#111214] flex flex-col items-center justify-center text-[#71717a] select-none p-6">
+        <FileCode size={24} className="mb-2 text-[#52525b]" />
+        <h2 className="text-sm font-medium text-[#e4e4e7] mb-1">No open file</h2>
+        <p className="text-xs text-[#71717a] max-w-xs text-center mb-4">
+          Select a file from the explorer or type a task in the agent panel.
         </p>
-        <div className="flex space-x-2 text-[11px] text-[#64748b]">
-          <span className="bg-[#1e293b] px-2 py-1 rounded">Ctrl+S: Save</span>
-          <span className="bg-[#1e293b] px-2 py-1 rounded">Ollama Local Inference</span>
+        <div className="text-[11px] text-[#71717a] font-mono">
+          Ctrl+S Save
         </div>
       </div>
     );

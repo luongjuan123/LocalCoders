@@ -1,13 +1,17 @@
 import { OllamaClient } from '../ollama/client';
+import { LLMRouter } from '../models/llm-router';
 import { AgentConfig, TaskPlanItem } from './types';
 import { ToolManager } from '../tools/tool-manager';
 import { ToolExecutionContext } from '../tools/types';
 import { FileLockManager } from './file-lock';
-import { parseToolCallsFromContent, parseCodeBlocksFromContent } from './main-agent';
+import { parseToolCallsFromContent, parseCodeBlocksFromContent, RuntimeModelOptions } from './main-agent';
+import { getSafePhaseLabel, sanitizeAssistantContent } from './events';
+import { executeTrackedTool } from './tool-runner';
 
 export class Subagent {
   public config: AgentConfig;
   private ollama: OllamaClient;
+  private llmRouter: LLMRouter;
   private toolManager: ToolManager;
   private fileLockManager: FileLockManager;
   private workspaceRoot: string;
@@ -17,10 +21,12 @@ export class Subagent {
     ollama: OllamaClient,
     toolManager: ToolManager,
     fileLockManager: FileLockManager,
-    workspaceRoot: string
+    workspaceRoot: string,
+    llmRouter?: LLMRouter
   ) {
     this.config = config;
     this.ollama = ollama;
+    this.llmRouter = llmRouter || new LLMRouter(ollama);
     this.toolManager = toolManager;
     this.fileLockManager = fileLockManager;
     this.workspaceRoot = workspaceRoot;
@@ -32,7 +38,8 @@ export class Subagent {
     projectContext: string,
     onActivity: (activity: string) => void,
     requestApproval: (req: any) => Promise<boolean>,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    runtimeOptions?: RuntimeModelOptions
   ): Promise<{ success: boolean; output: string; affectedFiles: string[] }> {
     onActivity(`Starting task: ${task.title}`);
 
@@ -69,7 +76,7 @@ CRITICAL EXECUTION MANDATE:
 - YOU MUST EXECUTE TOOLS:
   * write_file(path, content): Create or overwrite source files in the workspace.
   * edit_file(path, target, replacement): Modify existing files with targeted changes.
-  * run_command(command): Run shell commands, tests, package managers, and builds.
+  * run_command(command, stdin?): Run shell commands, tests, package managers, and builds. Pass optional 'stdin' text when interactive scripts request input(), or use start_process + write_stdin + read_output + terminate_process for interactive/UI/long-running processes.
   * read_file(path): Inspect file contents.
   * list_directory(path): Inspect directory structures.
 - Whenever you implement a feature, module, or test, YOU MUST CALL write_file TO SAVE THE CODE TO DISK.
@@ -106,6 +113,9 @@ ${targetFilePrompt}`;
       task.affectedFiles.length > 0 ||
       /\b(implement|create|write|build|add|code|fix|develop|test|setup)\b/i.test(task.title + ' ' + task.description);
 
+    const runId = runtimeOptions?.runId || `run_${Date.now()}`;
+    onActivity(`Working on ${task.title}`);
+
     try {
       while (turns < maxTurns) {
         turns++;
@@ -116,37 +126,80 @@ ${targetFilePrompt}`;
         let assistantContent = '';
         let assistantThinking = '';
         let toolCalls: any = undefined;
+        let phaseNotified = false;
 
-        let genTokens = 0;
-        let lastGenUpdate = Date.now();
+        runtimeOptions?.onStreamEvent?.({
+          kind: 'status',
+          id: `st_${runId}_${this.config.id}_${turns}`,
+          runId,
+          agentId: this.config.id,
+          agentName: this.config.name,
+          phase: 'analyzing',
+          summary: `${this.config.name}: ${getSafePhaseLabel('analyzing')}`,
+          timestamp: Date.now(),
+        });
 
-        await this.ollama.chatStream(
-          {
-            model: this.config.model,
-            messages,
-            tools,
-            temperature: this.config.temperature || 0.2,
-            contextWindow: this.config.contextWindow || 32768,
-          },
-          (chunk) => {
-            assistantContent += chunk.content;
-            genTokens++;
-            if (chunk.thinking) assistantThinking += chunk.thinking;
-            if (chunk.toolCalls) toolCalls = chunk.toolCalls;
-
-            const now = Date.now();
-            if (now - lastGenUpdate > 2500) {
-              lastGenUpdate = now;
-              if (chunk.thinking) {
-                const thinkSnippet = chunk.thinking.trim().slice(-60).replace(/[\r\n]+/g, ' ');
-                onActivity(`[${this.config.name}] Thinking: ${thinkSnippet}...`);
-              } else {
-                onActivity(`[${this.config.name}] Generating implementation (${genTokens} tokens)...`);
-              }
+        for (let streamAttempt = 0; streamAttempt < 2; streamAttempt++) {
+          assistantContent = '';
+          assistantThinking = '';
+          toolCalls = undefined;
+          phaseNotified = false;
+          try {
+            await this.llmRouter.chatStream(
+              {
+                model: this.config.model,
+                messages,
+                tools,
+                temperature: runtimeOptions?.temperature ?? this.config.temperature ?? 0.2,
+                maxOutputTokens: runtimeOptions?.maxOutputTokens,
+                contextWindow: runtimeOptions?.contextLimit,
+                reasoningEffort: runtimeOptions?.reasoningEffort,
+                fastMode: runtimeOptions?.fastMode,
+              },
+              (chunk) => {
+                assistantContent += chunk.content;
+                if (chunk.thinking) assistantThinking += chunk.thinking;
+                if (chunk.toolCalls && chunk.toolCalls.length > 0) {
+                  toolCalls = [...(toolCalls || []), ...chunk.toolCalls];
+                }
+                if (!phaseNotified && (chunk.content || chunk.thinking)) {
+                  phaseNotified = true;
+                  runtimeOptions?.onStreamEvent?.({
+                    kind: 'status',
+                    id: `st_${runId}_${this.config.id}_gen_${turns}`,
+                    runId,
+                    agentId: this.config.id,
+                    agentName: this.config.name,
+                    phase: 'generating',
+                    summary: `${this.config.name}: ${getSafePhaseLabel('generating')}`,
+                    timestamp: Date.now(),
+                  });
+                }
+              },
+              abortSignal
+            );
+            break;
+          } catch (streamErr: any) {
+            const msg = String(streamErr?.message || '');
+            const transient =
+              /llama-server process no longer running|unexpected EOF|ECONNRESET|socket hang up/i.test(msg);
+            if (streamAttempt === 0 && transient && !abortSignal?.aborted) {
+              runtimeOptions?.onStreamEvent?.({
+                kind: 'status',
+                id: `st_${runId}_${this.config.id}_retry_${turns}`,
+                runId,
+                agentId: this.config.id,
+                agentName: this.config.name,
+                phase: 'working',
+                summary: `${this.config.name}: Retrying local model execution`,
+                timestamp: Date.now(),
+              });
+              await new Promise((r) => setTimeout(r, 1500));
+              continue;
             }
-          },
-          abortSignal
-        );
+            throw streamErr;
+          }
+        }
 
         // 1. Check for native tool calls
         let activeCalls: Array<{ name: string; args: any }> = [];
@@ -171,12 +224,18 @@ ${targetFilePrompt}`;
           const extractedFiles = parseCodeBlocksFromContent(assistantContent, task.affectedFiles);
           if (extractedFiles.length > 0) {
             for (const ef of extractedFiles) {
-              onActivity(`[${this.config.name}] Writing extracted code to '${ef.path}'...`);
-              const writeRes = await this.toolManager.executeTool(
-                'write_file',
-                { path: ef.path, content: ef.content },
-                toolCtx
-              );
+              const { result: writeRes } = await executeTrackedTool({
+                runId,
+                agentId: this.config.id,
+                agentName: this.config.name,
+                agentRole: this.config.role,
+                toolName: 'write_file',
+                args: { path: ef.path, content: ef.content },
+                toolManager: this.toolManager,
+                baseCtx: toolCtx,
+                abortSignal,
+                onStreamEvent: runtimeOptions?.onStreamEvent,
+              });
               if (writeRes.success) {
                 filesWritten.push(ef.path);
                 toolsExecutedCount++;
@@ -195,17 +254,35 @@ ${targetFilePrompt}`;
         // 4. Execute tool calls
         if (activeCalls.length > 0) {
           for (const call of activeCalls) {
+            if (abortSignal?.aborted) {
+              throw new Error('Task was cancelled by user.');
+            }
             toolsExecutedCount++;
-            onActivity(`[${this.config.name}] ${call.name}(${JSON.stringify(call.args).slice(0, 50)}...)`);
 
-            const result = await this.toolManager.executeTool(call.name, call.args, toolCtx);
+            const { result } = await executeTrackedTool({
+              runId,
+              agentId: this.config.id,
+              agentName: this.config.name,
+              agentRole: this.config.role,
+              toolName: call.name,
+              args: call.args,
+              toolManager: this.toolManager,
+              baseCtx: toolCtx,
+              abortSignal,
+              onStreamEvent: runtimeOptions?.onStreamEvent,
+            });
+
+            if (result.cancelled || abortSignal?.aborted) {
+              throw new Error('Task was cancelled by user.');
+            }
+
             if (result.success && (call.name === 'write_file' || call.name === 'create_file')) {
               const p = call.args.path || call.args.filePath;
               if (p) filesWritten.push(p);
             }
 
             const resStr = JSON.stringify(result);
-            const boundedStr = resStr.length > 3000 ? resStr.slice(0, 3000) + '... [truncated]' : resStr;
+            const boundedStr = resStr.length > 12000 ? resStr.slice(0, 12000) + '... [truncated]' : resStr;
 
             if (toolCalls && toolCalls.length > 0) {
               messages.push({
@@ -233,7 +310,6 @@ ${targetFilePrompt}`;
 
         // 5. Nudge if implementation task didn't call any tools
         if (isImplementationTask && filesWritten.length === 0 && toolsExecutedCount === 0 && turns < 3) {
-          onActivity(`[${this.config.name}] Nudging model to invoke write_file tool...`);
           messages.push({
             role: 'user',
             content: 'CRITICAL: You explained the solution, but NO files were written to disk. You must call write_file(path, content) right now to persist the code into the workspace.',
@@ -241,7 +317,7 @@ ${targetFilePrompt}`;
           continue;
         }
 
-        finalSummary = assistantContent;
+        finalSummary = sanitizeAssistantContent(assistantContent);
         break;
       }
 

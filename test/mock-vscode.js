@@ -62,9 +62,23 @@ const mockVsCode = {
   },
   EventEmitter: class {
     constructor() {
-      this.event = () => {};
+      this._listeners = [];
+      this.event = (listener) => {
+        this._listeners.push(listener);
+        return {
+          dispose: () => {
+            this._listeners = this._listeners.filter((l) => l !== listener);
+          },
+        };
+      };
     }
-    fire() {}
+    fire(data) {
+      for (const l of [...this._listeners]) {
+        try {
+          l(data);
+        } catch {}
+      }
+    }
   },
 };
 

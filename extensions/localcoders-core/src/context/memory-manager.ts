@@ -9,6 +9,9 @@ export interface ProjectRules {
 
 export class MemoryManager {
   private workspaceRoot: string;
+  private cachedRules: ProjectRules | null = null;
+  private cacheTimestamp = 0;
+  private static readonly CACHE_TTL_MS = 10_000;
 
   constructor(workspaceRoot: string) {
     this.workspaceRoot = workspaceRoot;
@@ -16,6 +19,8 @@ export class MemoryManager {
 
   setWorkspace(root: string) {
     this.workspaceRoot = root;
+    this.cachedRules = null;
+    this.cacheTimestamp = 0;
   }
 
   private getDotDir(): string {
@@ -57,7 +62,14 @@ export class MemoryManager {
     }
   }
 
-  async getProjectRules(): Promise<ProjectRules> {
+  async getProjectRules(forceRefresh: boolean = false): Promise<ProjectRules> {
+    if (
+      !forceRefresh &&
+      this.cachedRules &&
+      Date.now() - this.cacheTimestamp < MemoryManager.CACHE_TTL_MS
+    ) {
+      return this.cachedRules;
+    }
     await this.ensureMemoryFiles();
     const rulesPath = path.join(this.getDotDir(), 'rules.md');
     const memoryPath = path.join(this.getDotDir(), 'project-memory.md');
@@ -76,13 +88,17 @@ export class MemoryManager {
       console.error('[MemoryManager] Error reading project rules:', err);
     }
 
-    return { rulesText, projectMemoryText };
+    const result = { rulesText, projectMemoryText };
+    this.cachedRules = result;
+    this.cacheTimestamp = Date.now();
+    return result;
   }
 
   async updateRules(newRules: string): Promise<void> {
     await this.ensureMemoryFiles();
     const rulesPath = path.join(this.getDotDir(), 'rules.md');
     await fs.writeFile(rulesPath, newRules, 'utf-8');
+    this.cachedRules = null;
   }
 
   async appendToMemory(entry: string): Promise<void> {
@@ -91,5 +107,6 @@ export class MemoryManager {
     const timestamp = new Date().toISOString();
     const formatted = `\n### [${timestamp}]\n${entry}\n`;
     await fs.appendFile(memoryPath, formatted, 'utf-8');
+    this.cachedRules = null;
   }
 }

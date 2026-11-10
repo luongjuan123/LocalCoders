@@ -53,7 +53,7 @@ export const ModelManagerView: React.FC = () => {
               <div>
                 <strong className="text-[#f8fafc]">{m.name}</strong>
                 <div className="text-[10px] text-[#64748b]">
-                  {(m.size / (1024 * 1024 * 1024)).toFixed(1)} GB • {m.details?.parameter_size || 'N/A'}
+                  {(m.size / (1024 * 1024 * 1024)).toFixed(1)} GB | {m.details?.parameter_size || 'N/A'}
                 </div>
               </div>
               <button

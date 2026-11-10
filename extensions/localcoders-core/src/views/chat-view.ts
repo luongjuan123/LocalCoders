@@ -1,16 +1,116 @@
 import * as vscode from 'vscode';
+import { getLucideCss, getLucideClientScript, lucideSvg } from './lucide-icons';
 import * as path from 'path';
 import { AgentOrchestrator } from '../agents/orchestrator';
 import { AgentMessage, TaskPlanItem, ToolApprovalRequest } from '../agents/types';
+import {
+  AgentStreamEvent,
+  finalizeRunningActivities,
+  upsertActivityItem,
+} from '../agents/events';
 import { SessionManager, SessionData, ExecutionGroup, AgentSessionConfig, ExecutionMode, PermissionMode } from '../sessions/session-manager';
 import { OllamaClient } from '../ollama/client';
 import { ModelProviderRegistry, ModelMetadata, ReasoningEffort } from '../models/model-provider-registry';
+import { getModelSelectorStyles, getModelSelectorMarkup, getModelSelectorScript } from './model-selector-ui';
+import { getActivityStreamStyles, getActivityClientScript } from './activity-stream-ui';
+import { getSessionsBarStyles, getSessionsBarClientScript } from './sessions-bar-ui';
 import { ToolManager } from '../tools/tool-manager';
 import { PermissionManager, SecurityMode } from '../security/permission-manager';
+import { AgentRegistry } from '../agents/agent-registry';
+import { McpHost } from '../mcp/mcp-host';
+import { ChangesManager } from '../context/changes-manager';
+import {
+  SlashCommandRegistry,
+  ensureBuiltinSlashCommandsRegistered,
+  runSlashCommandForWorkspace,
+  isSlashCommandInput,
+  getSlashCommandStyles,
+  getSlashCommandPopupMarkup,
+  getSlashCommandClientScript,
+} from '../commands';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'localcoders.chatView';
   private _view?: vscode.WebviewView;
+  private _isDisposed = false;
+  private activeRunId: string | null = null;
+  private _slashAbortController?: AbortController;
+
+  private postMessageSafe(data: any): void {
+    if (this._isDisposed || !this._view) return;
+    try {
+      this._view.webview.postMessage(data);
+    } catch {
+      // Webview disposed
+    }
+  }
+
+  private getActiveWorkspaceRoot(): string {
+    const sessionRoot = this.sessionManager.getActiveSession()?.workspaceRoot;
+    if (sessionRoot) return sessionRoot;
+    return this.orchestrator.getWorkspaceRoot() || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+  }
+
+  private async executeSlashCommand(rawInput: string, confirmed: boolean): Promise<void> {
+    const workspaceRoot = this.getActiveWorkspaceRoot();
+    this._slashAbortController?.abort();
+    const abortController = new AbortController();
+    this._slashAbortController = abortController;
+
+    const result = await runSlashCommandForWorkspace({
+      rawInput,
+      confirmed,
+      abortSignal: abortController.signal,
+      workspaceRoot,
+      viewMode: 'ide',
+      orchestrator: this.orchestrator,
+      sessionManager: this.sessionManager,
+      modelRegistry: this.modelRegistry,
+      permissionManager: this.permissionManager,
+      changesManager: this.changesManager,
+      toolManager: this.toolManager,
+      mcpHost: this.mcpHost,
+      registry: this.registry,
+      ollama: this.ollama,
+      ui: {
+        openCockpitModal: async (modal) => {
+          if (modal === 'models') {
+            await vscode.commands.executeCommand('localcoders.manageModels');
+          } else if (modal === 'agents') {
+            await vscode.commands.executeCommand('localcoders.agentsView.focus');
+          } else if (modal === 'mcp') {
+            await vscode.commands.executeCommand('localcoders.manageMcp');
+          }
+        },
+        switchInspectorTab: (tab) => {
+          if (tab === 'terminal') {
+            vscode.commands.executeCommand('workbench.action.terminal.focus');
+          } else {
+            vscode.commands.executeCommand('localcoders.changesView.focus');
+          }
+        },
+        openFilesExplorerOrPicker: async () => {
+          await vscode.commands.executeCommand('workbench.view.explorer');
+        },
+        syncSession: async () => {
+          await this.syncActiveSession();
+        },
+        applyWorkingFolder: (root) => {
+          this.orchestrator.setWorkspace(root);
+          this.changesManager?.setWorkspace(root);
+          this.permissionManager?.setWorkspace(root);
+          this.mcpHost?.setWorkspace(root);
+        },
+      },
+    });
+
+    if (this._slashAbortController === abortController) {
+      this._slashAbortController = undefined;
+    }
+
+    await this.syncActiveSession();
+    this.postMessageSafe({ type: 'slashCommandResult', result });
+  }
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -19,32 +119,75 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly ollama: OllamaClient,
     private readonly modelRegistry: ModelProviderRegistry = ModelProviderRegistry.getInstance(),
     private readonly permissionManager?: PermissionManager,
-    private readonly toolManager?: ToolManager
+    private readonly toolManager?: ToolManager,
+    private readonly registry?: AgentRegistry,
+    private readonly mcpHost?: McpHost,
+    private readonly changesManager?: ChangesManager
   ) {
-    // Listen for events from orchestrator
+    // Listen for structured stream events from orchestrator
     this.orchestrator.onMessage((msg) => {
-      this._view?.webview.postMessage({ type: 'addMessage', message: msg });
+      if (msg.senderRole === 'user') return;
+      this.postMessageSafe({ type: 'addMessage', message: msg });
       this.sessionManager.updateActiveSession((s) => {
-        s.messages.push(msg);
+        if (!s.messages.some((m) => m.id === msg.id)) {
+          s.messages.push(msg);
+        }
       });
     });
 
-    this.orchestrator.onActivity((ev) => {
-      this._view?.webview.postMessage({ type: 'activity', event: ev });
-    });
-
-    this.orchestrator.onPlanUpdate((plan) => {
-      this._view?.webview.postMessage({ type: 'planUpdate', plan });
-      this.sessionManager.updateActiveSession((s) => {
-        s.plan = plan;
-      });
+    this.orchestrator.onStreamEvent((ev: AgentStreamEvent) => {
+      this.activeRunId = ev.runId;
+      switch (ev.kind) {
+        case 'status': {
+          const isTerminal = ev.phase === 'completed' || ev.phase === 'failed' || ev.phase === 'cancelled';
+          this.sessionManager.updateActiveSession((s) => {
+            if (isTerminal) {
+              s.activePhase = undefined;
+              s.activePhaseSummary = undefined;
+              s.status = ev.phase as SessionData['status'];
+              s.activities = finalizeRunningActivities(s.activities || [], ev.runId, ev.phase as any);
+            } else {
+              s.activePhase = ev.phase;
+              s.activePhaseSummary = ev.summary;
+            }
+          });
+          this.postMessageSafe({ type: 'statusUpdate', event: ev });
+          break;
+        }
+        case 'message_delta': {
+          this.postMessageSafe({ type: 'messageDelta', event: ev });
+          break;
+        }
+        case 'activity_upsert': {
+          this.sessionManager.updateActiveSession((s) => {
+            s.activities = upsertActivityItem(s.activities || [], ev.item);
+          });
+          this.postMessageSafe({ type: 'activityUpsert', item: ev.item });
+          if (ev.item.category === 'file' && ev.item.status === 'completed') {
+            this.changesManager?.refresh().catch(() => {});
+          }
+          break;
+        }
+        case 'plan': {
+          this.sessionManager.updateActiveSession((s) => {
+            s.plan = ev.plan;
+            s.planExplicit = ev.explicit;
+          });
+          this.postMessageSafe({ type: 'planUpdate', plan: ev.plan, explicit: ev.explicit });
+          break;
+        }
+      }
     });
 
     this.orchestrator.onApproval((req) => {
-      this._view?.webview.postMessage({ type: 'approvalRequest', request: req });
+      this.postMessageSafe({ type: 'approvalRequest', request: req });
     });
 
     this.sessionManager.onDidChangeSessions(() => {
+      this.syncActiveSession();
+    });
+
+    this.modelRegistry.onDidChangeModels(() => {
       this.syncActiveSession();
     });
   }
@@ -55,6 +198,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     _token: vscode.CancellationToken
   ) {
     this._view = webviewView;
+    webviewView.onDidDispose(() => {
+      this._view = undefined;
+    });
 
     webviewView.webview.options = {
       enableScripts: true,
@@ -65,16 +211,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
       switch (data.command) {
+        case 'runSlashCommand':
+        case 'confirmSlashCommand': {
+          const rawCmd = String(data.text || '').trim();
+          if (!rawCmd) return;
+          const confirmed = data.command === 'confirmSlashCommand' || !!data.confirmed;
+          await this.executeSlashCommand(rawCmd, confirmed);
+          return;
+        }
+
         case 'sendMessage': {
           const text = data.text?.trim();
           if (!text) return;
+          if (isSlashCommandInput(text)) {
+            await this.executeSlashCommand(text, false);
+            return;
+          }
 
           // If no active session, create one
           let active = this.sessionManager.getActiveSession();
           if (!active) {
-            const models = await this.ollama.listModels();
-            const model = models[0]?.name || 'qwen3.8:27b';
-            active = this.sessionManager.createSession(text, model);
+            const firstAvailable = await this.modelRegistry.getDefaultOrFirstAvailableModel();
+            const model = firstAvailable?.id || '';
+            active = this.sessionManager.createSession(text, model, {
+              providerId: firstAvailable?.providerId || 'ollama',
+              modelId: model,
+              modelName: firstAvailable?.displayName || '',
+            });
           } else if (active.title === 'New Session' || active.title === 'New Section') {
             const newTitle = text.length > 36 ? text.substring(0, 36).trim() + '...' : text;
             this.sessionManager.renameSession(active.id, newTitle);
@@ -92,42 +255,63 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           this.sessionManager.updateActiveSession((s) => {
             s.messages.push(userMsg);
             s.status = 'running';
+            s.activePhase = 'analyzing';
+            s.activePhaseSummary = 'Analyzing the task';
+            s.planExplicit = false;
           });
-          this._view?.webview.postMessage({ type: 'addMessage', message: userMsg });
+          this.postMessageSafe({ type: 'addMessage', message: userMsg });
 
           try {
             const currentSession = this.sessionManager.getActiveSession();
             const history = currentSession?.messages ? currentSession.messages.map((m) => ({ role: m.senderRole, content: m.content })) : [];
             await this.orchestrator.submitTask(text, currentSession?.config, history);
             this.sessionManager.updateActiveSession((s) => {
-              s.status = 'completed';
+              if (s.status !== 'cancelled') {
+                s.status = 'completed';
+              }
+              s.activePhase = undefined;
+              s.activePhaseSummary = undefined;
+              s.activities = finalizeRunningActivities(s.activities || [], this.activeRunId || '', 'completed');
             });
+            this.postMessageSafe({ type: 'runFinished', status: 'completed' });
           } catch (err: any) {
+            const isCancelled = /cancel|abort/i.test(err?.message || '');
+            const finalStatus = isCancelled ? 'cancelled' : 'failed';
             this.sessionManager.updateActiveSession((s) => {
-              s.status = 'failed';
+              s.status = finalStatus;
+              s.activePhase = undefined;
+              s.activePhaseSummary = undefined;
+              s.activities = finalizeRunningActivities(s.activities || [], this.activeRunId || '', finalStatus);
             });
+            this.postMessageSafe({ type: 'runFinished', status: finalStatus });
             console.error('[LocalCoders] Task execution error:', err.message);
-            this._view?.webview.postMessage({
-              type: 'addMessage',
-              message: {
-                id: `err_${Date.now()}`,
-                senderId: 'system',
-                senderName: 'System',
-                senderRole: 'assistant',
-                content: `⚠️ **Task Warning / Error**: ${err.message}`,
-                timestamp: Date.now(),
-              },
-            });
+            if (!isCancelled) {
+              this.postMessageSafe({
+                type: 'addMessage',
+                message: {
+                  id: `err_${Date.now()}`,
+                  senderId: 'system',
+                  senderName: 'System',
+                  senderRole: 'assistant',
+                  content: `**Task Warning / Error**: ${err.message}`,
+                  timestamp: Date.now(),
+                },
+              });
+            }
           }
           break;
         }
 
         case 'newSession':
         case 'newSection': {
-          const models = await this.modelRegistry.getAvailableModels();
-          const model = models[0]?.id || 'qwen3.8:27b';
-          this.sessionManager.createSession('New Section', model);
-          this.syncActiveSession();
+          const firstAvailable = await this.modelRegistry.getDefaultOrFirstAvailableModel();
+          const model = firstAvailable?.id || '';
+          this.sessionManager.createSession('New Section', model, {
+            providerId: firstAvailable?.providerId || 'ollama',
+            modelId: model,
+            modelName: firstAvailable?.displayName || '',
+          });
+          await this.syncActiveSession();
           break;
         }
 
@@ -184,29 +368,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }
 
         case 'cancelTask': {
+          this._slashAbortController?.abort();
+          this._slashAbortController = undefined;
           this.orchestrator.cancelTask();
           this.sessionManager.updateActiveSession((s) => {
-            s.status = 'idle';
+            s.status = 'cancelled';
+            s.activePhase = undefined;
+            s.activePhaseSummary = undefined;
+            s.activities = finalizeRunningActivities(s.activities || [], this.activeRunId || '', 'cancelled');
           });
+          this.postMessageSafe({ type: 'runFinished', status: 'cancelled' });
           break;
         }
 
-        case 'selectModel': {
-          const models = await this.ollama.listModels();
-          if (models.length === 0) {
-            vscode.window.showWarningMessage('No Ollama models found. Open Model Manager to pull a model.');
-            return;
-          }
-          const picked = await vscode.window.showQuickPick(
-            models.map((m) => ({ label: m.name, description: m.details?.parameter_size || '' })),
-            { placeHolder: 'Select active model for Main Agent' }
-          );
-          if (picked) {
-            this.sessionManager.updateActiveSession((s) => {
-              s.model = picked.label;
-            });
-            this.syncActiveSession();
-          }
+        case 'clearActivities': {
+          this.sessionManager.updateActiveSession((s) => {
+            s.activities = [];
+          });
+          this.syncActiveSession();
+          break;
+        }
+
+        case 'focusIntegratedTerminal': {
+          vscode.commands.executeCommand('workbench.action.terminal.focus');
           break;
         }
 
@@ -223,10 +407,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           });
           if (picked) {
             if (picked.action === 'newSection') {
-              const models = await this.ollama.listModels();
-              const model = models[0]?.name || 'qwen3.8:27b';
-              this.sessionManager.createSession('New Section', model);
-              this.syncActiveSession();
+              const firstAvailable = await this.modelRegistry.getDefaultOrFirstAvailableModel();
+              const model = firstAvailable?.id || '';
+              this.sessionManager.createSession('New Section', model, {
+                providerId: firstAvailable?.providerId || 'ollama',
+                modelId: model,
+                modelName: firstAvailable?.displayName || '',
+              });
+              await this.syncActiveSession();
             } else if (picked.action === 'renameActive') {
               const active = this.sessionManager.getActiveSession();
               if (active) {
@@ -240,7 +428,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
                 }
               }
             } else if (picked.action === 'selectModel') {
-              vscode.commands.executeCommand('localcoders.selectModel');
+              vscode.commands.executeCommand('localcoders.selectMainAgent');
             } else if (picked.action === 'clearActive') {
               this.sessionManager.updateActiveSession((s) => {
                 s.messages = [];
@@ -273,33 +461,66 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           vscode.commands.executeCommand('localcoders.openSetupWizard');
           break;
 
+        case 'refreshModels': {
+          await this.modelRegistry.refreshAll(true);
+          await this.syncActiveSession();
+          break;
+        }
+
+        case 'openModelManager': {
+          vscode.commands.executeCommand('localcoders.manageModels');
+          break;
+        }
+
         case 'selectModel': {
           const modelId = data.modelId;
           if (!modelId) {
             const models = await this.modelRegistry.getAvailableModels();
             const picked = await vscode.window.showQuickPick(
-              models.map(m => ({ label: m.name, description: m.providerName + ' • ' + (m.contextWindowLabel || ''), id: m.id, provider: m.provider })),
-              { placeHolder: 'Select model for coding agent' }
+              models.map(m => ({
+                label: m.displayName,
+                description: `${m.providerName} | ${m.contextWindow ? Math.round(m.contextWindow / 1024) + 'k ctx' : 'Context: Unknown'} | ${m.availability}`,
+                id: m.id,
+                provider: m.providerId,
+              })),
+              { placeHolder: models.length > 0 ? 'Select discovered model' : 'No models discovered — configure Ollama or Cloud providers' }
             );
             if (picked) {
+              const pickedMeta = await this.modelRegistry.getModelById(picked.id);
               this.sessionManager.updateActiveConfig((cfg) => {
                 cfg.modelId = picked.id;
                 cfg.modelName = picked.label;
                 cfg.providerId = picked.provider;
+                if (pickedMeta?.reasoningEffortsSupported?.length && !pickedMeta.reasoningEffortsSupported.includes(cfg.reasoningEffort)) {
+                  cfg.reasoningEffort = pickedMeta.defaultReasoningEffort || pickedMeta.reasoningEffortsSupported[0];
+                }
               });
               await this.modelRegistry.recordModelUsage(picked.id);
-              this.syncActiveSession();
+              await this.syncActiveSession();
             }
             return;
           }
           const model = await this.modelRegistry.getModelById(modelId);
           this.sessionManager.updateActiveConfig((cfg) => {
-            cfg.modelId = modelId;
-            cfg.modelName = model?.name || data.modelName || modelId;
-            if (model?.provider || data.provider) cfg.providerId = model?.provider || data.provider;
+            cfg.modelId = model?.id || modelId;
+            cfg.modelName = model?.displayName || data.modelName || modelId;
+            if (model?.providerId || data.provider) cfg.providerId = model?.providerId || data.provider;
+            if (model?.reasoningEffortsSupported?.length && !model.reasoningEffortsSupported.includes(cfg.reasoningEffort)) {
+              cfg.reasoningEffort = model.defaultReasoningEffort || model.reasoningEffortsSupported[0];
+            }
           });
-          await this.modelRegistry.recordModelUsage(modelId);
-          this.syncActiveSession();
+          await this.modelRegistry.recordModelUsage(model?.id || modelId);
+          await this.syncActiveSession();
+          break;
+        }
+
+        case 'setModelRuntimeParams': {
+          this.sessionManager.updateActiveConfig((cfg) => {
+            cfg.temperature = typeof data.temperature === 'number' ? data.temperature : undefined;
+            cfg.maxOutputTokens = typeof data.maxOutputTokens === 'number' ? data.maxOutputTokens : undefined;
+            cfg.contextLimit = typeof data.contextLimit === 'number' ? data.contextLimit : undefined;
+          });
+          await this.syncActiveSession();
           break;
         }
 
@@ -339,6 +560,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             if (this.permissionManager) {
               this.permissionManager.setMode(data.permissionMode);
             }
+            try {
+              await vscode.workspace.getConfiguration('localcoders').update('defaultPermissionMode', data.permissionMode, vscode.ConfigurationTarget.Global);
+            } catch {}
             this.syncActiveSession();
           }
           break;
@@ -355,7 +579,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         case 'searchModels': {
           const query = data.query || '';
           const modelsGrouped = await this.modelRegistry.getGroupedModels(query);
-          this._view?.webview.postMessage({
+          this.postMessageSafe({
             type: 'modelsGroupedResponse',
             modelsGrouped,
             query,
@@ -463,6 +687,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           vscode.commands.executeCommand('localcoders.mcpServersView.focus');
           break;
         }
+
+        case 'showChangesPanel': {
+          vscode.commands.executeCommand('localcoders.changesView.focus');
+          break;
+        }
       }
     });
 
@@ -470,12 +699,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   }
 
   public async syncActiveSession() {
-    if (!this._view) return;
+    if (!this._view || this._isDisposed) return;
     const session = this.sessionManager.getActiveSession();
     const allSessions = this.sessionManager.getAllSessions();
     const workspaceName = vscode.workspace.workspaceFolders?.[0]?.name || 'No Project';
 
-    let modelsGrouped: Record<string, ModelMetadata[]> = {};
+    let modelsGrouped: any = { local: [], cloud: [], providers: [] };
     let allModels: ModelMetadata[] = [];
     try {
       modelsGrouped = await this.modelRegistry.getGroupedModels();
@@ -484,10 +713,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       console.warn('[ChatViewProvider] Failed to fetch models:', e);
     }
 
+    const firstAvailable = await this.modelRegistry.getDefaultOrFirstAvailableModel();
+    const fallbackModelId = session?.model || firstAvailable?.id || '';
+    const fallbackModelName = firstAvailable?.displayName || fallbackModelId || 'Select Model';
+
     const currentConfig = session?.config || {
-      providerId: 'ollama',
-      modelId: session?.model || 'qwen3.8:27b',
-      reasoningEffort: 'medium',
+      providerId: firstAvailable?.providerId || 'ollama',
+      modelId: fallbackModelId,
+      modelName: fallbackModelName,
+      reasoningEffort: firstAvailable?.defaultReasoningEffort || 'medium',
       fastMode: false,
       executionMode: 'code',
       permissionMode: 'smart',
@@ -495,8 +729,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       projectContext: [],
     };
     const permissionMode = this.permissionManager?.getMode() || currentConfig.permissionMode || 'smart';
+    this.permissionManager?.setMode(permissionMode as SecurityMode);
+    const workspaceRoot = this.getActiveWorkspaceRoot();
+    const slashCommands = ensureBuiltinSlashCommandsRegistered(
+      SlashCommandRegistry.getInstance(),
+      workspaceRoot
+    ).getSerializableCatalog();
 
-    this._view.webview.postMessage({
+    this.postMessageSafe({
       type: 'loadSession',
       session,
       allSessions,
@@ -505,11 +745,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       allModels,
       currentConfig,
       permissionMode,
+      slashCommands,
     });
   }
 
   private _getHtmlForWebview(): string {
-    const username = process.env.USER || process.env.USERNAME || 'developer';
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -517,20 +757,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
     :root {
-      --bg: var(--vscode-editor-background, #181818);
-      --fg: var(--vscode-editor-foreground, #e5e5e5);
-      --card-bg: var(--vscode-sideBar-background, #1e1e1e);
-      --border: var(--vscode-widget-border, #2a2a2a);
-      --hover-bg: var(--vscode-list-hoverBackground, #262626);
-      --input-bg: var(--vscode-input-background, #141414);
-      --accent: #38bdf8;
-      --accent-muted: rgba(56, 189, 248, 0.15);
+      --bg: var(--vscode-editor-background, #111214);
+      --fg: var(--vscode-editor-foreground, #e4e4e7);
+      --card-bg: var(--vscode-sideBar-background, #16171a);
+      --border: var(--vscode-widget-border, rgba(161, 161, 170, 0.16));
+      --hover-bg: color-mix(in srgb, var(--vscode-editor-foreground, #e4e4e7) 6%, transparent);
+      --input-bg: var(--vscode-input-background, #18191d);
+      --accent: var(--vscode-textLink-foreground, #60a5fa);
+      --accent-muted: color-mix(in srgb, var(--vscode-editor-foreground, #e4e4e7) 8%, transparent);
       --success: #22c55e;
       --danger: #ef4444;
       --warning: #f59e0b;
-      --text-muted: #888888;
+      --text-muted: var(--vscode-descriptionForeground, #8b8f98);
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    ${getLucideCss()}
+    .btn-mode-switch, .pill, .section-dropdown-btn, .section-meta-row, .msg-agent-badge, .plan-title, .tool-card-header, .activity-group-header {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .header-icon-btn, .btn-drawer-close, .btn-card-action, .btn-send, .attached-chip-remove, .popover-icon, .option-icon, .option-check, .pill-arrow, .section-icon, .dropdown-caret {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
     body {
       background-color: var(--bg);
       color: var(--fg);
@@ -611,6 +862,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     /* 2. Chat Feed */
     #chat-container {
       flex: 1;
+      min-height: 0;
       overflow-y: auto;
       padding: 16px 14px;
       display: flex;
@@ -618,36 +870,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       gap: 16px;
     }
 
-    /* Welcome Screen in Antigravity Style */
+    /* Quiet Empty State */
     .empty-welcome {
       margin: auto;
       text-align: center;
-      max-width: 320px;
+      max-width: 280px;
       display: flex;
       flex-direction: column;
       align-items: center;
-      gap: 16px;
+      gap: 6px;
       color: var(--text-muted);
       padding: 24px 12px;
     }
-    .welcome-logo-container {
-      width: 60px;
-      height: 60px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-    }
-    .welcome-logo-svg {
-      width: 52px;
-      height: 52px;
-      filter: drop-shadow(0 0 16px rgba(56, 189, 248, 0.45));
-    }
     .welcome-title {
-      font-size: 18px;
-      font-weight: 500;
+      font-size: 13.5px;
+      font-weight: 600;
       color: var(--fg);
-      letter-spacing: -0.3px;
-      line-height: 1.35;
+      line-height: 1.4;
+    }
+    .welcome-sub {
+      font-size: 12px;
+      color: var(--text-muted);
     }
 
     /* Message rows */
@@ -659,10 +902,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
     .msg-user {
       align-self: flex-end;
-      background: rgba(56, 189, 248, 0.12);
-      border: 1px solid rgba(56, 189, 248, 0.25);
-      border-radius: 10px 10px 2px 10px;
-      padding: 9px 13px;
+      background: color-mix(in srgb, var(--fg) 7%, transparent);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 12px;
       max-width: 85%;
       word-break: break-word;
       font-size: 13px;
@@ -681,9 +924,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       display: flex;
       align-items: center;
       gap: 6px;
-      font-size: 11px;
+      font-size: 11.5px;
       font-weight: 600;
-      color: var(--accent);
+      color: var(--text-muted);
       margin-bottom: 4px;
     }
 
@@ -827,13 +1070,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       cursor: pointer;
     }
 
-    /* 3. Antigravity-style Floating Card Composer */
+    /* Minimalist Matte Composer */
     .composer-surface {
-      padding: 10px 14px 14px 14px;
+      padding: 8px 12px 12px 12px;
       background: var(--bg);
       display: flex;
       flex-direction: column;
-      gap: 8px;
+      gap: 6px;
       flex-shrink: 0;
     }
     .mode-bar {
@@ -851,23 +1094,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       cursor: pointer;
     }
     .mode-btn.active {
-      background: rgba(255, 255, 255, 0.08);
+      background: color-mix(in srgb, var(--fg) 8%, transparent);
+      border-color: var(--border);
       color: var(--fg);
       font-weight: 600;
     }
     .composer-card {
-      background: var(--card-bg);
-      border: 1px solid rgba(255, 255, 255, 0.12);
-      border-radius: 12px;
-      padding: 10px 12px;
+      background: var(--input-bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 9px 11px;
       display: flex;
       flex-direction: column;
-      gap: 8px;
-      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+      gap: 7px;
+      transition: border-color 0.15s ease;
     }
     .composer-card:focus-within {
-      border-color: rgba(56, 189, 248, 0.5);
-      box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.2);
+      border-color: color-mix(in srgb, var(--fg) 30%, transparent);
     }
     .composer-top-row {
       display: flex;
@@ -1329,272 +1572,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       margin: 6px 0;
     }
 
-    /* Model Selector Modal */
-    .modal-search-header {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      padding: 8px 10px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-    }
-    .modal-search-input {
-      flex: 1;
-      background: transparent;
-      border: none;
-      outline: none;
-      font-size: 12.5px;
-      color: #f1f5f9;
-      font-family: inherit;
-    }
-    .modal-search-input::placeholder {
-      color: #64748b;
-    }
-    .kbd-badge {
-      font-size: 10px;
-      padding: 2px 4px;
-      border-radius: 4px;
-      background: rgba(255, 255, 255, 0.08);
-      color: #94a3b8;
-      font-family: var(--vscode-editor-font-family, monospace);
-      border: 1px solid rgba(255, 255, 255, 0.1);
-    }
-    .clear-search-btn {
-      background: none;
-      border: none;
-      color: #94a3b8;
-      cursor: pointer;
-      font-size: 12px;
-    }
-    .model-categories-scroll {
-      flex: 1;
-      overflow-y: auto;
-      max-height: 380px;
-      padding: 4px;
-    }
-    .model-category-header {
-      font-size: 9.5px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.6px;
-      color: #64748b;
-      padding: 6px 8px 3px 8px;
-    }
-    .model-item-row {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 6px 8px;
-      border-radius: 6px;
-      cursor: pointer;
-      transition: background 0.1s ease;
-    }
-    .model-item-row:hover {
-      background: rgba(255, 255, 255, 0.06);
-    }
-    .model-item-row.selected {
-      background: rgba(56, 189, 248, 0.12);
-    }
-    .model-item-icon {
-      width: 22px;
-      height: 22px;
-      border-radius: 4px;
-      background: rgba(255, 255, 255, 0.05);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 12px;
-      flex-shrink: 0;
-    }
-    .model-item-info {
-      flex: 1;
-      min-width: 0;
-    }
-    .model-item-name-row {
-      display: flex;
-      align-items: center;
-      gap: 5px;
-    }
-    .model-item-name {
-      font-size: 12px;
-      font-weight: 600;
-      color: #f8fafc;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .model-tag {
-      font-size: 9px;
-      padding: 1px 3px;
-      border-radius: 3px;
-      font-weight: 600;
-    }
-    .model-tag.local { background: rgba(56, 189, 248, 0.18); color: #38bdf8; }
-    .model-tag.new { background: rgba(34, 197, 94, 0.2); color: #4ade80; }
-    .model-tag.free { background: rgba(168, 85, 247, 0.2); color: #c084fc; }
-    .model-item-meta-row {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 10.5px;
-      color: #94a3b8;
-      margin-top: 2px;
-    }
-    .status-dot-available {
-      width: 5px;
-      height: 5px;
-      border-radius: 50%;
-      background: #22c55e;
-      display: inline-block;
-    }
-    .model-fav-btn {
-      background: none;
-      border: none;
-      font-size: 13px;
-      color: #64748b;
-      cursor: pointer;
-      padding: 2px;
-      transition: color 0.1s ease;
-    }
-    .model-fav-btn:hover, .model-fav-btn.is-fav {
-      color: #fbbf24;
-    }
-    .model-check {
-      font-size: 12px;
-      font-weight: 700;
-      color: #38bdf8;
-      width: 14px;
-      text-align: center;
-    }
-
-    /* Model Config Popover */
-    .config-popover-header {
-      padding: 6px 8px 8px 8px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-    }
-    .config-popover-title {
-      font-size: 12px;
-      font-weight: 600;
-      color: #f8fafc;
-    }
-    .config-model-name {
-      font-size: 11px;
-      color: var(--accent);
-      font-family: var(--vscode-editor-font-family, monospace);
-      margin-top: 2px;
-    }
-    .config-section {
-      padding: 8px 8px;
-      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-    }
-    .config-section-label {
-      font-size: 9.5px;
-      font-weight: 700;
-      letter-spacing: 0.6px;
-      color: #64748b;
-      margin-bottom: 6px;
-      text-transform: uppercase;
-    }
-    .effort-segmented-bar {
-      display: flex;
-      background: rgba(255, 255, 255, 0.05);
-      border-radius: 6px;
-      padding: 2px;
-      gap: 2px;
-    }
-    .effort-seg-btn {
-      flex: 1;
-      background: transparent;
-      border: none;
-      color: #94a3b8;
-      font-size: 10.5px;
-      font-weight: 500;
-      padding: 4px 0;
-      border-radius: 4px;
-      cursor: pointer;
-      transition: all 0.1s ease;
-    }
-    .effort-seg-btn:hover {
-      color: #ffffff;
-    }
-    .effort-seg-btn.active {
-      background: var(--accent);
-      color: #0f172a;
-      font-weight: 700;
-    }
-    .fast-mode-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    .fast-mode-title {
-      font-size: 12px;
-      font-weight: 600;
-      color: #f8fafc;
-    }
-    .fast-mode-desc {
-      font-size: 10.5px;
-      color: #94a3b8;
-      margin-top: 1px;
-    }
-    .toggle-switch {
-      position: relative;
-      display: inline-block;
-      width: 32px;
-      height: 18px;
-      flex-shrink: 0;
-    }
-    .toggle-switch input {
-      opacity: 0;
-      width: 0;
-      height: 0;
-    }
-    .toggle-slider {
-      position: absolute;
-      cursor: pointer;
-      top: 0; left: 0; right: 0; bottom: 0;
-      background-color: rgba(255, 255, 255, 0.15);
-      transition: .2s;
-      border-radius: 18px;
-    }
-    .toggle-slider:before {
-      position: absolute;
-      content: "";
-      height: 12px;
-      width: 12px;
-      left: 3px;
-      bottom: 3px;
-      background-color: white;
-      transition: .2s;
-      border-radius: 50%;
-    }
-    input:checked + .toggle-slider {
-      background-color: var(--accent);
-    }
-    input:checked + .toggle-slider:before {
-      transform: translateX(14px);
-      background-color: #0f172a;
-    }
-    .resource-card {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      background: rgba(255, 255, 255, 0.03);
-      padding: 6px 8px;
-      border-radius: 6px;
-      border: 1px solid rgba(255, 255, 255, 0.06);
-    }
-    .resource-icon {
-      font-size: 15px;
-    }
-    .resource-title {
-      font-size: 11.5px;
-      font-weight: 600;
-      color: #f1f5f9;
-    }
-    .resource-desc {
-      font-size: 10.5px;
-      color: #94a3b8;
-    }
+    /* Shared Model Selector & Configuration Popovers */
+    ${getModelSelectorStyles()}
 
     /* Attached Context Chips Bar */
     .composer-attached-row {
@@ -1631,96 +1610,210 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     .tool-btn {
       width: 24px;
       height: 24px;
-      border-radius: 4px;
+      box-sizing: border-box;
+      border-radius: 6px;
       border: 1px solid rgba(255, 255, 255, 0.1);
-      background: rgba(255, 255, 255, 0.04);
+      background: rgba(255, 255, 255, 0.05);
       color: var(--text-muted);
       cursor: pointer;
-      display: flex;
+      display: inline-flex;
       align-items: center;
       justify-content: center;
       font-size: 13px;
+      line-height: 1;
+      flex-shrink: 0;
+      transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
     }
     .tool-btn:hover {
       background: rgba(255, 255, 255, 0.1);
+      border-color: rgba(255, 255, 255, 0.2);
       color: #ffffff;
     }
-    .tool-btn-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      padding: 2px 7px;
-      border-radius: 5px;
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      color: #cbd5e1;
-      font-size: 11px;
-      font-weight: 500;
-      cursor: pointer;
-      transition: all 0.12s ease;
-    }
-    .tool-btn-pill:hover {
-      background: rgba(255, 255, 255, 0.1);
-      color: #ffffff;
-    }
-    .model-selector-pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-      padding: 2px 8px;
-      border-radius: 5px;
-      background: rgba(255, 255, 255, 0.06);
-      border: 1px solid rgba(255, 255, 255, 0.1);
-      font-size: 11px;
-      color: #f1f5f9;
-      cursor: pointer;
-      font-weight: 500;
-    }
-    .model-selector-pill:hover {
-      background: rgba(255, 255, 255, 0.12);
-    }
+    .tool-btn-pill,
+    .model-selector-pill,
     .effort-selector-pill {
       display: inline-flex;
       align-items: center;
-      gap: 3px;
-      padding: 2px 6px;
-      border-radius: 4px;
-      background: rgba(56, 189, 248, 0.1);
-      border: 1px solid rgba(56, 189, 248, 0.2);
-      color: #38bdf8;
-      font-size: 10.5px;
-      font-weight: 600;
+      justify-content: center;
+      gap: 4px;
+      height: 24px;
+      box-sizing: border-box;
+      padding: 0 8px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      color: #e2e8f0;
+      font-family: inherit;
+      font-size: 11px;
+      font-weight: 500;
+      line-height: 1;
+      white-space: nowrap;
       cursor: pointer;
+      flex-shrink: 0;
+      transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
     }
+    .tool-btn-pill:hover,
+    .model-selector-pill:hover,
     .effort-selector-pill:hover {
-      background: rgba(56, 189, 248, 0.2);
+      background: rgba(255, 255, 255, 0.1);
+      border-color: rgba(255, 255, 255, 0.2);
+      color: #ffffff;
+    }
+    .lc-icon-gap {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .model-provider-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 13px;
+      height: 13px;
+      flex-shrink: 0;
     }
     .pill-arrow {
-      font-size: 9px;
-      opacity: 0.7;
+      display: inline-flex;
+      align-items: center;
+      opacity: 0.72;
+      flex-shrink: 0;
     }
 
     .btn-mode-switch {
       display: inline-flex;
       align-items: center;
       gap: 4px;
-      background: rgba(56, 189, 248, 0.12);
-      border: 1px solid rgba(56, 189, 248, 0.3);
-      color: #38bdf8;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-muted);
       font-size: 11px;
-      font-weight: 600;
+      font-weight: 500;
       padding: 2px 7px;
       border-radius: 4px;
       cursor: pointer;
       height: 24px;
-      transition: all 0.15s ease;
+      transition: background 0.12s ease, color 0.12s ease;
     }
     .btn-mode-switch:hover {
-      background: rgba(56, 189, 248, 0.22);
-      color: #ffffff;
-      border-color: rgba(56, 189, 248, 0.5);
+      background: var(--hover-bg);
+      color: var(--fg);
     }
 
+    /* Segmented View Tabs (Conversation / Activity / Terminal) */
+    .lc-side-tabs {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 6px 12px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
+      flex-shrink: 0;
+    }
+    .lc-side-tab {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--text-muted);
+      font-size: 11.5px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .lc-side-tab:hover {
+      background: var(--hover-bg);
+      color: var(--fg);
+    }
+    .lc-side-tab.active {
+      background: color-mix(in srgb, var(--fg) 8%, transparent);
+      border-color: var(--border);
+      color: var(--fg);
+      font-weight: 600;
+    }
+    .lc-tab-count {
+      font-size: 10px;
+      padding: 0 5px;
+      border-radius: 10px;
+      background: rgba(148, 163, 184, 0.18);
+      color: var(--fg);
+      font-weight: 600;
+    }
+    .lc-side-tab-spacer {
+      flex: 1;
+    }
+    #activity-panel {
+      flex: 1;
+      display: none;
+      flex-direction: column;
+      overflow: hidden;
+      background: var(--bg);
+    }
+    #activity-panel.visible {
+      display: flex;
+    }
+    .lc-act-filter-bar {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+    .lc-act-filter-pill {
+      padding: 2px 8px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text-muted);
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .lc-act-filter-pill.active {
+      background: var(--accent-muted);
+      border-color: rgba(56, 189, 248, 0.35);
+      color: var(--accent);
+      font-weight: 600;
+    }
+    .lc-act-clear-btn {
+      margin-left: auto;
+      padding: 2px 8px;
+      border-radius: 5px;
+      border: 1px solid var(--border);
+      background: transparent;
+      color: var(--text-muted);
+      font-size: 10.5px;
+      cursor: pointer;
+    }
+    .lc-act-clear-btn:hover {
+      color: var(--fg);
+      background: var(--hover-bg);
+    }
+    #activity-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .lc-live-strip {
+      padding: 0 14px 4px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .lc-live-strip:empty {
+      display: none;
+    }
+
+    ${getActivityStreamStyles()}
+    ${getSlashCommandStyles()}
+    ${getSessionsBarStyles()}
   </style>
 </head>
 <body>
@@ -1728,13 +1821,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <div class="header-bar">
     <div class="header-left">
       <button class="section-selector-btn" id="btn-section-dropdown" title="Click to view all chat sections / history">
-        <span class="section-icon">💬</span>
+        <span class="section-icon">${lucideSvg('message-square', 14)}</span>
         <span class="session-title-label" id="session-title">New Section</span>
-        <span class="dropdown-caret">⌄</span>
+        <span class="dropdown-caret">${lucideSvg('chevron-down', 12)}</span>
       </button>
     </div>
     <div class="header-actions">
-      <button class="btn-mode-switch" id="btn-switch-agent-view" title="Switch to full 3-column Devin Agent cockpit">☵ Cockpit</button>
+      <button class="btn-mode-switch" id="btn-switch-agent-view" title="Switch to full 3-column Devin Agent cockpit">${lucideSvg('columns-2', 13)} <span>Cockpit</span></button>
       <button class="header-icon-btn" id="btn-new-section" title="New Chat Section (+)">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
           <line x1="12" y1="5" x2="12" y2="19"></line>
@@ -1747,44 +1840,79 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           <polyline points="12 6 12 12 16 14"></polyline>
         </svg>
       </button>
-      <button class="header-icon-btn" id="btn-more-options" title="Section Options">⋯</button>
+      <button class="header-icon-btn" id="btn-more-options" title="Section Options">${lucideSvg('ellipsis', 14)}</button>
     </div>
   </div>
 
   <!-- Sections / History Drawer -->
   <div class="sections-drawer" id="sections-drawer">
-    <div class="drawer-header">
-      <div class="drawer-title">
-        <span>Chat Sections</span>
-        <span class="drawer-count-badge" id="drawer-count">0</span>
-      </div>
-      <div class="drawer-header-actions">
-        <button class="btn-drawer-new" id="btn-drawer-new">+ New Section</button>
-        <button class="btn-drawer-close" id="btn-drawer-close">✕</button>
+    <div class="lc-sessions-header">
+      <span class="lc-sessions-heading">Sessions</span>
+      <div class="lc-sessions-hdr-actions">
+        <button type="button" class="lc-sess-hdr-btn" id="btn-drawer-new" title="New Session">${lucideSvg('plus', 15)}</button>
+        <button type="button" class="lc-sess-hdr-btn" id="btn-drawer-filter" title="Filter &amp; Sort">${lucideSvg('sliders-horizontal', 14)}</button>
+        <button type="button" class="lc-sess-hdr-btn" id="btn-drawer-more" title="Session Options">${lucideSvg('ellipsis', 14)}</button>
+        <button type="button" class="lc-sess-hdr-btn" id="btn-drawer-close" title="Close">${lucideSvg('x', 14)}</button>
+        <div class="lc-sessions-menu" id="drawer-sessions-menu">
+          <button type="button" class="lc-sessions-menu-item" data-drawer-act="new">${lucideSvg('plus', 12)}<span>New Session</span></button>
+          <button type="button" class="lc-sessions-menu-item" data-drawer-act="toggleSort">${lucideSvg('arrow-up-down', 12)}<span id="drawer-sort-lbl">Sort: Alphabetical</span></button>
+          <div class="lc-sessions-menu-sep"></div>
+          <button type="button" class="lc-sessions-menu-item" data-drawer-act="close">${lucideSvg('x', 12)}<span>Close Sessions</span></button>
+        </div>
       </div>
     </div>
-    <div class="drawer-search-bar">
-      <input type="text" class="drawer-search-input" id="drawer-search-input" placeholder="Search saved sections..." />
+    <div class="lc-sessions-filter-bar" id="drawer-filter-bar">
+      <div class="lc-sessions-search-wrap">
+        <span class="lc-sessions-search-ico">${lucideSvg('search', 12)}</span>
+        <input type="text" class="lc-sessions-filter-input" id="drawer-search-input" placeholder="Filter sessions..." />
+      </div>
     </div>
-    <div class="drawer-list" id="drawer-sections-list"></div>
+    <button type="button" class="lc-recent-subheader" id="btn-drawer-recent">
+      ${lucideSvg('clock', 12)}
+      <span>Recent</span>
+    </button>
+    <div class="lc-sessions-scroll" id="drawer-sections-list"></div>
   </div>
 
-  <!-- 2. Chat Feed -->
+  <!-- Separated Navigation Strip: Conversation vs Agent Activity vs Terminal -->
+  <div class="lc-side-tabs" id="lc-side-tabs">
+    <button class="lc-side-tab active" id="tab-btn-chat" data-tab="chat">
+      ${lucideSvg('message-square', 12)}
+      <span>Conversation</span>
+    </button>
+    <button class="lc-side-tab" id="tab-btn-activity" data-tab="activity">
+      ${lucideSvg('zap', 12)}
+      <span>Activity</span>
+      <span class="lc-tab-count" id="activity-count-badge">0</span>
+    </button>
+    <div class="lc-side-tab-spacer"></div>
+    <button class="lc-side-tab" id="tab-btn-terminal" title="Focus Integrated Terminal">
+      ${lucideSvg('terminal', 12)}
+      <span>Terminal</span>
+    </button>
+  </div>
+
+  <!-- 2A. Chat Feed (Clean Conversation Only) -->
   <div id="chat-container">
     <div class="empty-welcome" id="empty-welcome">
-      <div class="welcome-logo-container">
-        <svg class="welcome-logo-svg" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <path d="M24 6L6 38H16L24 22L32 38H42L24 6Z" fill="url(#brandGlow)" />
-          <defs>
-            <linearGradient id="brandGlow" x1="6" y1="6" x2="42" y2="38" gradientUnits="userSpaceOnUse">
-              <stop stop-color="#38bdf8" />
-              <stop offset="1" stop-color="#818cf8" />
-            </linearGradient>
-          </defs>
-        </svg>
-      </div>
-      <div class="welcome-title">Hey ${username}, what should we build today?</div>
+      <div class="welcome-title">New session</div>
+      <div class="welcome-sub">Type a task or question below. Ctrl+K switches models.</div>
     </div>
+  </div>
+
+  <!-- Safe Single Status Pill + Compact Activity Summary Strip -->
+  <div class="lc-live-strip" id="lc-live-strip"></div>
+
+  <!-- 2B. Separate Agent Activity Panel (Tool / Command / Subagent Cards) -->
+  <div id="activity-panel">
+    <div class="lc-act-filter-bar" id="act-filter-bar">
+      <button class="lc-act-filter-pill active" data-filter="all">All</button>
+      <button class="lc-act-filter-pill" data-filter="command">Commands</button>
+      <button class="lc-act-filter-pill" data-filter="file">Files</button>
+      <button class="lc-act-filter-pill" data-filter="subagent">Agents</button>
+      <button class="lc-act-clear-btn" id="btn-clear-activity">Clear</button>
+    </div>
+    <div id="activity-list"></div>
   </div>
 
   <!-- 3. Antigravity-style Floating Card Composer -->
@@ -1802,47 +1930,47 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       <!-- 1. Attachment / Context Popover -->
       <div class="popover-menu" id="attachMenuPopover">
         <div class="popover-menu-item" data-action="attachFiles">
-          <span class="popover-icon">📎</span>
+          <span class="popover-icon">${lucideSvg('paperclip', 14)}</span>
           <span class="popover-label">Attach files</span>
         </div>
         <div class="popover-menu-item" data-action="quickFile">
-          <span class="popover-icon">📄</span>
+          <span class="popover-icon">${lucideSvg('file-text', 14)}</span>
           <span class="popover-label">Files</span>
         </div>
         <div class="popover-menu-item" data-action="quickDirectory">
-          <span class="popover-icon">📁</span>
+          <span class="popover-icon">${lucideSvg('folder', 14)}</span>
           <span class="popover-label">Directories</span>
         </div>
         <div class="popover-menu-item" data-action="attachGit">
-          <span class="popover-icon">⎇</span>
+          <span class="popover-icon">${lucideSvg('git-branch', 14)}</span>
           <span class="popover-label">Git</span>
         </div>
         <div class="popover-menu-item" data-action="openMcp">
-          <span class="popover-icon">⚡</span>
+          <span class="popover-icon">${lucideSvg('plug', 14)}</span>
           <span class="popover-label">MCP servers</span>
         </div>
         <div class="popover-menu-item" data-action="openRules">
-          <span class="popover-icon">📜</span>
+          <span class="popover-icon">${lucideSvg('scroll-text', 14)}</span>
           <span class="popover-label">Rules</span>
         </div>
         <div class="popover-menu-item" data-action="openSkills">
-          <span class="popover-icon">💡</span>
+          <span class="popover-icon">${lucideSvg('lightbulb', 14)}</span>
           <span class="popover-label">Skills</span>
         </div>
         <div class="popover-menu-item" data-action="attachPlan">
-          <span class="popover-icon">📋</span>
+          <span class="popover-icon">${lucideSvg('list-checks', 14)}</span>
           <span class="popover-label">Plans</span>
         </div>
         <div class="popover-menu-item" data-action="attachConversation">
-          <span class="popover-icon">💬</span>
+          <span class="popover-icon">${lucideSvg('message-square', 14)}</span>
           <span class="popover-label">Conversations</span>
         </div>
         <div class="popover-menu-item" data-action="attachTerminal">
-          <span class="popover-icon">⌨</span>
+          <span class="popover-icon">${lucideSvg('terminal', 14)}</span>
           <span class="popover-label">Terminal</span>
         </div>
         <div class="popover-menu-item" data-action="attachCodemap">
-          <span class="popover-icon">🗺</span>
+          <span class="popover-icon">${lucideSvg('map', 14)}</span>
           <span class="popover-label">Codemaps</span>
         </div>
       </div>
@@ -1855,135 +1983,87 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             <div class="option-title">Code</div>
             <div class="option-desc">Write and edit code</div>
           </div>
-          <div class="option-check" id="checkExec_code">✓</div>
+          <div class="option-check" id="checkExec_code">${lucideSvg('check', 13)}</div>
         </div>
         <div class="popover-card-option" data-exec="smart">
-          <div class="option-icon">✦</div>
+          <div class="option-icon">${lucideSvg('sparkles', 14)}</div>
           <div class="option-content">
             <div class="option-title">Smart</div>
             <div class="option-desc">Auto-approve safe actions</div>
           </div>
-          <div class="option-check" id="checkExec_smart">✓</div>
+          <div class="option-check" id="checkExec_smart">${lucideSvg('check', 13)}</div>
         </div>
         <div class="popover-card-option" data-exec="ask">
-          <div class="option-icon">💬</div>
+          <div class="option-icon">${lucideSvg('message-square', 14)}</div>
           <div class="option-content">
             <div class="option-title">Ask</div>
             <div class="option-desc">Answer questions without code changes</div>
           </div>
-          <div class="option-check" id="checkExec_ask">✓</div>
+          <div class="option-check" id="checkExec_ask">${lucideSvg('check', 13)}</div>
         </div>
         <div class="popover-card-option" data-exec="plan">
-          <div class="option-icon">📋</div>
+          <div class="option-icon">${lucideSvg('list-checks', 14)}</div>
           <div class="option-content">
             <div class="option-title">Plan</div>
             <div class="option-desc">Plan changes before implementing</div>
           </div>
-          <div class="option-check" id="checkExec_plan">✓</div>
+          <div class="option-check" id="checkExec_plan">${lucideSvg('check', 13)}</div>
         </div>
         <div class="popover-divider"></div>
         <div class="popover-card-option" data-perm="bypass" id="optBypassPerms">
-          <div class="option-icon">🛡</div>
+          <div class="option-icon">${lucideSvg('shield', 14)}</div>
           <div class="option-content">
             <div class="option-title">Bypass Permissions</div>
             <div class="option-desc">Auto-approve all safe tool calls</div>
           </div>
-          <div class="option-check" id="checkPerm_bypass">✓</div>
+          <div class="option-check" id="checkPerm_bypass">${lucideSvg('check', 13)}</div>
         </div>
       </div>
 
       <!-- 3. Permission Mode Popover -->
       <div class="popover-card" id="permModePopover" style="width: 280px;">
         <div class="popover-card-option" data-perm="ask">
-          <div class="option-icon">🛡</div>
+          <div class="option-icon">${lucideSvg('shield', 14)}</div>
           <div class="option-content">
             <div class="option-title">Ask Before Actions</div>
             <div class="option-desc">Manual confirmation for each tool call</div>
           </div>
-          <div class="option-check" id="checkPerm_ask">✓</div>
+          <div class="option-check" id="checkPerm_ask">${lucideSvg('check', 13)}</div>
         </div>
         <div class="popover-card-option" data-perm="smart">
-          <div class="option-icon">⚡</div>
+          <div class="option-icon">${lucideSvg('shield-check', 14)}</div>
           <div class="option-content">
             <div class="option-title">Smart Approval</div>
             <div class="option-desc">Auto-approve reads; ask on file writes/shell</div>
           </div>
-          <div class="option-check" id="checkPerm_smart">✓</div>
+          <div class="option-check" id="checkPerm_smart">${lucideSvg('check', 13)}</div>
         </div>
         <div class="popover-card-option" data-perm="bypass">
-          <div class="option-icon">🚀</div>
+          <div class="option-icon">${lucideSvg('shield-alert', 14)}</div>
           <div class="option-content">
             <div class="option-title">Bypass Permissions</div>
             <div class="option-desc">Auto-approve all actions safely</div>
           </div>
-          <div class="option-check" id="checkPerm_bypass_modal">✓</div>
+          <div class="option-check" id="checkPerm_bypass_modal">${lucideSvg('check', 13)}</div>
         </div>
       </div>
 
-      <!-- 4. Advanced Model Selector Popover -->
-      <div class="popover-card model-selector-modal" id="modelSelectorPopover" style="width: 330px; max-height: 460px;">
-        <div class="modal-search-header">
-          <span class="search-icon">🔍</span>
-          <input type="text" id="modelSearchInput" class="modal-search-input" placeholder="Search models..." autocomplete="off" />
-          <span class="kbd-badge">Ctrl+K</span>
-          <button class="clear-search-btn" id="btnClearModelSearch" style="display:none;">✕</button>
-        </div>
-        <div class="model-categories-scroll" id="modelCategoriesContainer">
-          <!-- Categories rendered dynamically -->
-        </div>
-      </div>
-
-      <!-- 5. Model Configuration Popover -->
-      <div class="popover-card" id="modelConfigPopover" style="width: 290px;">
-        <div class="config-popover-header">
-          <div class="config-popover-title">Model Configuration</div>
-          <div class="config-model-name" id="cfgActiveModelName">qwen3.8:27b</div>
-        </div>
-        
-        <div class="config-section">
-          <div class="config-section-label">REASONING EFFORT</div>
-          <div class="effort-segmented-bar" id="effortSegmentedBar">
-            <button class="effort-seg-btn" data-effort="minimal">Min</button>
-            <button class="effort-seg-btn" data-effort="low">Low</button>
-            <button class="effort-seg-btn active" data-effort="medium">Med</button>
-            <button class="effort-seg-btn" data-effort="high">High</button>
-            <button class="effort-seg-btn" data-effort="extra_high">Max</button>
-          </div>
-        </div>
-
-        <div class="config-section">
-          <div class="fast-mode-row">
-            <div class="fast-mode-text">
-              <div class="fast-mode-title">Fast Mode</div>
-              <div class="fast-mode-desc">Prioritize generation speed</div>
-            </div>
-            <label class="toggle-switch">
-              <input type="checkbox" id="chkFastMode" />
-              <span class="toggle-slider"></span>
-            </label>
-          </div>
-        </div>
-
-        <div class="config-section">
-          <div class="config-section-label">RESOURCE &amp; BILLING</div>
-          <div class="resource-card" id="cfgResourceCard">
-            <div class="resource-icon">🖥</div>
-            <div class="resource-details">
-              <div class="resource-title" id="cfgResourceTitle">Local Model (Ollama)</div>
-              <div class="resource-desc" id="cfgResourceDesc">100% On-Device / Zero API Billing</div>
-            </div>
-          </div>
-        </div>
-      </div>
+      ${getSlashCommandPopupMarkup()}
+      ${getModelSelectorMarkup({ compact: true })}
 
       <!-- Attached Chips Row -->
       <div class="composer-attached-row" id="attachedChipsRow" style="display:none;"></div>
 
+      <div class="lc-bypass-indicator" id="bypassModeBanner">
+        <span class="lc-bypass-indicator-left">${lucideSvg('shield-alert', 12)}<span>Bypass Permissions Active</span></span>
+        <button type="button" class="lc-bypass-reset-btn" id="btnResetBypass">Normal</button>
+      </div>
+
       <div class="composer-top-row">
         <span class="chip-project" id="chip-project" title="Workspace Context">
-          <span>📁</span>
+          ${lucideSvg('folder', 13)}
           <span id="chip-project-name">No Project</span>
-          <span style="font-size: 9px; opacity: 0.7;">⌄</span>
+          ${lucideSvg('chevron-down', 11)}
         </span>
       </div>
 
@@ -1993,23 +2073,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         <div class="composer-left-tools">
           <button class="tool-btn" id="btnAttachment" title="Add File / Context">+</button>
           <button class="tool-btn-pill" id="btnExecMode" title="Change Execution Mode">
-            <span id="execModeLabel">&lt;/&gt; Code</span>
-            <span class="pill-arrow">▾</span>
+            <span id="execModeLabel" class="lc-icon-gap">${lucideSvg('code', 13)}<span>Code</span></span>
+            <span class="pill-arrow">${lucideSvg('chevron-down', 11)}</span>
           </button>
           <button class="tool-btn-pill" id="btnPermMode" title="Change Security Permission Policy">
-            <span id="permModeLabel">🛡 Smart</span>
-            <span class="pill-arrow">▾</span>
+            <span id="permModeLabel" class="lc-icon-gap">${lucideSvg('shield-check', 13)}<span>Smart</span></span>
+            <span class="pill-arrow">${lucideSvg('chevron-down', 11)}</span>
           </button>
         </div>
         <div class="composer-right-tools" style="display: flex; align-items: center; gap: 6px;">
-          <div class="model-selector-pill" id="modelSelector" title="Select Model (Ctrl+K)">
-            <span class="model-provider-icon" id="modelProviderIcon">🦙</span>
-            <span id="current-model-label">qwen3.8:27b</span>
-            <span class="pill-arrow">▾</span>
-          </div>
-          <div class="effort-selector-pill" id="btnEffortConfig" title="Configure Effort">
+          <button type="button" class="model-selector-pill" id="modelSelector" title="Select Model (Ctrl+K)">
+            <span class="model-provider-icon" id="modelProviderIcon"></span>
+            <span id="current-model-label">Select Model</span>
+            <span class="pill-arrow">${lucideSvg('chevron-down', 11)}</span>
+          </button>
+          <button type="button" class="effort-selector-pill" id="btnEffortConfig" title="Configure Effort">
             <span id="activeEffortLabel">Med</span>
-          </div>
+            <span class="pill-arrow">${lucideSvg('chevron-down', 11)}</span>
+          </button>
           <button class="btn-send" id="btn-send" title="Send (Enter)">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
               <line x1="12" y1="19" x2="12" y2="5"></line>
@@ -2024,8 +2105,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   <script>
     const vscode = acquireVsCodeApi();
     const chatContainer = document.getElementById('chat-container');
+    const activityPanel = document.getElementById('activity-panel');
+    const activityList = document.getElementById('activity-list');
+    const liveStrip = document.getElementById('lc-live-strip');
+    const tabBtnChat = document.getElementById('tab-btn-chat');
+    const tabBtnActivity = document.getElementById('tab-btn-activity');
+    const tabBtnTerminal = document.getElementById('tab-btn-terminal');
+    const activityCountBadge = document.getElementById('activity-count-badge');
+    const btnClearActivity = document.getElementById('btn-clear-activity');
     const emptyWelcome = document.getElementById('empty-welcome');
     const promptInput = document.getElementById('prompt-input');
+    ${getLucideClientScript()}
+    ${getActivityClientScript()}
+    ${getSlashCommandClientScript()}
+    ${getSessionsBarClientScript()}
+    let slashCommandsCatalog = [];
+    let currentCommandResults = [];
+    let ephemeralCommandResults = [];
+    let lastLoadedSessionId = null;
+    let currentSessionMessagesCache = [];
+    let currentSessionPlanCache = [];
+    let currentSessionPlanExplicit = false;
     const btnSend = document.getElementById('btn-send');
     const sessionTitle = document.getElementById('session-title');
     const chipProject = document.getElementById('chip-project');
@@ -2048,24 +2148,85 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     let isRunning = false;
     let allSectionsCache = [];
     let currentActiveSessionId = null;
+    let drawerSortMode = 'recent';
+    let drawerRecentCollapsed = false;
+
+    const drawerFilterBar = document.getElementById('drawer-filter-bar');
+    const btnDrawerFilter = document.getElementById('btn-drawer-filter');
+    const btnDrawerMore = document.getElementById('btn-drawer-more');
+    const drawerMoreMenu = document.getElementById('drawer-sessions-menu');
 
     // Drawer Toggle Logic
     function toggleDrawer() {
       const isOpen = sectionsDrawer.classList.toggle('open');
       if (isOpen) {
-        drawerSearchInput.value = '';
+        if (drawerSearchInput) drawerSearchInput.value = '';
         renderDrawerSections(allSectionsCache);
-        drawerSearchInput.focus();
+        if (drawerFilterBar?.classList.contains('open')) {
+          drawerSearchInput?.focus();
+        }
       }
     }
 
     function closeDrawer() {
       sectionsDrawer.classList.remove('open');
+      drawerMoreMenu?.classList.remove('open');
     }
 
     btnSectionDropdown.addEventListener('click', toggleDrawer);
     btnHistoryToggle.addEventListener('click', toggleDrawer);
     btnDrawerClose.addEventListener('click', closeDrawer);
+
+    btnDrawerFilter?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      drawerMoreMenu?.classList.remove('open');
+      const next = drawerFilterBar ? !drawerFilterBar.classList.contains('open') : false;
+      drawerFilterBar?.classList.toggle('open', next);
+      btnDrawerFilter.classList.toggle('active', next);
+      if (next) {
+        drawerSearchInput?.focus();
+      } else if (drawerSearchInput && drawerSearchInput.value) {
+        drawerSearchInput.value = '';
+        renderDrawerSections(allSectionsCache);
+      }
+    });
+
+    btnDrawerMore?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const lbl = document.getElementById('drawer-sort-lbl');
+      if (lbl) lbl.textContent = drawerSortMode === 'recent' ? 'Sort: Alphabetical' : 'Sort: Most Recent';
+      drawerMoreMenu?.classList.toggle('open');
+    });
+
+    document.addEventListener('click', (e) => {
+      if (drawerMoreMenu && !drawerMoreMenu.contains(e.target) && e.target !== btnDrawerMore) {
+        drawerMoreMenu.classList.remove('open');
+      }
+    });
+
+    drawerMoreMenu?.querySelectorAll('.lc-sessions-menu-item[data-drawer-act]').forEach((item) => {
+      item.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const act = item.getAttribute('data-drawer-act');
+        drawerMoreMenu.classList.remove('open');
+        if (act === 'new') {
+          closeDrawer();
+          vscode.postMessage({ command: 'newSection' });
+        } else if (act === 'toggleSort') {
+          drawerSortMode = drawerSortMode === 'recent' ? 'alpha' : 'recent';
+          const q = (drawerSearchInput?.value || '').toLowerCase().trim();
+          const base = q ? allSectionsCache.filter((s) => (s.title || '').toLowerCase().includes(q)) : allSectionsCache;
+          renderDrawerSections(base);
+        } else if (act === 'close') {
+          closeDrawer();
+        }
+      });
+    });
+
+    document.getElementById('btn-drawer-recent')?.addEventListener('click', () => {
+      drawerRecentCollapsed = !drawerRecentCollapsed;
+      if (drawerSectionsList) drawerSectionsList.style.display = drawerRecentCollapsed ? 'none' : 'flex';
+    });
 
     const btnSwitchAgentView = document.getElementById('btn-switch-agent-view');
     if (btnSwitchAgentView) {
@@ -2110,14 +2271,46 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       vscode.postMessage({ command: 'selectWorkspace' });
     });
 
+    const slashPopupEl = document.getElementById('slashCommandPopup');
+    function dispatchSlashCommand(rawCmd) {
+      if (!rawCmd) return;
+      if (slashCtrl) slashCtrl.close();
+      promptInput.value = '';
+      promptInput.style.height = 'auto';
+      vscode.postMessage({ command: 'runSlashCommand', text: rawCmd });
+    }
+
+    const slashCtrl = lcCreateSlashController({
+      promptEl: promptInput,
+      popupEl: slashPopupEl,
+      getCatalog: () => slashCommandsCatalog,
+      getModels: () => (typeof cachedAllModelsList !== 'undefined' ? cachedAllModelsList : []),
+      onSubmitSlash: (cmdLine) => dispatchSlashCommand(cmdLine),
+    });
+
+    document.getElementById('btnResetBypass')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      dispatchSlashCommand('/normal');
+    });
+
+    document.addEventListener('click', (e) => {
+      if (slashPopupEl && !slashPopupEl.contains(e.target) && e.target !== promptInput) {
+        slashCtrl.close();
+      }
+    });
+
     // Auto-grow textarea
     promptInput.addEventListener('input', () => {
       promptInput.style.height = 'auto';
       promptInput.style.height = Math.min(promptInput.scrollHeight, 160) + 'px';
+      slashCtrl.refreshFromInput();
     });
 
     // Enter to submit, Shift+Enter for newline
     promptInput.addEventListener('keydown', (e) => {
+      if (slashCtrl.handleKeyDown(e)) {
+        return;
+      }
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         submitMessage();
@@ -2125,6 +2318,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     btnSend.addEventListener('click', () => {
+      const val = promptInput.value.trim();
+      if (val && lcIsSlashCommandInput(val)) {
+        dispatchSlashCommand(val);
+        return;
+      }
       if (isRunning) {
         vscode.postMessage({ command: 'cancelTask' });
       } else {
@@ -2134,7 +2332,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     function submitMessage() {
       const text = promptInput.value.trim();
-      if (!text || isRunning) return;
+      if (!text) return;
+      if (lcIsSlashCommandInput(text)) {
+        dispatchSlashCommand(text);
+        return;
+      }
+      if (isRunning) return;
+      slashCtrl.close();
       promptInput.value = '';
       promptInput.style.height = 'auto';
       setRunningState(true);
@@ -2145,59 +2349,58 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       isRunning = running;
       if (running) {
         btnSend.classList.add('stop-mode');
-        btnSend.innerHTML = '<span style="font-size: 11px;">■</span>';
+        btnSend.innerHTML = lcIcon('square', 11, '', 'currentColor');
         btnSend.title = 'Stop Generation';
       } else {
         btnSend.classList.remove('stop-mode');
-        btnSend.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>';
+        btnSend.innerHTML = lcIcon('arrow-up', 14);
         btnSend.title = 'Send (Enter)';
       }
     }
 
     function formatTimeAgo(timestamp) {
-      if (!timestamp) return 'Just now';
-      const diffSec = Math.floor((Date.now() - timestamp) / 1000);
-      if (diffSec < 60) return 'Just now';
-      const diffMin = Math.floor(diffSec / 60);
-      if (diffMin < 60) return diffMin + 'm ago';
-      const diffHour = Math.floor(diffMin / 60);
-      if (diffHour < 24) return diffHour + 'h ago';
-      const diffDay = Math.floor(diffHour / 24);
-      if (diffDay < 7) return diffDay + 'd ago';
-      return new Date(timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+      return lcFormatSessionTimeAgo(timestamp);
     }
 
     function renderDrawerSections(sections) {
       drawerSectionsList.innerHTML = '';
-      if (!sections || sections.length === 0) {
-        drawerSectionsList.innerHTML = '<div class="drawer-empty-note">No sections found. Click "+ New Section" to start one!</div>';
+      const sorted = (sections || []).slice();
+      if (drawerSortMode === 'alpha') {
+        sorted.sort((a, b) => (a.title || '').localeCompare(b.title || ''));
+      } else {
+        sorted.sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+      }
+
+      if (sorted.length === 0) {
+        drawerSectionsList.innerHTML = '<div class="lc-sess-empty">No sessions found</div>';
         return;
       }
 
-      sections.forEach((s) => {
+      sorted.forEach((s) => {
         const card = document.createElement('div');
         const isActive = s.id === currentActiveSessionId;
-        card.className = 'section-card' + (isActive ? ' active' : '');
-        const msgCount = (s.messages || []).length;
+        const isRunningSess = s.status === 'running';
+        card.className = 'lc-sess-row' + (isActive ? ' active' : '');
 
         card.innerHTML =
-          '<div class="section-card-main">' +
-          '<div class="section-card-title">' + escapeHtml(s.title || 'Untitled Section') + '</div>' +
-          '<div class="section-card-meta">' +
-          '<span>' + formatTimeAgo(s.updatedAt) + '</span>' +
-          '<span>•</span>' +
-          '<span>' + msgCount + ' msg' + (msgCount === 1 ? '' : 's') + '</span>' +
-          '<span>•</span>' +
-          '<span class="section-model-tag">' + escapeHtml(s.model || 'qwen3.8:27b') + '</span>' +
-          '</div>' +
-          '</div>' +
-          '<div class="section-card-actions">' +
-          '<button class="btn-card-action btn-rename" title="Rename Section">✏️</button>' +
-          '<button class="btn-card-action btn-delete" title="Delete Section">🗑️</button>' +
+          '<span class="lc-sess-gutter"><span class="lc-sess-dot' + (isRunningSess ? ' running' : '') + '"></span></span>' +
+          '<div class="lc-sess-main">' +
+            '<div class="lc-sess-top">' +
+              '<div class="lc-sess-name" title="' + escapeHtml(s.title || 'Untitled Session') + '">' + escapeHtml(s.title || 'Untitled Session') + '</div>' +
+              '<div class="lc-sess-row-actions">' +
+                '<button class="session-act-btn btn-rename" type="button" title="Rename">' + lcIcon('pencil', 12) + '</button>' +
+                '<button class="session-act-btn btn-delete-session btn-delete" type="button" title="Delete">' + lcIcon('trash-2', 12) + '</button>' +
+              '</div>' +
+            '</div>' +
+            '<div class="lc-sess-meta">' +
+              '<span class="lc-sess-meta-icon">' + lcIcon('session-node', 11) + '</span>' +
+              '<span class="lc-sess-time">' + escapeHtml(formatTimeAgo(s.updatedAt || s.createdAt)) + '</span>' +
+            '</div>' +
           '</div>';
 
         // Click to switch section
-        card.querySelector('.section-card-main').addEventListener('click', () => {
+        card.addEventListener('click', (e) => {
+          if (e.target.closest('.lc-sess-row-actions')) return;
           closeDrawer();
           vscode.postMessage({ command: 'switchSection', sessionId: s.id });
         });
@@ -2246,9 +2449,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const cfgResourceDesc = document.getElementById('cfgResourceDesc');
     const chkFastMode = document.getElementById('chkFastMode');
 
-    let cachedGroupedModels = {};
+    let cachedGroupedModels = { local: [], cloud: [], providers: [] };
     let cachedConfig = {
-      modelId: 'qwen3.8:27b',
+      modelId: '',
+      modelName: '',
+      providerId: 'ollama',
       reasoningEffort: 'medium',
       fastMode: false,
       executionMode: 'code',
@@ -2324,134 +2529,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }, 50);
       } else if (e.key === 'Escape') {
         closeAllPopovers();
+        if (slashCtrl) slashCtrl.close();
       }
     });
 
-    // Model Search Filtering
-    modelSearchInput.addEventListener('input', () => {
-      const val = modelSearchInput.value.trim();
-      btnClearModelSearch.style.display = val ? 'block' : 'none';
-      renderModelCategories(cachedGroupedModels, val);
-    });
-
-    btnClearModelSearch.addEventListener('click', () => {
-      modelSearchInput.value = '';
-      btnClearModelSearch.style.display = 'none';
-      renderModelCategories(cachedGroupedModels, '');
-      modelSearchInput.focus();
-    });
-
-    function renderModelCategories(grouped, filterText = '') {
-      modelCategoriesContainer.innerHTML = '';
-      const filterLower = filterText.toLowerCase();
-
-      const categoryLabels = {
-        favorites: 'Favorites ★',
-        adaptive: 'Adaptive',
-        recently_used: 'Recently Used',
-        recommended: 'Recommended',
-        local: 'Local Models (Ollama)',
-        cloud: 'Cloud Models',
-      };
-
-      const providerIcons = {
-        ollama: '🦙',
-        anthropic: ' Claude',
-        openai: ' OpenAI',
-        gemini: ' Gemini',
-        custom: '🔌',
-      };
-
-      let totalRendered = 0;
-
-      for (const [catKey, label] of Object.entries(categoryLabels)) {
-        const list = grouped[catKey] || [];
-        const filteredList = list.filter(m => {
-          if (!filterLower) return true;
-          return m.name.toLowerCase().includes(filterLower) ||
-            m.providerName.toLowerCase().includes(filterLower) ||
-            (m.family && m.family.toLowerCase().includes(filterLower));
-        });
-
-        if (filteredList.length === 0) continue;
-
-        const catHeader = document.createElement('div');
-        catHeader.className = 'model-category-header';
-        catHeader.textContent = label;
-        modelCategoriesContainer.appendChild(catHeader);
-
-        for (const m of filteredList) {
-          totalRendered++;
-          const row = document.createElement('div');
-          const isSelected = m.id === cachedConfig.modelId || m.rawName === cachedConfig.modelId;
-          row.className = 'model-item-row' + (isSelected ? ' selected' : '');
-          
-          const icon = providerIcons[m.provider] || '⚡';
-          const isFav = m.category === 'favorite' || m.isFavorite;
-
-          row.innerHTML = 
-            '<div class="model-item-icon">' + icon + '</div>' +
-            '<div class="model-item-info">' +
-              '<div class="model-item-name-row">' +
-                '<span class="model-item-name">' + escapeHtml(m.name) + '</span>' +
-                (m.isLocal ? '<span class="model-tag local">Local</span>' : '') +
-                (m.isNew ? '<span class="model-tag new">New</span>' : '') +
-              '</div>' +
-              '<div class="model-item-meta-row">' +
-                '<span class="status-dot-available"></span>' +
-                '<span>' + (m.defaultEffort ? m.defaultEffort.charAt(0).toUpperCase() + m.defaultEffort.slice(1) : 'Medium') + '</span>' +
-                '<span>•</span>' +
-                '<span>' + (m.contextWindowLabel || '32k') + '</span>' +
-              '</div>' +
-            '</div>' +
-            '<button class="model-fav-btn' + (isFav ? ' is-fav' : '') + '" title="' + (isFav ? 'Remove Favorite' : 'Pin Favorite') + '">' +
-              (isFav ? '★' : '☆') +
-            '</button>' +
-            (isSelected ? '<div class="model-check">✓</div>' : '<div class="model-check"></div>');
-
-          row.addEventListener('click', (e) => {
-            if (e.target.closest('.model-fav-btn')) return;
-            selectModelItem(m);
-            closeAllPopovers();
-          });
-
-          const favBtn = row.querySelector('.model-fav-btn');
-          favBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            vscode.postMessage({ command: 'toggleFavorite', modelId: m.id });
-          });
-
-          modelCategoriesContainer.appendChild(row);
-        }
-      }
-
-      if (totalRendered === 0) {
-        modelCategoriesContainer.innerHTML = '<div style="padding: 20px; text-align: center; color: #64748b; font-size: 11.5px;">No models found matching "' + escapeHtml(filterText) + '"</div>';
-      }
-    }
-
-    function selectModelItem(m) {
-      cachedConfig.modelId = m.id;
-      cachedConfig.modelName = m.name;
-      if (currentModelLabel) currentModelLabel.textContent = m.name;
-      if (cfgActiveModelName) cfgActiveModelName.textContent = m.name;
-      const providerIcons = {
-        ollama: '🦙',
-        anthropic: ' Claude',
-        openai: ' OpenAI',
-        gemini: ' Gemini',
-        custom: '🔌',
-      };
-      if (modelProviderIcon) modelProviderIcon.textContent = providerIcons[m.provider] || '⚡';
-      if (m.isLocal) {
-        if (cfgResourceTitle) cfgResourceTitle.textContent = 'Local Model (Ollama)';
-        if (cfgResourceDesc) cfgResourceDesc.textContent = '100% On-Device / Zero API Billing';
-      } else {
-        if (cfgResourceTitle) cfgResourceTitle.textContent = m.providerName + ' API';
-        if (cfgResourceDesc) cfgResourceDesc.textContent = (m.contextWindowLabel || '200k') + ' context window';
-      }
-      vscode.postMessage({ command: 'selectModel', modelId: m.id, modelName: m.name, provider: m.provider });
-    }
+    ${getModelSelectorScript({ modelLabelElementId: 'current-model-label' })}
 
     // Execution Mode
     document.querySelectorAll('#execModePopover .popover-card-option[data-exec]').forEach((opt) => {
@@ -2463,18 +2545,37 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       });
     });
 
+    // Composer top mode tabs (Agent / Plan / Ask / Review) synced with executionMode
+    document.querySelectorAll('.mode-btn').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const m = btn.getAttribute('data-mode') || 'agent';
+        document.querySelectorAll('.mode-btn').forEach((b) => b.classList.toggle('active', b === btn));
+        if (m === 'review') {
+          vscode.postMessage({ command: 'showChangesPanel' });
+          return;
+        }
+        const mappedExec = m === 'plan' ? 'plan' : m === 'ask' ? 'ask' : 'code';
+        setExecutionModeUI(mappedExec);
+        vscode.postMessage({ command: 'setExecutionMode', executionMode: mappedExec });
+      });
+    });
+
     function setExecutionModeUI(mode) {
       cachedConfig.executionMode = mode;
       document.querySelectorAll('#execModePopover .popover-card-option[data-exec]').forEach((el) => {
         el.classList.toggle('active', el.getAttribute('data-exec') === mode);
       });
+      const tabTarget = mode === 'plan' ? 'plan' : mode === 'ask' ? 'ask' : 'agent';
+      document.querySelectorAll('.mode-btn').forEach((b) => {
+        b.classList.toggle('active', b.getAttribute('data-mode') === tabTarget);
+      });
       const labels = {
-        code: '</> Code',
-        smart: '✦ Smart',
-        ask: '💬 Ask',
-        plan: '📋 Plan',
+        code: lcIcon('code', 13) + '<span>Code</span>',
+        smart: lcIcon('sparkles', 13) + '<span>Smart</span>',
+        ask: lcIcon('message-square', 13) + '<span>Ask</span>',
+        plan: lcIcon('list-checks', 13) + '<span>Plan</span>',
       };
-      if (execModeLabel) execModeLabel.textContent = labels[mode] || '</> Code';
+      if (execModeLabel) execModeLabel.innerHTML = labels[mode] || (lcIcon('code', 13) + '<span>Code</span>');
     }
 
     // Permission Mode
@@ -2496,28 +2597,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (bypassOpt) {
         bypassOpt.classList.toggle('active', mode === 'bypass');
       }
+      if (btnPermMode) {
+        btnPermMode.classList.toggle('bypass-active', mode === 'bypass');
+      }
+      const bypassBanner = document.getElementById('bypassModeBanner');
+      if (bypassBanner) {
+        bypassBanner.classList.toggle('active', mode === 'bypass');
+      }
       const labels = {
-        ask: '🛡 Ask',
-        smart: '🛡 Smart',
-        bypass: '🛡 Bypass',
+        ask: lcIcon('shield', 13) + '<span>Ask</span>',
+        smart: lcIcon('shield-check', 13) + '<span>Smart</span>',
+        bypass: lcIcon('shield-alert', 13) + '<span>Bypass</span>',
       };
-      if (permModeLabel) permModeLabel.textContent = labels[mode] || '🛡 Smart';
+      if (permModeLabel) permModeLabel.innerHTML = labels[mode] || (lcIcon('shield-check', 13) + '<span>Smart</span>');
     }
-
-    // Reasoning Effort
-    document.querySelectorAll('.effort-seg-btn').forEach((btn) => {
-      btn.addEventListener('click', () => {
-        const effort = btn.getAttribute('data-effort');
-        document.querySelectorAll('.effort-seg-btn').forEach(b => b.classList.remove('active'));
-        btn.classList.add('active');
-        cachedConfig.reasoningEffort = effort;
-        if (activeEffortLabel) {
-          const shortLabels = { minimal: 'Min', low: 'Low', medium: 'Med', high: 'High', extra_high: 'Max' };
-          activeEffortLabel.textContent = shortLabels[effort] || 'Med';
-        }
-        vscode.postMessage({ command: 'setReasoningEffort', effort });
-      });
-    });
 
     chkFastMode.addEventListener('change', () => {
       cachedConfig.fastMode = chkFastMode.checked;
@@ -2564,12 +2657,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         const chip = document.createElement('div');
         chip.className = 'attached-chip';
         const isSpecial = filePath.includes(':');
-        const icon = isSpecial ? '⚡' : '📄';
+        const icon = isSpecial ? lcIcon('zap', 12) : lcIcon('file-text', 12);
         const label = isSpecial ? filePath : filePath.split('/').pop() || filePath;
         chip.innerHTML = 
           '<span>' + icon + '</span>' +
           '<span>' + escapeHtml(label) + '</span>' +
-          '<span class="attached-chip-remove" data-path="' + escapeHtml(filePath) + '" title="Remove">✕</span>';
+          '<span class="attached-chip-remove" data-path="' + escapeHtml(filePath) + '" title="Remove">' + lcIcon('x', 11) + '</span>';
 
         chip.querySelector('.attached-chip-remove').addEventListener('click', (e) => {
           e.stopPropagation();
@@ -2580,35 +2673,195 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    let cachedActivities = [];
+    let expandedActivityIds = {};
+    let activityFilter = 'all';
+    let currentViewTab = 'chat';
+    let currentStatusSummary = '';
+    const streamingMsgNodes = {};
+
+    function switchSideTab(tab) {
+      currentViewTab = tab === 'activity' ? 'activity' : 'chat';
+      if (tabBtnChat) tabBtnChat.classList.toggle('active', currentViewTab === 'chat');
+      if (tabBtnActivity) tabBtnActivity.classList.toggle('active', currentViewTab === 'activity');
+      if (chatContainer) chatContainer.style.display = currentViewTab === 'chat' ? 'flex' : 'none';
+      if (liveStrip) liveStrip.style.display = currentViewTab === 'chat' ? 'flex' : 'none';
+      if (activityPanel) activityPanel.classList.toggle('visible', currentViewTab === 'activity');
+      if (currentViewTab === 'activity') renderActivityPanel();
+    }
+
+    if (tabBtnChat) tabBtnChat.addEventListener('click', () => switchSideTab('chat'));
+    if (tabBtnActivity) tabBtnActivity.addEventListener('click', () => switchSideTab('activity'));
+    if (tabBtnTerminal) {
+      tabBtnTerminal.addEventListener('click', () => {
+        vscode.postMessage({ command: 'focusIntegratedTerminal' });
+      });
+    }
+    if (btnClearActivity) {
+      btnClearActivity.addEventListener('click', () => {
+        cachedActivities = [];
+        expandedActivityIds = {};
+        updateActivityCounters();
+        renderActivityPanel();
+        vscode.postMessage({ command: 'clearActivities' });
+      });
+    }
+    document.querySelectorAll('.lc-act-filter-pill').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        activityFilter = btn.getAttribute('data-filter') || 'all';
+        document.querySelectorAll('.lc-act-filter-pill').forEach((b) => {
+          b.classList.toggle('active', b.getAttribute('data-filter') === activityFilter);
+        });
+        renderActivityPanel();
+      });
+    });
+
+    function updateActivityCounters() {
+      const count = cachedActivities.length;
+      if (activityCountBadge) activityCountBadge.textContent = String(count);
+    }
+
+    function renderLiveStrip() {
+      if (!liveStrip) return;
+      liveStrip.innerHTML = '';
+      if (isRunning && currentStatusSummary) {
+        const row = document.createElement('div');
+        row.className = 'lc-live-status-row';
+        row.innerHTML =
+          '<span class="lc-status-pulse"></span>' +
+          '<span class="lc-live-status-text">' + lcEscapeHtml(currentStatusSummary) + '</span>';
+        liveStrip.appendChild(row);
+      }
+      if (cachedActivities.length > 0) {
+        const runningCount = cachedActivities.filter((a) => a.status === 'running').length;
+        const failCount = cachedActivities.filter((a) => a.status === 'failed').length;
+        const label =
+          runningCount > 0
+            ? 'Agent activity: ' + runningCount + ' active (' + cachedActivities.length + ' total)'
+            : failCount > 0
+              ? 'View ' + cachedActivities.length + ' activity items (' + failCount + ' failed)'
+              : 'View ' + cachedActivities.length + ' activity item' + (cachedActivities.length === 1 ? '' : 's');
+        const pill = document.createElement('button');
+        pill.className = 'lc-turn-summary-pill';
+        pill.type = 'button';
+        pill.innerHTML = lcIcon('zap', 12) + '<span>' + lcEscapeHtml(label) + '</span>' + lcIcon('chevron-right', 12);
+        pill.addEventListener('click', () => switchSideTab('activity'));
+        liveStrip.appendChild(pill);
+      }
+    }
+
+    function renderActivityPanel() {
+      if (!activityList) return;
+      activityList.innerHTML = '';
+      const filtered = cachedActivities.filter((item) => {
+        if (activityFilter === 'all') return true;
+        if (activityFilter === 'command') return item.category === 'command';
+        if (activityFilter === 'file') return item.category === 'file';
+        if (activityFilter === 'subagent') return item.category === 'subagent';
+        return true;
+      });
+      if (filtered.length === 0) {
+        activityList.innerHTML =
+          '<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:12px;">' +
+          'No agent tool or command executions in this section yet.' +
+          '</div>';
+        return;
+      }
+      filtered.forEach((item) => {
+        const isOpen = !!expandedActivityIds[item.id] || item.status === 'running' || item.status === 'failed';
+        const card = lcBuildActivityCardElement(item, isOpen, (id, open) => {
+          expandedActivityIds[id] = open;
+        });
+        activityList.appendChild(card);
+      });
+      activityList.scrollTop = activityList.scrollHeight;
+    }
+
+    function renderSidebarChat() {
+      const mergedCmdMap = new Map();
+      (Array.isArray(currentCommandResults) ? currentCommandResults : []).forEach((cr) => {
+        if (cr && cr.id) mergedCmdMap.set(cr.id, cr);
+      });
+      (Array.isArray(ephemeralCommandResults) ? ephemeralCommandResults : []).forEach((cr) => {
+        if (cr && cr.id) mergedCmdMap.set(cr.id, cr);
+      });
+      const allCmdResults = Array.from(mergedCmdMap.values()).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+
+      chatContainer.innerHTML = '';
+      Object.keys(streamingMsgNodes).forEach((k) => delete streamingMsgNodes[k]);
+
+      if (currentSessionMessagesCache.length === 0 && allCmdResults.length === 0) {
+        if (emptyWelcome) {
+          emptyWelcome.style.display = 'flex';
+          chatContainer.appendChild(emptyWelcome);
+        }
+        return;
+      }
+
+      if (emptyWelcome) emptyWelcome.style.display = 'none';
+      let nextCmdIdx = 0;
+      const appendCmdCard = (cr) => {
+        chatContainer.appendChild(lcBuildCommandResultElement(cr, {
+          onConfirm: (commandLine, cardId) => {
+            ephemeralCommandResults = ephemeralCommandResults.filter((x) => x.id !== cardId);
+            vscode.postMessage({ command: 'confirmSlashCommand', text: commandLine });
+          },
+          onCancel: (cardId) => {
+            ephemeralCommandResults = ephemeralCommandResults.filter((x) => x.id !== cardId);
+            renderSidebarChat();
+          },
+        }));
+      };
+
+      currentSessionMessagesCache.forEach((m) => {
+        const msgTs = m?.timestamp || 0;
+        while (nextCmdIdx < allCmdResults.length && msgTs > 0 && (allCmdResults[nextCmdIdx].timestamp || 0) <= msgTs) {
+          appendCmdCard(allCmdResults[nextCmdIdx++]);
+        }
+        renderMessage(m);
+      });
+      while (nextCmdIdx < allCmdResults.length) {
+        appendCmdCard(allCmdResults[nextCmdIdx++]);
+      }
+
+      if (currentSessionPlanExplicit && currentSessionPlanCache && currentSessionPlanCache.length > 0) {
+        renderPlan(currentSessionPlanCache);
+      }
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+    }
+
     window.addEventListener('message', (event) => {
       const data = event.data;
       switch (data.type) {
         case 'loadSession':
           allSectionsCache = data.allSessions || [];
+          cachedAllModelsList = data.allModels || [];
+          if (Array.isArray(data.slashCommands)) {
+            slashCommandsCatalog = data.slashCommands;
+            if (slashCtrl && slashCtrl.isOpen()) {
+              slashCtrl.refreshFromInput();
+            }
+          }
           if (drawerCount) drawerCount.textContent = allSectionsCache.length;
+
+          {
+            const nextId = data.session ? data.session.id : null;
+            if (lastLoadedSessionId !== nextId) {
+              ephemeralCommandResults = [];
+              lastLoadedSessionId = nextId;
+            }
+          }
 
           if (data.session) {
             currentActiveSessionId = data.session.id;
             sessionTitle.textContent = data.session.title || 'New Section';
-            if (currentModelLabel) currentModelLabel.textContent = data.session.model || 'qwen3.8:27b';
           }
 
           if (data.currentConfig) {
             cachedConfig = Object.assign({}, cachedConfig, data.currentConfig);
             if (data.permissionMode) cachedConfig.permissionMode = data.permissionMode;
-            if (currentModelLabel) currentModelLabel.textContent = cachedConfig.modelName || cachedConfig.modelId || 'qwen3.8:27b';
-            if (cfgActiveModelName) cfgActiveModelName.textContent = cachedConfig.modelName || cachedConfig.modelId || 'qwen3.8:27b';
             setExecutionModeUI(cachedConfig.executionMode || 'code');
             setPermissionModeUI(cachedConfig.permissionMode || 'smart');
-            if (cachedConfig.reasoningEffort) {
-              document.querySelectorAll('.effort-seg-btn').forEach(b => {
-                b.classList.toggle('active', b.getAttribute('data-effort') === cachedConfig.reasoningEffort);
-              });
-              if (activeEffortLabel) {
-                const shortLabels = { minimal: 'Min', low: 'Low', medium: 'Med', high: 'High', extra_high: 'Max' };
-                activeEffortLabel.textContent = shortLabels[cachedConfig.reasoningEffort] || 'Med';
-              }
-            }
             if (chkFastMode) chkFastMode.checked = !!cachedConfig.fastMode;
             renderAttachedChips(cachedConfig.attachedFiles || []);
           }
@@ -2616,6 +2869,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           if (data.modelsGrouped) {
             cachedGroupedModels = data.modelsGrouped;
             renderModelCategories(cachedGroupedModels, modelSearchInput.value.trim());
+          }
+
+          {
+            const activeModel = cachedAllModelsList.find(
+              (m) => m.id === cachedConfig.modelId || m.modelIdentifier === cachedConfig.modelId
+            );
+            if (currentModelLabel) {
+              currentModelLabel.textContent = activeModel?.displayName || cachedConfig.modelName || cachedConfig.modelId || 'Select Model';
+            }
+            if (modelProviderIcon) {
+              modelProviderIcon.innerHTML = activeModel
+                ? getProviderSvgIcon(activeModel.providerType === 'LOCAL' ? (activeModel.providerId === 'ollama' ? 'ollama' : 'custom') : activeModel.providerId.split('-')[0])
+                : '';
+            }
+            updateModelConfigurationUI(activeModel);
           }
 
           if (data.workspaceName && chipProjectName) {
@@ -2627,42 +2895,163 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             renderDrawerSections(allSectionsCache);
           }
 
-          if (data.session && data.session.messages && data.session.messages.length > 0) {
-            if (emptyWelcome) emptyWelcome.style.display = 'none';
-            chatContainer.innerHTML = '';
-            data.session.messages.forEach(renderMessage);
-            if (data.session.plan && data.session.plan.length > 0) {
-              renderPlan(data.session.plan);
-            }
-          } else {
-            chatContainer.innerHTML = '';
-            if (emptyWelcome) {
-              emptyWelcome.style.display = 'flex';
-              chatContainer.appendChild(emptyWelcome);
-            }
-          }
+          cachedActivities = Array.isArray(data.session?.activities) ? data.session.activities.slice() : [];
+          updateActivityCounters();
+          renderActivityPanel();
+
+          const sessionRunning = data.session?.status === 'running';
+          currentStatusSummary = sessionRunning ? (data.session?.activePhaseSummary || 'Agent is working') : '';
+          setRunningState(sessionRunning);
+          renderLiveStrip();
+
+          currentSessionMessagesCache = Array.isArray(data.session?.messages) ? data.session.messages.slice() : [];
+          currentCommandResults = Array.isArray(data.session?.commandResults) ? data.session.commandResults.slice() : [];
+          currentSessionPlanCache = Array.isArray(data.session?.plan) ? data.session.plan.slice() : [];
+          currentSessionPlanExplicit = !!data.session?.planExplicit;
+          renderSidebarChat();
           break;
 
         case 'addMessage':
           if (emptyWelcome) emptyWelcome.style.display = 'none';
-          renderMessage(data.message);
+          if (data.message && (!data.message.id || !currentSessionMessagesCache.some((m) => m.id === data.message.id))) {
+            currentSessionMessagesCache.push(data.message);
+          }
+          if (data.message && data.message.id && streamingMsgNodes[data.message.id]) {
+            const node = streamingMsgNodes[data.message.id];
+            const contentEl = node.querySelector('.msg-content');
+            if (contentEl) {
+              contentEl.innerHTML = renderMarkdown(data.message.content || '');
+            }
+            delete streamingMsgNodes[data.message.id];
+          } else {
+            renderMessage(data.message);
+          }
           chatContainer.scrollTop = chatContainer.scrollHeight;
-          if (data.message.senderRole === 'assistant') {
+          if (data.message?.senderRole === 'assistant') {
+            currentStatusSummary = '';
             setRunningState(false);
+            renderLiveStrip();
           }
           break;
 
+        case 'messageDelta': {
+          const ev = data.event;
+          if (!ev || !ev.messageId) break;
+          if (emptyWelcome) emptyWelcome.style.display = 'none';
+          let row = streamingMsgNodes[ev.messageId];
+          if (!row) {
+            row = document.createElement('div');
+            row.className = 'msg-row';
+            row.setAttribute('data-msg-id', ev.messageId);
+            row.innerHTML =
+              '<div class="msg-assistant">' +
+              '<div class="msg-header">' +
+              lcIcon('bot', 13) +
+              '<span>' + escapeHtml(ev.agentName || 'Main Agent') + '</span>' +
+              '</div>' +
+              '<div class="msg-content"></div>' +
+              '</div>';
+            chatContainer.appendChild(row);
+            streamingMsgNodes[ev.messageId] = row;
+          }
+          const contentEl = row.querySelector('.msg-content');
+          if (contentEl) {
+            contentEl.innerHTML = renderMarkdown(ev.fullContent || '');
+          }
+          chatContainer.scrollTop = chatContainer.scrollHeight;
+          break;
+        }
+
+        case 'statusUpdate': {
+          const ev = data.event;
+          if (!ev) break;
+          const isTerminal = ev.phase === 'completed' || ev.phase === 'failed' || ev.phase === 'cancelled';
+          if (isTerminal) {
+            currentStatusSummary = '';
+            setRunningState(false);
+          } else {
+            currentStatusSummary = ev.summary || 'Agent is working';
+            setRunningState(true);
+          }
+          renderLiveStrip();
+          break;
+        }
+
+        case 'activityUpsert': {
+          if (!data.item || !data.item.id) break;
+          cachedActivities = lcUpsertActivityList(cachedActivities, data.item);
+          updateActivityCounters();
+          renderLiveStrip();
+          renderActivityPanel();
+          break;
+        }
+
+        case 'runFinished': {
+          const terminalStatus = data.status || 'completed';
+          currentStatusSummary = '';
+          setRunningState(false);
+          cachedActivities = cachedActivities.map((item) =>
+            item.status === 'running' ? Object.assign({}, item, { status: terminalStatus }) : item
+          );
+          updateActivityCounters();
+          renderLiveStrip();
+          renderActivityPanel();
+          break;
+        }
+
         case 'planUpdate':
-          renderPlan(data.plan);
+          if (data.explicit && data.plan && data.plan.length > 0) {
+            renderPlan(data.plan);
+          }
           break;
 
         case 'activity':
-          renderExecutionActivity(data.event);
           break;
 
         case 'approvalRequest':
           renderApproval(data.request);
           break;
+
+        case 'slashCommandResult': {
+          const res = data.result;
+          if (!res) break;
+          if (res.status === 'confirmation_required') {
+            ephemeralCommandResults = ephemeralCommandResults.filter(
+              (x) => x.status !== 'confirmation_required' || x.command !== res.command
+            );
+            ephemeralCommandResults.push(res);
+          } else if (res.command === 'clear' && res.ok) {
+            ephemeralCommandResults = [res];
+            currentCommandResults = [];
+            currentSessionMessagesCache = [];
+          } else if (res.command === 'delete-session' && res.ok) {
+            ephemeralCommandResults = [res];
+          } else {
+            if (!currentCommandResults.some((x) => x.id === res.id)) {
+              currentCommandResults.push(res);
+            }
+          }
+          renderSidebarChat();
+          if (res.uiAction) {
+            const act = res.uiAction.type;
+            if (act === 'openModelSelector' && typeof togglePopover === 'function' && typeof modelSelectorPopover !== 'undefined') {
+              togglePopover(modelSelectorPopover, modelSelector, true);
+              setTimeout(() => {
+                modelSearchInput?.focus();
+                modelSearchInput?.select();
+              }, 50);
+            } else if (act === 'focusSessions' && sectionsDrawer) {
+              sectionsDrawer.classList.add('open');
+              drawerFilterBar?.classList.add('open');
+              btnDrawerFilter?.classList.add('active');
+              renderDrawerSections(allSectionsCache);
+              drawerSearchInput?.focus();
+            } else if (act === 'focusPrompt' && promptInput) {
+              promptInput.focus();
+            }
+          }
+          break;
+        }
 
         case 'modelsGroupedResponse':
           if (data.modelsGrouped) {
@@ -2674,8 +3063,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     });
 
     function renderMessage(msg) {
+      if (!msg) return;
+      if (msg.id) {
+        const existing = chatContainer.querySelector('[data-msg-id="' + msg.id.replace(/"/g, '') + '"]');
+        if (existing) {
+          const c = existing.querySelector('.msg-content');
+          if (c) c.innerHTML = renderMarkdown(msg.content || '');
+          return;
+        }
+      }
+      if (msg.senderRole === 'user') {
+        const lastRow = chatContainer.lastElementChild;
+        if (lastRow && lastRow.querySelector('.msg-user')) {
+          const prevText = lastRow.querySelector('.msg-user').textContent || '';
+          if (prevText.trim() === (msg.content || '').trim()) {
+            return; // skip duplicate user bubble
+          }
+        }
+      }
       const row = document.createElement('div');
       row.className = 'msg-row';
+      if (msg.id) row.setAttribute('data-msg-id', msg.id);
 
       if (msg.senderRole === 'user') {
         row.innerHTML = '<div class="msg-user">' + escapeHtml(msg.content) + '</div>';
@@ -2683,7 +3091,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         row.innerHTML =
           '<div class="msg-assistant">' +
           '<div class="msg-header">' +
-          '<span>🤖</span>' +
+          lcIcon('bot', 13) +
           '<span>' + escapeHtml(msg.senderName || 'Main Agent') + '</span>' +
           '</div>' +
           '<div class="msg-content">' + renderMarkdown(msg.content) + '</div>' +
@@ -2693,41 +3101,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       chatContainer.scrollTop = chatContainer.scrollHeight;
     }
 
-    // Devin-style Expandable Execution Activity
-    function renderExecutionActivity(ev) {
-      if (!ev.latestActivity) return;
-      const group = document.createElement('div');
-      group.className = 'execution-group';
-      group.innerHTML =
-        '<div class="exec-summary">' +
-        '<div class="exec-summary-left">' +
-        '<span>⚙️</span>' +
-        '<span>' + escapeHtml(ev.agentName || 'Agent') + ': ' + escapeHtml(ev.latestActivity) + '</span>' +
-        '</div>' +
-        '<span style="font-size: 10px;">▸</span>' +
-        '</div>' +
-        '<div class="exec-details">' +
-        '<div>• Status: ' + escapeHtml(ev.status || '') + '</div>' +
-        '<div>• Timestamp: ' + escapeHtml(new Date(ev.timestamp || Date.now()).toLocaleTimeString()) + '</div>' +
-        '</div>';
-
-      const summary = group.querySelector('.exec-summary');
-      const details = group.querySelector('.exec-details');
-      const arrow = summary.querySelector('span:last-child');
-      summary.addEventListener('click', () => {
-        const isOpen = details.classList.toggle('open');
-        arrow.textContent = isOpen ? '▾' : '▸';
-      });
-
-      chatContainer.appendChild(group);
-      chatContainer.scrollTop = chatContainer.scrollHeight;
-    }
-
     function renderPlan(plan) {
       if (!plan || plan.length === 0) return;
-      const box = document.createElement('div');
-      box.className = 'plan-box';
-      let html = '<div class="plan-title"><span>📋 Execution Plan</span><span>' + plan.length + ' steps</span></div>';
+      let box = chatContainer.querySelector('.plan-box');
+      if (!box) {
+        box = document.createElement('div');
+        box.className = 'plan-box';
+        chatContainer.appendChild(box);
+      }
+      let html = '<div class="plan-title"><span class="lc-icon-gap">' + lcIcon('list-checks', 13) + '<span>Execution Plan</span></span><span>' + plan.length + ' steps</span></div>';
       plan.forEach((item, idx) => {
         html +=
           '<div class="plan-item">' +
@@ -2736,7 +3118,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           '</div>';
       });
       box.innerHTML = html;
-      chatContainer.appendChild(box);
       chatContainer.scrollTop = chatContainer.scrollHeight;
     }
 
@@ -2744,7 +3125,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const box = document.createElement('div');
       box.className = 'approval-box';
       box.innerHTML =
-        '<div style="font-weight: 600; color: var(--warning); margin-bottom: 6px;">⚠️ Approval Required: ' + escapeHtml(req.toolName) + '</div>' +
+        '<div style="font-weight: 600; color: var(--warning); margin-bottom: 6px; display:flex; align-items:center; gap:6px;">' + lcIcon('triangle-alert', 14) + '<span>Approval Required: ' + escapeHtml(req.toolName) + '</span></div>' +
         '<div style="font-size: 12px; color: var(--fg);">' + escapeHtml(req.description) + '</div>' +
         '<div class="approval-btns">' +
         '<button class="btn-approve" id="app-yes">Approve</button>' +
@@ -2769,18 +3150,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     }
 
     function renderMarkdown(text) {
-      if (!text) return '';
-      let html = escapeHtml(text);
-      const bt = String.fromCharCode(96);
-      const b3 = bt + bt + bt;
-      const codeBlockRe = new RegExp(b3 + '([a-zA-Z0-9]*)\\n([\\s\\S]*?)' + b3, 'g');
-      const inlineCodeRe = new RegExp(bt + '([^' + bt + ']+)' + bt, 'g');
-      html = html.replace(codeBlockRe, '<pre style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 6px; overflow-x: auto; font-family: monospace; font-size: 12px; margin: 8px 0;"><code>$2</code></pre>');
-      html = html.replace(inlineCodeRe, '<code style="background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 4px; font-family: monospace;">$1</code>');
-      html = html.replace(/\\*\\*([^\\*]+)\\*\\*/g, '<strong>$1</strong>');
-      html = html.replace(/^### (.*$)/gm, '<h4 style="font-size: 13px; font-weight: 600; margin: 8px 0 4px 0; color: var(--fg);">$1</h4>');
-      html = html.replace(/\\n/g, '<br/>');
-      return html;
+      return lcRenderMarkdown(text);
     }
   </script>
 </body>

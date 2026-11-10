@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useAppStore } from '../../store/useAppStore';
-import { Terminal, Shield, ListCollapse, X, Play, AlertCircle } from 'lucide-react';
+import { Terminal, Shield, ListCollapse, X, Play, AlertCircle, CheckCircle2 } from 'lucide-react';
 
 export const BottomPanel: React.FC = () => {
   const {
@@ -136,8 +136,9 @@ Fix: ${finding.recommendedFix}`
                 </div>
 
                 {criticReport.findings.length === 0 ? (
-                  <div className="text-emerald-400 font-semibold p-2 bg-emerald-500/10 rounded border border-emerald-500/30">
-                    ✓ All changes verified without defects. Code approved.
+                  <div className="text-emerald-400 font-semibold p-2 bg-emerald-500/10 rounded border border-emerald-500/30 flex items-center gap-2">
+                    <CheckCircle2 size={15} strokeWidth={1.75} className="shrink-0" />
+                    <span>All changes verified without defects. Code approved.</span>
                   </div>
                 ) : (
                   <div className="space-y-2">

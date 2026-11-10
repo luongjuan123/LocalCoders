@@ -2,6 +2,7 @@ import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
 import * as path from 'path';
 import { ToolExecutionContext, ToolResult } from './types';
+import { OperationHistoryManager } from '../commands/operation-history';
 
 export function assertWithinWorkspace(workspaceRoot: string, targetPath: string): string {
   const resolved = path.resolve(workspaceRoot, targetPath);
@@ -108,6 +109,16 @@ export async function writeFileTool(args: { path: string; content: string }, ctx
     const parentDir = path.dirname(fullPath);
     await fs.mkdir(parentDir, { recursive: true });
     await fs.writeFile(fullPath, content, 'utf-8');
+    OperationHistoryManager.getInstance().record({
+      workspaceRoot: ctx.workspaceRoot,
+      type: 'write',
+      filePath: relPath,
+      beforeExists: exists,
+      beforeContent: original,
+      afterExists: true,
+      afterContent: content,
+      description: `${exists ? 'Modify' : 'Create'} ${relPath}`,
+    });
 
     return {
       success: true,
@@ -170,6 +181,16 @@ export async function editFileTool(
     }
 
     await fs.writeFile(fullPath, modified, 'utf-8');
+    OperationHistoryManager.getInstance().record({
+      workspaceRoot: ctx.workspaceRoot,
+      type: 'edit',
+      filePath: relPath,
+      beforeExists: true,
+      beforeContent: original,
+      afterExists: true,
+      afterContent: modified,
+      description: `Edit ${relPath}`,
+    });
     return { success: true, output: { path: relPath, edited: true } };
   } catch (err: any) {
     return { success: false, error: err.message };
@@ -207,6 +228,17 @@ export async function renameFileTool(
 
     await fs.mkdir(path.dirname(newFull), { recursive: true });
     await fs.rename(oldFull, newFull);
+    OperationHistoryManager.getInstance().record({
+      workspaceRoot: ctx.workspaceRoot,
+      type: 'rename',
+      filePath: path.relative(ctx.workspaceRoot, oldFull),
+      newPath: path.relative(ctx.workspaceRoot, newFull),
+      beforeExists: true,
+      beforeContent: '',
+      afterExists: true,
+      afterContent: '',
+      description: `Rename ${path.relative(ctx.workspaceRoot, oldFull)} -> ${path.relative(ctx.workspaceRoot, newFull)}`,
+    });
 
     return {
       success: true,
@@ -246,7 +278,18 @@ export async function deleteFileTool(args: { path: string }, ctx: ToolExecutionC
     if (stat.isDirectory()) {
       await fs.rm(fullPath, { recursive: true, force: true });
     } else {
+      const original = await fs.readFile(fullPath, 'utf-8').catch(() => '');
       await fs.unlink(fullPath);
+      OperationHistoryManager.getInstance().record({
+        workspaceRoot: ctx.workspaceRoot,
+        type: 'delete',
+        filePath: relPath,
+        beforeExists: true,
+        beforeContent: original,
+        afterExists: false,
+        afterContent: '',
+        description: `Delete ${relPath}`,
+      });
     }
 
     return { success: true, output: { path: relPath, deleted: true } };

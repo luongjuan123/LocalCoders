@@ -176,6 +176,7 @@ interface ActiveSessionRun {
   itemId?: string;
   source: 'direct' | 'queued';
   abortController: AbortController;
+  cancelling?: boolean;
   runner?: AgentOrchestrator;
 }
 
@@ -512,10 +513,14 @@ export class MessageQueueManager {
   }
 
   private computeState(sessionId: string, q: InternalSessionQueue): QueueEngineState {
+    const activeRun = this.activeRuns.get(sessionId);
+    const isActivelyRunning = Boolean(
+      activeRun && !activeRun.cancelling && !activeRun.abortController.signal.aborted
+    );
     if (this.transitioningSessions.has(sessionId)) {
       return 'processing_next';
     }
-    if (this.activeRuns.has(sessionId) || q.items.some((i) => i.status === 'processing')) {
+    if (isActivelyRunning || q.items.some((i) => i.status === 'processing')) {
       return 'running';
     }
     const hasFailed = q.items.some((i) => i.status === 'failed');
@@ -539,6 +544,9 @@ export class MessageQueueManager {
   public getSnapshot(sessionId: string): SessionQueueSnapshot {
     const q = this.ensureQueueRecord(sessionId);
     const activeRun = this.activeRuns.get(sessionId);
+    const isActivelyRunning = Boolean(
+      activeRun && !activeRun.cancelling && !activeRun.abortController.signal.aborted
+    );
     const processingItem = q.items.find((i) => i.status === 'processing');
     const queuedItems = q.items
       .filter((i) => i.status === 'queued')
@@ -554,9 +562,9 @@ export class MessageQueueManager {
       sessionId,
       state: this.computeState(sessionId, q),
       paused: q.paused,
-      activeItemId: processingItem?.id || activeRun?.itemId || null,
-      activeExecutionId: processingItem?.executionId || activeRun?.executionId || null,
-      isBusy: this.isSessionBusy(sessionId),
+      activeItemId: processingItem?.id || (isActivelyRunning ? activeRun?.itemId || null : null),
+      activeExecutionId: processingItem?.executionId || (isActivelyRunning ? activeRun?.executionId || null : null),
+      isBusy: Boolean(isActivelyRunning || this.transitioningSessions.has(sessionId)),
       capacity: this.capacity,
       queuedCount: queuedItems.length,
       failedCount: failedItems.length,
@@ -1032,12 +1040,13 @@ export class MessageQueueManager {
       }
 
       if (abortController.signal.aborted || result.cancelled) {
+        const hasQueued = q.items.some((i) => i.status === 'queued');
         item.status = 'cancelled';
         item.error = result.error || 'Execution cancelled by user.';
         item.completedAt = Date.now();
         item.updatedAt = Date.now();
-        q.paused = true;
-        q.lastError = item.error;
+        q.paused = hasQueued;
+        q.lastError = hasQueued ? (q.lastError || item.error) : undefined;
         this.finalizeSessionStatus(sessionId, runId, 'cancelled');
         this.persistQueue(sessionId);
         return 'cancelled';
@@ -1069,12 +1078,13 @@ export class MessageQueueManager {
     } catch (err: any) {
       const msg = err?.message || String(err);
       const isCancelled = Boolean(abortController.signal.aborted || /cancel|abort/i.test(msg));
+      const hasQueued = q.items.some((i) => i.status === 'queued');
       item.status = isCancelled ? 'cancelled' : 'failed';
       item.error = msg;
       item.completedAt = Date.now();
       item.updatedAt = Date.now();
-      q.paused = true;
-      q.lastError = msg;
+      q.paused = isCancelled ? hasQueued : true;
+      q.lastError = isCancelled ? (hasQueued ? (q.lastError || msg) : undefined) : msg;
       this.finalizeSessionStatus(sessionId, runId, isCancelled ? 'cancelled' : 'failed');
       this.persistQueue(sessionId);
       return item.status;
@@ -1378,8 +1388,13 @@ export class MessageQueueManager {
 
     q.items.splice(idx, 1);
     this.renumberQueuedPositions(q);
-    if (!q.items.some((i) => i.status === 'failed')) {
+    const hasFailed = q.items.some((i) => i.status === 'failed');
+    const hasQueued = q.items.some((i) => i.status === 'queued');
+    if (!hasFailed) {
       q.lastError = undefined;
+      if (!hasQueued && !this.isSessionBusy(sessionId)) {
+        q.paused = false;
+      }
     }
     this.persistQueue(sessionId);
     return {
@@ -1548,21 +1563,45 @@ export class MessageQueueManager {
     };
   }
 
+  private requeueFailedOrTargetItems(q: InternalSessionQueue, targets: QueuedMessage[]): void {
+    if (targets.length === 0) return;
+    const targetIds = new Set(targets.map((t) => t.id));
+    const remainingQueued = q.items
+      .filter((i) => i.status === 'queued' && !targetIds.has(i.id))
+      .sort((a, b) => (a.position - b.position) || (a.createdAt - b.createdAt));
+    const now = Date.now();
+    targets.forEach((item, idx) => {
+      item.status = 'queued';
+      item.executionId = makeQueueId('exec');
+      item.error = undefined;
+      item.completedAt = undefined;
+      item.updatedAt = now;
+      item.position = idx;
+    });
+    remainingQueued.forEach((other, idx) => {
+      other.position = targets.length + idx;
+    });
+  }
+
   public resumeQueue(sessionId: string): QueueMutationResult {
     const q = this.ensureQueueRecord(sessionId);
+    const failedItems = q.items.filter((i) => i.status === 'failed');
+    if (failedItems.length > 0) {
+      // Re-queue failed items at the front so clicking Resume after a failure retries and continues cleanly
+      this.requeueFailedOrTargetItems(q, failedItems);
+    }
     q.paused = false;
     q.justCompletedCycle = false;
-    // Clear transient restart-interruption notice; preserve failed item records separately
-    if (!q.items.some((i) => i.status === 'failed')) {
-      q.lastError = undefined;
-    }
+    q.lastError = undefined;
     this.persistQueue(sessionId);
     if (!this.isSessionBusy(sessionId) && q.items.some((i) => i.status === 'queued')) {
       void this.drainQueue(sessionId);
     }
     return {
       ok: true,
-      message: 'Queue execution resumed.',
+      message: failedItems.length > 0
+        ? 'Retrying failed message and resuming queue execution.'
+        : 'Queue execution resumed.',
       snapshot: this.getSnapshot(sessionId),
     };
   }
@@ -1585,20 +1624,8 @@ export class MessageQueueManager {
       };
     }
 
-    item.status = 'queued';
-    item.executionId = makeQueueId('exec');
-    item.error = undefined;
-    item.completedAt = undefined;
-    item.updatedAt = Date.now();
-
     // Place retried item at the front of remaining queued items so it runs next cleanly
-    const others = q.items
-      .filter((i) => i.status === 'queued' && i.id !== item.id)
-      .sort((a, b) => (a.position - b.position) || (a.createdAt - b.createdAt));
-    item.position = 0;
-    others.forEach((other, idx) => {
-      other.position = idx + 1;
-    });
+    this.requeueFailedOrTargetItems(q, [item]);
 
     q.paused = false;
     q.lastError = undefined;
@@ -1658,8 +1685,8 @@ export class MessageQueueManager {
     }
 
     const hasRemaining = q.items.some((i) => i.status === 'queued');
-    // Unpause if queue was paused because of a failed item so remaining queued items continue cleanly
-    if (!stillHasFailed && hasRemaining) {
+    // Unpause if queue was paused because of a failed item or becomes empty after skipping it
+    if (!stillHasFailed && (hasRemaining || !this.isSessionBusy(sessionId))) {
       q.paused = false;
     }
 
@@ -1686,8 +1713,13 @@ export class MessageQueueManager {
     const beforeCount = q.items.filter((i) => !keepStatuses.has(i.status)).length;
     q.items = q.items.filter((i) => keepStatuses.has(i.status));
     q.justCompletedCycle = false;
-    if (options?.includeFailed || !q.items.some((i) => i.status === 'failed')) {
+    const stillHasFailed = q.items.some((i) => i.status === 'failed');
+    const stillHasQueued = q.items.some((i) => i.status === 'queued');
+    if (options?.includeFailed || !stillHasFailed) {
       q.lastError = undefined;
+    }
+    if (!stillHasFailed && !stillHasQueued && !this.isSessionBusy(sessionId)) {
+      q.paused = false;
     }
     this.persistQueue(sessionId);
 
@@ -1699,26 +1731,32 @@ export class MessageQueueManager {
   }
 
   public cancelActiveTask(sessionId?: string): void {
-    const targets = sessionId ? [sessionId] : Array.from(this.activeRuns.keys());
+    const targets = sessionId
+      ? [sessionId]
+      : Array.from(new Set([...this.activeRuns.keys(), ...this.queues.keys()]));
     for (const sid of targets) {
       const q = this.ensureQueueRecord(sid);
-      q.paused = true;
       const run = this.activeRuns.get(sid);
       if (run) {
+        run.cancelling = true;
         run.abortController.abort();
         run.runner?.cancelTask();
-      } else {
-        this.deps.orchestrator?.cancelTask();
       }
+      this.deps.orchestrator?.cancelTask();
+
       const processingItem = q.items.find((i) => i.status === 'processing');
       if (processingItem) {
         processingItem.status = 'cancelled';
         processingItem.error = 'Execution cancelled by user.';
         processingItem.completedAt = Date.now();
+        processingItem.updatedAt = Date.now();
       }
-      if (q.items.some((i) => i.status === 'queued')) {
-        q.lastError = 'Active task cancelled; remaining queued messages were paused cleanly.';
-      }
+      const hasRemainingQueued = q.items.some((i) => i.status === 'queued');
+      q.paused = hasRemainingQueued;
+      q.lastError = hasRemainingQueued
+        ? 'Active task cancelled; remaining queued messages were paused cleanly.'
+        : undefined;
+      this.finalizeSessionStatus(sid, run?.runId || '', 'cancelled');
       this.persistQueue(sid);
     }
   }
@@ -1736,6 +1774,13 @@ export async function handleQueueActionCommand(
   const itemId = String(data?.itemId || '').trim();
 
   switch (action) {
+    case 'stopActive':
+      queueManager.cancelActiveTask(sessionId);
+      return {
+        ok: true,
+        message: 'Active task cancelled.',
+        snapshot: queueManager.getSnapshot(sessionId),
+      };
     case 'pause':
       return queueManager.pauseQueue(sessionId);
     case 'resume':

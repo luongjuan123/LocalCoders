@@ -714,12 +714,27 @@ describe('Multi-Message Agent Queue System — Engine, Persistence, Recovery, Co
       const sentMsgs = agentDom.posted.filter((m) => m.command === 'sendMessage');
       assert.strictEqual(sentMsgs.length, 2);
 
-      // Verify Queue UI header, state badge & rendered items in Agent View
+      // Verify Queue UI hides completely when queue count = 0 (both idle & single active task) and shows when queued/paused/failed
+      const queueDockEl = agentDom.elements.get('lcQueueDock');
+      assert.strictEqual(queueDockEl.style.display, 'flex', 'Queue dock visible when queuedCount > 0');
       assert.strictEqual(agentDom.elements.get('lcQueueTitle').textContent, 'Queued Messages (2)');
       assert.strictEqual(agentDom.elements.get('lcQueueStateBadge').textContent, 'Running');
       assert.strictEqual(agentDom.elements.get('lcQueueList').children.length, 3); // 1 processing + 2 queued
 
-      // Pause/Resume toggle in UI
+      agentDom.sendMessageToWebview({
+        type: 'queueUpdated',
+        snapshot: { sessionId: s1.id, state: 'running', paused: false, activeItemId: 'x', isBusy: true, capacity: 200, queuedCount: 0, failedCount: 0, completedCount: 0, lastError: '', items: [{ id: 'x', sessionId: s1.id, content: 'Single active prompt', status: 'processing', createdAt: Date.now(), position: 0 }] },
+      });
+      assert.strictEqual(queueDockEl.style.display, 'none', 'Queue dock stays hidden when queuedCount = 0 and not paused/failed');
+
+      agentDom.sendMessageToWebview({
+        type: 'queueUpdated',
+        snapshot: { sessionId: s1.id, state: 'paused', paused: true, activeItemId: null, isBusy: false, capacity: 200, queuedCount: 0, failedCount: 0, completedCount: 0, lastError: '', items: [] },
+      });
+      assert.strictEqual(queueDockEl.style.display, 'flex', 'Queue dock remains accessible when explicitly paused');
+
+      // Restore queued=2 snapshot for pause click check
+      agentDom.sendMessageToWebview({ type: 'queueUpdated', snapshot: snap });
       agentDom.elements.get('btnQueuePauseResume').dispatch('click', {});
       assert.ok(agentDom.posted.some((m) => m.command === 'queueAction' && m.action === 'pause'));
 
@@ -746,13 +761,135 @@ describe('Multi-Message Agent Queue System — Engine, Persistence, Recovery, Co
       assert.ok(chatDom.posted.some((m) => m.command === 'sendMessage' && m.text === 'Queued from IDE View'));
       assert.strictEqual(chatDom.elements.get('lcQueueTitle').textContent, 'Queued Messages (2)');
 
-      // Verify backend shared handleQueueActionCommand works cleanly across edits/reorders
+      // Verify Stop button in Agent View updates UI immediately & posts stopTask, and Processing card renders stopActive button
+      const processingCardHtml = agentDom.elements.get('lcQueueList').children[0]?.innerHTML || '';
+      assert.ok(processingCardHtml.includes('data-q-act="stopActive"'), 'Processing row exposes active stopActive button');
+
+      agentDom.elements.get('btnStop').dispatch('click', {});
+      assert.strictEqual(agentDom.elements.get('btnStop').style.display, 'none', 'Stop button clears running UI immediately on click');
+      assert.strictEqual(agentDom.elements.get('topStatusBadge').textContent, 'Ready');
+      assert.ok(agentDom.posted.some((m) => m.command === 'stopTask'));
+
+      // Verify backend shared handleQueueActionCommand works cleanly across pause and stopActive
       const actionRes = await handleQueueActionCommand(qm, s1.id, { action: 'pause' });
       assert.strictEqual(actionRes.ok, true);
       assert.strictEqual(actionRes.snapshot.paused, true);
 
+      const stopRes = await handleQueueActionCommand(qm, s1.id, { action: 'stopActive' });
+      assert.strictEqual(stopRes.ok, true);
+      assert.strictEqual(stopRes.snapshot.isBusy, false, 'Snapshot immediately reflects stopped state before unwind completes');
+      assert.notStrictEqual(stopRes.snapshot.state, 'running');
+      assert.strictEqual(stopRes.snapshot.paused, true, 'Paused remains true because queued follow-ups remain');
+
       gate.resolve();
       await qm.waitForQueueIdle(s1.id);
+
+      // Verify stopping a standalone prompt (0 remaining queued items) clears paused state cleanly
+      const g2 = deferred();
+      const s2 = sm.createSession('Standalone Cancel Session', 'ollama/qwen3:8b');
+      const qmSingle = new MessageQueueManager({
+        sessionManager: sm,
+        executor: async (_item, execCtx) => {
+          await new Promise((_, rej) => {
+            execCtx.abortSignal.addEventListener('abort', () => rej(new Error('Task aborted')));
+          });
+          return { ok: true };
+        },
+      });
+      await qmSingle.submitMessage({ sessionId: s2.id, content: 'Long task' });
+      const singleStop = await handleQueueActionCommand(qmSingle, s2.id, { action: 'stopActive' });
+      assert.strictEqual(singleStop.snapshot.isBusy, false);
+      assert.strictEqual(singleStop.snapshot.paused, false, 'Do not trap standalone session in hidden paused queue when queue = 0');
+      await qmSingle.waitForQueueIdle(s2.id);
+      g2.resolve();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('11. Clicking Resume after a task failure retries the failed task and clears empty failed/paused state on delete/skip', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-mq-resume-fail-'));
+    try {
+      const ctx = createMockContext(tmpDir);
+      const sm = new SessionManager(ctx, tmpDir);
+      const s1 = sm.createSession('Resume Failed Flow', 'ollama/qwen3:8b');
+
+      let attempts = 0;
+      const runs = [];
+      const qm = new MessageQueueManager({
+        sessionManager: sm,
+        executor: async (item) => {
+          attempts++;
+          runs.push(`${item.content}#${attempts}`);
+          if (item.content === 'Fix clock 12h' && attempts === 1) {
+            return { ok: false, error: 'Critic Agent blocked completion after 7 review cycle(s)' };
+          }
+          return { ok: true };
+        },
+      });
+
+      // Submit standalone prompt that fails with 0 remaining queued items
+      await qm.submitMessage({ sessionId: s1.id, content: 'Fix clock 12h' });
+      await qm.waitForQueueIdle(s1.id);
+      const failedSnap = qm.getSnapshot(s1.id);
+      assert.strictEqual(failedSnap.state, 'failed');
+      assert.strictEqual(failedSnap.paused, true);
+      assert.strictEqual(failedSnap.queuedCount, 0);
+      assert.strictEqual(failedSnap.failedCount, 1);
+
+      // Clicking Resume via shared queueAction must retry the failed task and complete!
+      const resumeRes = await handleQueueActionCommand(qm, s1.id, { action: 'resume' });
+      assert.strictEqual(resumeRes.ok, true);
+      await qm.waitForQueueIdle(s1.id);
+      assert.deepStrictEqual(runs, ['Fix clock 12h#1', 'Fix clock 12h#2']);
+      const doneSnap = qm.getSnapshot(s1.id);
+      assert.strictEqual(doneSnap.state, 'completed');
+      assert.strictEqual(doneSnap.paused, false);
+      assert.strictEqual(doneSnap.failedCount, 0);
+      assert.strictEqual(doneSnap.lastError, undefined);
+
+      // Verify UI shows Resume (not Pause) and dispatches 'resume' when failedCount > 0 even if paused is false
+      const agentHtml = AgentWorkspaceEditorPanel.prototype._getHtmlForWebview.call({ _panel: { webview: { cspSource: 'vscode-webview:' } } });
+      const agentDom = createQueueSandbox(agentHtml);
+      agentDom.sendMessageToWebview({
+        type: 'queueUpdated',
+        snapshot: {
+          sessionId: s1.id,
+          state: 'failed',
+          paused: false,
+          activeItemId: null,
+          activeExecutionId: null,
+          isBusy: false,
+          capacity: 200,
+          queuedCount: 0,
+          failedCount: 1,
+          completedCount: 0,
+          lastError: 'Critic Agent blocked completion',
+          items: [{ id: 'f1', content: 'Retry me', status: 'failed', error: 'Blocked', position: 0, createdAt: Date.now(), attachments: [] }],
+        },
+      });
+      const pauseResumeBtn = agentDom.elements.get('btnQueuePauseResume');
+      assert.ok(pauseResumeBtn.innerHTML.includes('Resume'), 'Header button shows Resume when a failed item can be resumed');
+      assert.ok(agentDom.elements.get('lcQueueBanner').innerHTML.includes('btnBannerResume'), 'Error banner exposes Resume button cleanly');
+      pauseResumeBtn.dispatch('click', {});
+      assert.ok(
+        agentDom.posted.some((m) => m.command === 'queueAction' && m.action === 'resume'),
+        'Clicking header button in failed state dispatches resume action'
+      );
+
+      // Verify deleting the sole failed item unpauses and returns to idle cleanly
+      const s2 = sm.createSession('Delete Failed Item', 'ollama/qwen3:8b');
+      const qm2 = new MessageQueueManager({
+        sessionManager: sm,
+        executor: async () => ({ ok: false, error: 'Simulated failure' }),
+      });
+      const sub2 = await qm2.submitMessage({ sessionId: s2.id, content: 'Broken' });
+      await qm2.waitForQueueIdle(s2.id);
+      assert.strictEqual(qm2.getSnapshot(s2.id).paused, true);
+      const delRes = qm2.deleteQueuedMessage(s2.id, sub2.item.id);
+      assert.strictEqual(delRes.snapshot.failedCount, 0);
+      assert.strictEqual(delRes.snapshot.paused, false);
+      assert.strictEqual(delRes.snapshot.state, 'idle');
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

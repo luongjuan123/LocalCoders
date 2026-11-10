@@ -1966,4 +1966,233 @@ describe('Event Streaming, Thinking Filter, Command Cards & Cockpit UI (12 Scena
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('34. Agent thinking box updates in-place via delta append and preserves scroll positions during streaming', () => {
+    const vm = require('vm');
+    const actUi = require('../extensions/localcoders-core/dist/views/activity-stream-ui');
+    const css = actUi.getActivityStreamStyles();
+    assert.ok(css.includes('.lc-thought-body'), 'Includes thought body rules');
+    assert.ok(css.includes('overscroll-behavior: contain'), 'Prevents scroll-chaining jolts inside nested thought/terminal boxes');
+    assert.ok(css.includes('overflow-anchor: none'), 'Disables browser scroll-anchor jumps during live appends');
+    assert.ok(css.includes('.lc-thought-body.is-expanded'), 'Supports expanding thought blocks inline');
+
+    // Verify in-place delta append & scrollTop preservation in lcUpdateThoughtEntryElement
+    const makeRichDom = () => {
+      const makeTextNode = (txt) => ({
+        nodeType: 3,
+        data: String(txt || ''),
+        appendData(d) { this.data += String(d || ''); },
+      });
+      const makeEl = (tag) => {
+        const attrs = {};
+        const listeners = {};
+        const el = {
+          tagName: tag,
+          className: '',
+          children: [],
+          style: {},
+          scrollTop: 0,
+          clientHeight: 340,
+          _scrollHeight: 600,
+          get scrollHeight() { return Math.max(this._scrollHeight, (this.textContent || '').length * 2); },
+          set scrollHeight(v) { this._scrollHeight = v; },
+          get lastChild() { return this.children[this.children.length - 1] || null; },
+          get textContent() {
+            return this.children.map((c) => (c.nodeType === 3 ? c.data : c.textContent || '')).join('');
+          },
+          set textContent(v) {
+            this.children = [makeTextNode(v)];
+          },
+          _innerHTML: '',
+          get innerHTML() { return this._innerHTML; },
+          set innerHTML(v) {
+            this._innerHTML = String(v);
+            if (String(v).includes('lc-thought-body')) {
+              const dur = makeEl('span'); dur.className = 'lc-thought-dur'; dur.textContent = 'thinking...';
+              const btn = makeEl('button'); btn.className = 'lc-thought-expand-btn';
+              const body = makeEl('div'); body.className = 'lc-thought-body';
+              const match = String(v).match(/<div class="lc-thought-body[^"]*">([\s\S]*?)<\/div>/);
+              if (match) body.textContent = match[1];
+              el._subMap = { '.lc-thought-dur': dur, '.lc-thought-expand-btn': btn, '.lc-thought-body': body };
+            } else {
+              el._subMap = null;
+            }
+          },
+          classList: {
+            contains: (c) => el.className.split(/\s+/).includes(c),
+            toggle: (c, force) => {
+              const parts = el.className.split(/\s+/).filter(Boolean);
+              const has = parts.includes(c);
+              const next = typeof force === 'boolean' ? force : !has;
+              if (next && !has) parts.push(c);
+              if (!next && has) parts.splice(parts.indexOf(c), 1);
+              el.className = parts.join(' ');
+              return next;
+            },
+          },
+          setAttribute: (k, v) => { attrs[k] = String(v); },
+          getAttribute: (k) => attrs[k] ?? null,
+          addEventListener: (ev, fn) => { listeners[ev] = listeners[ev] || []; listeners[ev].push(fn); },
+          trigger: (ev) => { (listeners[ev] || []).forEach((fn) => fn({ stopPropagation() {} })); },
+          appendChild: (c) => { el.children.push(c); },
+          remove: () => {},
+          querySelector: (sel) => (el._subMap && el._subMap[sel]) || null,
+          querySelectorAll: () => [],
+        };
+        return el;
+      };
+      return {
+        document: {
+          createElement: makeEl,
+          createTextNode: makeTextNode,
+        },
+        lcIcon: () => '<svg></svg>',
+      };
+    };
+
+    const dom = makeRichDom();
+    const sandbox = Object.assign({}, dom);
+    vm.createContext(sandbox);
+    vm.runInContext(actUi.getActivityClientScript(), sandbox);
+
+    const thought = {
+      id: 'thought_1',
+      category: 'thinking_summary',
+      agentName: 'Main Agent',
+      agentRole: 'Lead Architect',
+      status: 'running',
+      stdout: 'Line 1: Analyzing requirements...\n' + 'x'.repeat(250),
+    };
+    let expandedId = null;
+    const box = sandbox.lcBuildThoughtEntryElement(thought, {
+      isExpanded: false,
+      onToggleExpand: (id, open) => { expandedId = open ? id : null; },
+    });
+    const bodyEl = box.querySelector('.lc-thought-body');
+    const origBodyRef = bodyEl;
+    const origTextNode = bodyEl.lastChild;
+
+    // Simulate user scrolling partway down while reading
+    bodyEl.scrollHeight = 700;
+    bodyEl.clientHeight = 340;
+    bodyEl.scrollTop = 125;
+
+    // Stream new reasoning chunk
+    sandbox.lcUpdateThoughtEntryElement(box, Object.assign({}, thought, {
+      stdout: thought.stdout + '\nLine 2: Designing plan steps...',
+    }), { isExpanded: false });
+
+    assert.strictEqual(box.querySelector('.lc-thought-body'), origBodyRef, 'Thought body DOM node is reused in-place');
+    assert.strictEqual(bodyEl.lastChild, origTextNode, 'Text node appends delta in-place instead of replacing DOM');
+    assert.ok(bodyEl.textContent.includes('Line 2: Designing plan steps...'), 'Delta text appended cleanly');
+    assert.strictEqual(bodyEl.scrollTop, 125, 'Preserves user scrollTop when user scrolled away from top/bottom');
+
+    // Simulate user scrolled to bottom tail -> follows new content smoothly
+    bodyEl.scrollHeight = bodyEl.scrollTop + 340 + 8; // gap 8 <= 24
+    bodyEl.scrollTop = bodyEl.scrollHeight - bodyEl.clientHeight - 8;
+    sandbox.lcUpdateThoughtEntryElement(box, Object.assign({}, thought, {
+      stdout: thought.stdout + '\nLine 2: Designing plan steps...\nLine 3: Ready to delegate.',
+    }), { isExpanded: false });
+    assert.strictEqual(
+      bodyEl.scrollTop,
+      Math.max(0, bodyEl.scrollHeight - bodyEl.clientHeight),
+      'Follows bottom only when user is already pinned to the tail'
+    );
+
+    // Toggle full inline expand button
+    const expandBtn = box.querySelector('.lc-thought-expand-btn');
+    expandBtn.trigger('click');
+    assert.strictEqual(expandedId, 'thought_1', 'Fires expand callback cleanly');
+    assert.ok(bodyEl.classList.contains('is-expanded'), 'Adds .is-expanded class when toggled');
+    assert.strictEqual(expandBtn.textContent, 'Compact', 'Button label switches to Compact');
+
+    // Verify AgentWorkspaceEditorPanel wires in-place upsert & scroll preservation cleanly
+    const workspaceInst = Object.create(AgentWorkspaceEditorPanel.prototype);
+    const workspaceHtml = workspaceInst._getHtmlForWebview();
+    assert.ok(workspaceHtml.includes('upsertActivityInConversation('), 'Workspace upserts activities in-place instead of calling renderFullConversation on every chunk');
+    assert.ok(workspaceHtml.includes('captureInnerScrollState()'), 'Workspace snapshots and restores thought/terminal scroll offsets across full re-renders');
+    assert.ok(workspaceHtml.includes('expandedThoughtIds'), 'Workspace tracks per-thought inline expansion state across updates');
+  });
+
+  it('35. Closing a launched application never triggers an infinite relaunch loop across turns or Critic remediation', async () => {
+    const vscode = require('vscode');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-ev-35-'));
+    const origFolders = vscode.workspace.workspaceFolders;
+    vscode.workspace.workspaceFolders = [{ uri: { fsPath: tmpDir } }];
+    try {
+      const markerLog = path.join(tmpDir, 'launch_count.log');
+      fs.writeFileSync(
+        path.join(tmpDir, 'clock.py'),
+        `import pathlib\nwith open(${JSON.stringify(markerLog)}, 'a') as f:\n    f.write('LAUNCHED\\n')\nprint('CLOCK_WINDOW_CLOSED')\n`,
+        'utf8'
+      );
+
+      // 1. Unit verification of progressGuard cross-tool command normalization & Critic app-launch blocking
+      const { createTurnProgressGuard } = require('../extensions/localcoders-core/dist/agents/tool-runner');
+      const guard = createTurnProgressGuard({ maxStuckTurns: 2 });
+      assert.strictEqual(guard.checkBeforeCall('run_command', { command: 'python3 clock.py' }).skip, false);
+      guard.recordOutcome('run_command', { command: 'python3 clock.py' }, { success: true, output: { exitCode: 0 } });
+      assert.strictEqual(guard.checkBeforeCall('run_command', { command: 'python3 clock.py' }).skip, true, 'Blocks identical run_command relaunch');
+      assert.strictEqual(guard.checkBeforeCall('start_process', { command: 'python3 ./clock.py' }).skip, true, 'Blocks switching to start_process for same app');
+      assert.strictEqual(guard.checkBeforeCall('app.launch', { command: 'python3', args: ['clock.py'] }).skip, true, 'Blocks app.launch variant too');
+
+      const criticGuard = createTurnProgressGuard({ maxStuckTurns: 2, blockInteractiveApps: true });
+      assert.strictEqual(criticGuard.checkBeforeCall('start_process', { command: 'python3 clock.py' }).skip, true, 'Critic remediation blocks start_process');
+      assert.strictEqual(criticGuard.checkBeforeCall('run_command', { command: 'python3 clock.py' }).skip, true, 'Critic remediation blocks interactive app run_command');
+      assert.strictEqual(criticGuard.checkBeforeCall('run_command', { command: 'python3 -m unittest test_clock.py' }).skip, false, 'Critic remediation still allows automated tests');
+
+      // 2. Full orchestrator verification: stubborn LLM tries to relaunch clock.py on turn 2 via start_process -> blocked, stops cleanly with 1 launch!
+      const { PermissionManager } = require('../extensions/localcoders-core/dist/security/permission-manager');
+      const pm = new PermissionManager(tmpDir);
+      pm.setMode('bypass');
+      const toolManager = new ToolManager(undefined, pm);
+      const registry = makeRegistry(makeMockContext(tmpDir));
+
+      let llmTurns = 0;
+      const mockLlm = {
+        getHost: () => 'http://localhost:11434',
+        chatStream: async (_params, onChunk) => {
+          llmTurns++;
+          if (llmTurns === 1) {
+            onChunk({
+              content: '',
+              toolCalls: [{ function: { name: 'run_command', arguments: { command: 'python3 clock.py' } } }],
+              done: true,
+            });
+          } else {
+            // Stubborn model tries reopening after user closed the window
+            onChunk({
+              content: '',
+              toolCalls: [{ function: { name: 'start_process', arguments: { command: 'python3 ./clock.py' } } }],
+              done: true,
+            });
+          }
+        },
+      };
+
+      const orchestrator = new AgentOrchestrator(mockLlm, registry, toolManager, tmpDir);
+      const task = await orchestrator.submitTask('run clock.py', {
+        providerId: 'ollama',
+        modelId: 'mock-model',
+        modelName: 'mock-model',
+        reasoningEffort: 'none',
+        fastMode: false,
+        executionMode: 'code',
+        permissionMode: 'bypass',
+        enabledMcpServers: [],
+        enabledSkills: [],
+        activeRules: [],
+        attachedFiles: [],
+        projectContext: [],
+      });
+
+      assert.strictEqual(task.status, 'completed');
+      const launches = fs.readFileSync(markerLog, 'utf8').trim().split(/\r?\n/).filter(Boolean);
+      assert.strictEqual(launches.length, 1, 'Application must launch only ONCE even if LLM tries reopening after close');
+      assert.ok(llmTurns <= 2, `Should stop immediately on duplicate launch attempt (turns=${llmTurns})`);
+    } finally {
+      vscode.workspace.workspaceFolders = origFolders;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

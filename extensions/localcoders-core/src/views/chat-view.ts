@@ -339,7 +339,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           }
           const res = await handleQueueActionCommand(this.queueManager, activeSess.id, data);
           this.postMessageSafe({ type: 'queueUpdated', snapshot: res.snapshot });
-          if (!res.ok && res.error) {
+          if (data?.action === 'stopActive') {
+            this.orchestrator.cancelTask();
+            this.postMessageSafe({ type: 'runFinished', status: 'cancelled' });
+            await this.syncActiveSession();
+          } else if (!res.ok && res.error) {
             this.postMessageSafe({ type: 'queueActionError', error: res.error });
           }
           break;
@@ -417,11 +421,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           const activeSess = this.sessionManager.getActiveSession();
           if (this.queueManager) {
             this.queueManager.cancelActiveTask(activeSess?.id);
-          } else {
-            this.orchestrator.cancelTask();
+            if (activeSess) {
+              this.postMessageSafe({ type: 'queueUpdated', snapshot: this.queueManager.getSnapshot(activeSess.id) });
+            }
           }
-          await this.syncActiveSession();
+          this.orchestrator.cancelTask();
           this.postMessageSafe({ type: 'runFinished', status: 'cancelled' });
+          await this.syncActiveSession();
           break;
         }
 
@@ -2207,6 +2213,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const drawerCount = document.getElementById('drawer-count');
 
     let isRunning = false;
+    let chatPinnedToBottom = true;
+    let activityPinnedToBottom = true;
+    if (chatContainer && typeof chatContainer.addEventListener === 'function') {
+      chatContainer.addEventListener('scroll', () => {
+        const gap = chatContainer.scrollHeight - chatContainer.scrollTop - chatContainer.clientHeight;
+        chatPinnedToBottom = gap <= 32;
+      });
+    }
+    if (activityList && typeof activityList.addEventListener === 'function') {
+      activityList.addEventListener('scroll', () => {
+        const gap = activityList.scrollHeight - activityList.scrollTop - activityList.clientHeight;
+        activityPinnedToBottom = gap <= 32;
+      });
+    }
     let allSectionsCache = [];
     let currentActiveSessionId = null;
     let drawerSortMode = 'recent';
@@ -2390,6 +2410,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     if (btnStop) {
       btnStop.addEventListener('click', () => {
+        setRunningState(false);
         vscode.postMessage({ command: 'cancelTask' });
       });
     }
@@ -2416,6 +2437,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       slashCtrl.close();
       promptInput.value = '';
       promptInput.style.height = 'auto';
+      chatPinnedToBottom = true;
       if (!isRunning) {
         setRunningState(true);
       }
@@ -2752,6 +2774,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
     let cachedActivities = [];
     let expandedActivityIds = {};
+    let expandedThoughtIds = {};
     let activityFilter = 'all';
     let currentViewTab = 'chat';
     let currentStatusSummary = '';
@@ -2827,16 +2850,65 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    function renderActivityPanel() {
-      if (!activityList) return;
-      activityList.innerHTML = '';
-      const filtered = cachedActivities.filter((item) => {
-        if (activityFilter === 'all') return true;
-        if (activityFilter === 'command') return item.category === 'command';
-        if (activityFilter === 'file') return item.category === 'file';
-        if (activityFilter === 'subagent') return item.category === 'subagent';
-        return true;
+    function matchesSideActivityFilter(item) {
+      if (!item) return false;
+      if (activityFilter === 'all') return true;
+      if (activityFilter === 'command') return item.category === 'command';
+      if (activityFilter === 'file') return item.category === 'file';
+      if (activityFilter === 'subagent') return item.category === 'subagent';
+      return true;
+    }
+
+    function buildSideActivityNode(item) {
+      if (item.category === 'thinking_summary') {
+        return lcBuildThoughtEntryElement(item, {
+          isExpanded: !!expandedThoughtIds[item.id],
+          onToggleExpand: (id, open) => {
+            expandedThoughtIds[id] = open;
+          },
+        });
+      }
+      const isOpen = !!expandedActivityIds[item.id] || item.status === 'running' || item.status === 'failed';
+      return lcBuildActivityCardElement(item, isOpen, (id, open) => {
+        expandedActivityIds[id] = open;
       });
+    }
+
+    function upsertActivityPanelItem(item) {
+      if (!activityList || !item || !item.id || !matchesSideActivityFilter(item)) return;
+      const existing = lcFindChildByAttr(activityList, 'data-act-id', item.id);
+      if (existing) {
+        if (item.category === 'thinking_summary') {
+          lcUpdateThoughtEntryElement(existing, item, { isExpanded: !!expandedThoughtIds[item.id] });
+        } else {
+          lcUpdateActivityCardElement(existing, item);
+        }
+        if (activityPinnedToBottom) {
+          activityList.scrollTop = activityList.scrollHeight;
+        }
+        return;
+      }
+      renderActivityPanel();
+    }
+
+    function renderActivityPanel(opts) {
+      if (!activityList) return;
+      const forceBottom = Boolean(opts && opts.forceScrollBottom);
+      const prevTop = Number(activityList.scrollTop || 0);
+      const shouldStick = forceBottom || activityPinnedToBottom;
+      const savedInner = new Map();
+      activityList.querySelectorAll('[data-act-id]').forEach((el) => {
+        const id = el.getAttribute('data-act-id');
+        const body = el.querySelector('.lc-thought-body, .lc-terminal-pre.is-stdout');
+        if (id && body) {
+          const top = Number(body.scrollTop || 0);
+          const gap = Number(body.scrollHeight || 0) - top - Number(body.clientHeight || 0);
+          savedInner.set(id, { scrollTop: top, wasAtBottom: top > 0 && gap <= 24 });
+        }
+      });
+
+      activityList.innerHTML = '';
+      const filtered = cachedActivities.filter(matchesSideActivityFilter);
       if (filtered.length === 0) {
         activityList.innerHTML =
           '<div style="padding:20px;text-align:center;color:var(--text-muted);font-size:12px;">' +
@@ -2845,16 +2917,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         return;
       }
       filtered.forEach((item) => {
-        const isOpen = !!expandedActivityIds[item.id] || item.status === 'running' || item.status === 'failed';
-        const card = lcBuildActivityCardElement(item, isOpen, (id, open) => {
-          expandedActivityIds[id] = open;
-        });
-        activityList.appendChild(card);
+        const node = buildSideActivityNode(item);
+        activityList.appendChild(node);
+        const snap = savedInner.get(item.id);
+        if (snap) {
+          const body = node.querySelector('.lc-thought-body, .lc-terminal-pre.is-stdout');
+          if (body) {
+            if (snap.wasAtBottom) body.scrollTop = Math.max(0, body.scrollHeight - body.clientHeight);
+            else if (snap.scrollTop > 0) body.scrollTop = snap.scrollTop;
+          }
+        }
       });
-      activityList.scrollTop = activityList.scrollHeight;
+      if (shouldStick) {
+        activityList.scrollTop = activityList.scrollHeight;
+      } else if (prevTop > 0) {
+        activityList.scrollTop = prevTop;
+      }
     }
 
-    function renderSidebarChat() {
+    function renderSidebarChat(opts) {
+      const forceBottom = Boolean(opts && opts.forceScrollBottom);
+      const prevTop = Number(chatContainer.scrollTop || 0);
+      const shouldStick = forceBottom || chatPinnedToBottom;
       const mergedCmdMap = new Map();
       (Array.isArray(currentCommandResults) ? currentCommandResults : []).forEach((cr) => {
         if (cr && cr.id) mergedCmdMap.set(cr.id, cr);
@@ -2904,7 +2988,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       if (currentSessionPlanExplicit && currentSessionPlanCache && currentSessionPlanCache.length > 0) {
         renderPlan(currentSessionPlanCache);
       }
-      chatContainer.scrollTop = chatContainer.scrollHeight;
+      if (shouldStick) {
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+        chatPinnedToBottom = true;
+      } else if (prevTop > 0) {
+        chatContainer.scrollTop = prevTop;
+      }
     }
 
     window.addEventListener('message', (event) => {
@@ -2921,9 +3010,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           }
           if (drawerCount) drawerCount.textContent = allSectionsCache.length;
 
+          let isNewSessionLoad = false;
           {
             const nextId = data.session ? data.session.id : null;
             if (lastLoadedSessionId !== nextId) {
+              isNewSessionLoad = true;
               ephemeralCommandResults = [];
               lcQueueUserToggled = false;
               lcQueueEditingId = null;
@@ -2976,7 +3067,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
           cachedActivities = Array.isArray(data.session?.activities) ? data.session.activities.slice() : [];
           updateActivityCounters();
-          renderActivityPanel();
+          renderActivityPanel({ forceScrollBottom: isNewSessionLoad });
 
           const sessionRunning = Boolean(data.session?.status === 'running' || data.queueSnapshot?.isBusy);
           currentStatusSummary = sessionRunning ? (data.session?.activePhaseSummary || 'Agent is working') : '';
@@ -3006,7 +3097,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           currentCommandResults = Array.isArray(data.session?.commandResults) ? data.session.commandResults.slice() : [];
           currentSessionPlanCache = Array.isArray(data.session?.plan) ? data.session.plan.slice() : [];
           currentSessionPlanExplicit = !!data.session?.planExplicit;
-          renderSidebarChat();
+          renderSidebarChat({ forceScrollBottom: isNewSessionLoad });
           break;
 
         case 'addMessage':
@@ -3021,10 +3112,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               contentEl.innerHTML = renderMarkdown(data.message.content || '');
             }
             delete streamingMsgNodes[data.message.id];
+            if (chatPinnedToBottom) chatContainer.scrollTop = chatContainer.scrollHeight;
           } else {
+            if (data.message?.senderRole === 'user') chatPinnedToBottom = true;
             renderMessage(data.message);
           }
-          chatContainer.scrollTop = chatContainer.scrollHeight;
           if (data.message?.senderRole === 'assistant') {
             currentStatusSummary = '';
             setRunningState(Boolean(lcGetQueueSnapshot()?.isBusy));
@@ -3056,7 +3148,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           if (contentEl) {
             contentEl.innerHTML = renderMarkdown(ev.fullContent || '');
           }
-          chatContainer.scrollTop = chatContainer.scrollHeight;
+          if (chatPinnedToBottom) {
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+          }
           break;
         }
 
@@ -3080,7 +3174,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           cachedActivities = lcUpsertActivityList(cachedActivities, data.item);
           updateActivityCounters();
           renderLiveStrip();
-          renderActivityPanel();
+          upsertActivityPanelItem(data.item);
           break;
         }
 
@@ -3214,7 +3308,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           '</div>';
       }
       chatContainer.appendChild(row);
-      chatContainer.scrollTop = chatContainer.scrollHeight;
+      if (chatPinnedToBottom) {
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+      }
     }
 
     function renderPlan(plan) {
@@ -3234,7 +3330,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           '</div>';
       });
       box.innerHTML = html;
-      chatContainer.scrollTop = chatContainer.scrollHeight;
+      if (chatPinnedToBottom) {
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+      }
     }
 
     function renderApproval(req) {

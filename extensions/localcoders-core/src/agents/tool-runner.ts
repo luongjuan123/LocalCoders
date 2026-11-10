@@ -284,30 +284,97 @@ export interface TurnProgressCheckResult {
   cachedResultJson?: string;
 }
 
+export interface TurnProgressGuardOptions {
+  maxStuckTurns?: number;
+  blockInteractiveApps?: boolean;
+  launchedApps?: Set<string>;
+}
+
+const APP_LAUNCH_TOOL_NAMES = new Set([
+  'start_process',
+  'app.launch',
+  'app.open_url',
+  'app.open_file',
+]);
+
+export function isTestOrVerificationCommand(rawCmd: string): boolean {
+  const s = String(rawCmd || '').trim();
+  if (!s) return false;
+  return (
+    /\b(unittest|pytest|py_compile|vitest|jest|mocha|rspec|phpunit|ctest)\b/i.test(s) ||
+    /\b(npm|pnpm|yarn|bun)\s+(test|run\s+(test|lint|build|typecheck|check)|install|ci)\b/i.test(s) ||
+    /\b(npx|tsc|eslint|flake8|mypy|ruff|black|pylint)\b/i.test(s) ||
+    /\b(cargo|go|dotnet|mvn|gradle)\s+(test|build|check|vet|clippy)\b/i.test(s) ||
+    /\bnode\b[^|;&]*--test\b/i.test(s) ||
+    /\bpip3?\s+install\b/i.test(s)
+  );
+}
+
+export function normalizeCommandTarget(toolName: string, args: Record<string, any> | undefined): string {
+  if (toolName === 'app.open_url') {
+    return `url:${String(args?.url || '').trim().toLowerCase()}`;
+  }
+  if (toolName === 'app.open_file') {
+    return `file:${String(args?.path || '').trim().replace(/^\.\//, '')}`;
+  }
+  const argSuffix = Array.isArray(args?.args) && args.args.length > 0 ? ` ${args.args.join(' ')}` : '';
+  let cmd = String(args?.command || args?.cmd || args?.path || '').trim() + argSuffix;
+  // Strip shell wrappers (cd ... &&, nohup, trailing &, stderr redirection)
+  cmd = cmd
+    .replace(/^(?:cd\s+[^&;]+&&\s*)+/i, '')
+    .replace(/^nohup\s+/i, '')
+    .replace(/\s*(?:2>&1|1?>\/dev\/null)\s*/gi, ' ')
+    .replace(/\s*&\s*$/, '')
+    .trim();
+  // Collapse whitespace, normalize python3/python & unbuffered flag, strip quotes & ./ on paths
+  cmd = cmd
+    .replace(/["']/g, '')
+    .replace(/\s+/g, ' ')
+    .replace(/\bpython3(?:\.\d+)?\b/gi, 'python')
+    .replace(/\bpython\s+-u\s+/gi, 'python ')
+    .replace(/(^|\s)\.\//g, '$1')
+    .trim();
+  return cmd;
+}
+
 /**
  * Shared loop-breaker across MainAgent, Critic remediation, and Subagents.
- * Prevents local models from wasting minutes repeating identical failed `edit_file` targets
- * or re-running identical failing tests when zero files were modified between runs.
+ * Prevents local models from wasting minutes repeating identical failed `edit_file` targets,
+ * re-running identical failing tests, or infinitely re-launching desktop/GUI apps after close.
  */
-export function createTurnProgressGuard(options: { maxStuckTurns?: number } = {}) {
+export function createTurnProgressGuard(options: TurnProgressGuardOptions = {}) {
   const maxStuckTurns = Math.max(1, options.maxStuckTurns ?? 2);
+  const blockInteractiveApps = Boolean(options.blockInteractiveApps);
+  const launchedApps = options.launchedApps || new Set<string>();
   const succeededMutations = new Set<string>();
   const failedMutations = new Map<string, string>();
   const blockedCommands = new Map<string, string>();
   const failedCommandsSinceLastWrite = new Map<string, { error: string; count: number }>();
+  const executedTestsSinceLastWrite = new Set<string>();
   let stuckTurns = 0;
 
   const isMutationTool = (name: string) =>
     name === 'write_file' || name === 'create_file' || name === 'edit_file';
 
+  const isAppLaunchTool = (name: string) => APP_LAUNCH_TOOL_NAMES.has(name);
+
   const isCommandTool = (name: string) =>
-    name === 'run_command' || name === 'run_tests';
+    name === 'run_command' || name === 'run_tests' || isAppLaunchTool(name);
 
   const mutationSignature = (name: string, args: Record<string, any>) =>
     `${name}:${JSON.stringify(args || {})}`;
 
   const commandSignature = (name: string, args: Record<string, any>) =>
-    `${name}:${String(args?.command || args?.cmd || '').trim()}::${String(args?.stdin ?? args?.input ?? '')}`;
+    `${name}:${normalizeCommandTarget(name, args)}::${String(args?.stdin ?? args?.input ?? '')}`;
+
+  const isLaunchOrAppRun = (toolName: string, args: Record<string, any>): boolean => {
+    if (isAppLaunchTool(toolName)) return true;
+    if (toolName === 'run_command') {
+      const norm = normalizeCommandTarget(toolName, args);
+      return Boolean(norm) && !isTestOrVerificationCommand(norm);
+    }
+    return false;
+  };
 
   return {
     checkBeforeCall(toolName: string, args: Record<string, any>): TurnProgressCheckResult {
@@ -343,6 +410,36 @@ export function createTurnProgressGuard(options: { maxStuckTurns?: number } = {}
 
       if (isCommandTool(toolName)) {
         const sig = commandSignature(toolName, args);
+        const normTarget = normalizeCommandTarget(toolName, args);
+        const appRun = isLaunchOrAppRun(toolName, args);
+
+        if (blockInteractiveApps && appRun) {
+          return {
+            skip: true,
+            reason: `Blocked launching interactive application '${normTarget}' during remediation pass`,
+            cachedResultJson: JSON.stringify({
+              success: true,
+              skippedDuplicate: true,
+              message: `Skipped launching '${normTarget}' during code-fix review pass. Run only automated tests/checks (e.g. unittest, pytest, npm test).`,
+            }),
+          };
+        }
+
+        if (appRun && normTarget && launchedApps.has(normTarget)) {
+          return {
+            skip: true,
+            reason: `Application '${normTarget}' was already launched in this run`,
+            cachedResultJson: JSON.stringify({
+              success: true,
+              skippedDuplicate: true,
+              alreadyExecuted: true,
+              message:
+                `Skipped duplicate launch of '${normTarget}': this application already ran/launched during this task. ` +
+                `Do NOT reopen it after it exits or is closed by the user. Summarize completion concisely now.`,
+            }),
+          };
+        }
+
         if (blockedCommands.has(sig)) {
           const prevReason = blockedCommands.get(sig) || 'Command timed out or required interactive input.';
           return {
@@ -356,7 +453,6 @@ export function createTurnProgressGuard(options: { maxStuckTurns?: number } = {}
           };
         }
         if (failedCommandsSinceLastWrite.has(sig)) {
-          const prev = failedCommandsSinceLastWrite.get(sig)!;
           return {
             skip: true,
             reason: `No workspace files changed since last failure of ${args?.command || toolName}`,
@@ -366,6 +462,17 @@ export function createTurnProgressGuard(options: { maxStuckTurns?: number } = {}
               error:
                 `Skipped redundant retry of failing command '${args?.command || toolName}': no files were modified since its last failure. ` +
                 `Read/fix the failing file with read_file + write_file before running tests again.`,
+            }),
+          };
+        }
+        if (!appRun && normTarget && executedTestsSinceLastWrite.has(normTarget)) {
+          return {
+            skip: true,
+            reason: `Test/verification command '${normTarget}' already passed with current files`,
+            cachedResultJson: JSON.stringify({
+              success: true,
+              skippedDuplicate: true,
+              message: `Skipped duplicate verification '${normTarget}': already passed with zero edits since last run. Summarize completion.`,
             }),
           };
         }
@@ -391,8 +498,9 @@ export function createTurnProgressGuard(options: { maxStuckTurns?: number } = {}
           if (isMutationTool(toolName)) {
             succeededMutations.add(mutationSignature(toolName, args));
           }
-          // File contents changed on disk, so previously failing tests are now allowed to re-run
+          // File contents changed on disk, so previously failing tests/commands can re-run cleanly
           failedCommandsSinceLastWrite.clear();
+          executedTestsSinceLastWrite.clear();
         } else if (!result?.cancelled && isMutationTool(toolName)) {
           failedMutations.set(
             mutationSignature(toolName, args),
@@ -403,8 +511,31 @@ export function createTurnProgressGuard(options: { maxStuckTurns?: number } = {}
 
       if (isCommandTool(toolName)) {
         const sig = commandSignature(toolName, args);
+        const normTarget = normalizeCommandTarget(toolName, args);
+        const appRun = isLaunchOrAppRun(toolName, args);
+
+        if (appRun && normTarget) {
+          const out = result?.output || {};
+          const exitCode = typeof out.exitCode === 'number' ? out.exitCode : undefined;
+          const stderrStr = String(out.stderr || result?.error || '');
+          // If an app crashed with a code error before staying open, allow fixing & retrying once;
+          // if it opened/ran (success or user-closed/terminated), keep it in launchedApps for the run
+          const preLaunchCodeCrash =
+            !result?.success &&
+            exitCode !== 0 &&
+            exitCode !== 130 &&
+            exitCode !== 143 &&
+            /SyntaxError|IndentationError|ModuleNotFoundError|ImportError|NameError|Cannot find module|ENOENT/i.test(stderrStr);
+          if (!preLaunchCodeCrash) {
+            launchedApps.add(normTarget);
+          }
+        }
+
         if (result?.success) {
           failedCommandsSinceLastWrite.delete(sig);
+          if (!appRun && normTarget) {
+            executedTestsSinceLastWrite.add(normTarget);
+          }
           madeProgress = true;
         } else if (!result?.cancelled) {
           if (result?.output?.interactiveRequired || result?.output?.timedOut) {
@@ -424,6 +555,9 @@ export function createTurnProgressGuard(options: { maxStuckTurns?: number } = {}
     },
 
     shouldStopTurn(params: { skippedAll: boolean; turnMadeProgress: boolean; executedReadOnly: boolean }): boolean {
+      if (params.skippedAll && !params.turnMadeProgress && !params.executedReadOnly && launchedApps.size > 0) {
+        return true;
+      }
       if (params.turnMadeProgress) {
         stuckTurns = 0;
         return false;

@@ -214,9 +214,24 @@ export async function runCommandTool(
           }, 500)
         : undefined;
 
+    const destroyChildStreams = () => {
+      try {
+        child.stdin?.destroy();
+      } catch {}
+      try {
+        child.stdout?.destroy();
+      } catch {}
+      try {
+        child.stderr?.destroy();
+      } catch {}
+    };
+
     const onAbort = () => {
       cancelled = true;
       killChildTree();
+      destroyChildStreams();
+      // Force settlement quickly even if detached child/grandchild processes hold stdio pipes open
+      setTimeout(() => finalize(null), 60);
     };
     ctx.abortSignal?.addEventListener('abort', onAbort, { once: true });
 
@@ -340,6 +355,11 @@ export async function runCommandTool(
     };
 
     child.on('error', (err) => finalize(1, err.message));
+    child.on('exit', (code) => {
+      if (cancelled) {
+        finalize(code);
+      }
+    });
     child.on('close', (code) => finalize(code));
   });
 }

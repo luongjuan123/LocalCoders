@@ -336,7 +336,7 @@ export function getQueuePanelStyles(options: { compact?: boolean } = {}): string
 
 export function getQueuePanelMarkup(): string {
   return `
-      <div class="lc-queue-dock" id="lcQueueDock">
+      <div class="lc-queue-dock" id="lcQueueDock" style="display:none;">
         <div class="lc-queue-header" id="lcQueueHeader">
           <button type="button" class="lc-queue-toggle" id="lcQueueToggleBtn" title="Expand or collapse queued messages">
             <span id="lcQueueChevron">${lucideSvg('chevron-right', 13)}</span>
@@ -425,6 +425,15 @@ export function getQueuePanelClientScript(): string {
       }
     }
 
+    function lcCanResumeSnapshot(snap) {
+      if (!snap) return false;
+      var items = Array.isArray(snap.items) ? snap.items : [];
+      var failedCount = typeof snap.failedCount === 'number'
+        ? snap.failedCount
+        : items.filter(function(i) { return i.status === 'failed'; }).length;
+      return Boolean(snap.paused || (failedCount > 0 && !snap.isBusy));
+    }
+
     function lcRenderQueuePanel() {
       if (!lcQueueDock) return;
       var snap = lcQueueSnapshot || { state: 'idle', paused: false, queuedCount: 0, failedCount: 0, items: [] };
@@ -435,7 +444,20 @@ export function getQueuePanelClientScript(): string {
       var failedCount = typeof snap.failedCount === 'number'
         ? snap.failedCount
         : items.filter(function(i) { return i.status === 'failed'; }).length;
+      var canResume = lcCanResumeSnapshot(snap);
       var totalVisible = items.length;
+      var showQueueDock = pendingCount > 0 || failedCount > 0 || !!snap.paused || !!snap.lastError;
+      if (lcQueueDock.style) {
+        lcQueueDock.style.display = showQueueDock ? 'flex' : 'none';
+      }
+      if (!showQueueDock) {
+        lcQueueExpanded = false;
+        lcQueueUserToggled = false;
+        if (lcQueueBody && lcQueueBody.classList) {
+          lcQueueBody.classList.remove('open');
+        }
+        return;
+      }
 
       if (!lcQueueUserToggled) {
         lcQueueExpanded = totalVisible > 0;
@@ -453,8 +475,8 @@ export function getQueuePanelClientScript(): string {
       if (lcQueueSubtitle) {
         if (snap.state === 'processing_next') {
           lcQueueSubtitle.textContent = 'Starting next queued message...';
-        } else if (snap.paused && failedCount > 0) {
-          lcQueueSubtitle.textContent = 'Paused on error — retry, edit, or skip';
+        } else if ((snap.paused || snap.state === 'failed') && failedCount > 0) {
+          lcQueueSubtitle.textContent = 'Paused on error — click Resume to retry, or edit/skip';
         } else if (snap.paused) {
           lcQueueSubtitle.textContent = 'Paused — click Resume to continue';
         } else if (pendingCount > 0 && snap.isBusy) {
@@ -481,11 +503,13 @@ export function getQueuePanelClientScript(): string {
       }
 
       if (btnQueuePauseResume) {
-        var showPause = totalVisible > 0 || snap.isBusy || snap.paused;
+        var showPause = totalVisible > 0 || snap.isBusy || canResume;
         btnQueuePauseResume.style.display = showPause ? 'inline-flex' : 'none';
-        if (snap.paused) {
+        if (canResume) {
           btnQueuePauseResume.innerHTML = lcIcon('play', 11) + '<span>Resume</span>';
-          btnQueuePauseResume.title = 'Resume queue execution';
+          btnQueuePauseResume.title = failedCount > 0
+            ? 'Retry failed message and resume queue execution'
+            : 'Resume queue execution';
         } else {
           btnQueuePauseResume.innerHTML = lcIcon('pause', 11) + '<span>Pause</span>';
           btnQueuePauseResume.title = 'Pause queue advancement';
@@ -503,7 +527,7 @@ export function getQueuePanelClientScript(): string {
           lcQueueBanner.className = 'lc-queue-banner' + (failedCount > 0 || snap.state === 'failed' ? ' error' : '');
           lcQueueBanner.innerHTML =
             '<span class="lc-icon-gap">' + lcIcon('triangle-alert', 12) + '<span>' + lcQueueEscape(snap.lastError) + '</span></span>' +
-            (snap.paused ? '<button type="button" class="lc-queue-hdr-btn" id="btnBannerResume">' + lcIcon('play', 10) + '<span>Resume</span></button>' : '');
+            (canResume ? '<button type="button" class="lc-queue-hdr-btn" id="btnBannerResume">' + lcIcon('play', 10) + '<span>Resume</span></button>' : '');
           var bannerBtn = document.getElementById('btnBannerResume');
           if (bannerBtn) {
             bannerBtn.addEventListener('click', function() {
@@ -550,8 +574,7 @@ export function getQueuePanelClientScript(): string {
 
         if (item.status === 'processing') {
           html += '<span class="lc-queue-badge status-processing">Processing</span>' +
-            '<button type="button" class="lc-queue-act-btn" disabled title="Currently executing — cannot edit while processing">' + lcIcon('pencil', 11) + '</button>' +
-            '<button type="button" class="lc-queue-act-btn delete" disabled title="Currently executing — click Stop to cancel">' + lcIcon('trash-2', 11) + '</button>';
+            '<button type="button" class="lc-queue-act-btn delete" data-q-act="stopActive" title="Stop current task">' + lcIcon('square', 10) + '</button>';
         } else if (item.status === 'failed') {
           html +=
             '<button type="button" class="lc-queue-act-btn" data-q-act="retry" title="Retry this message">' + lcIcon('rotate-ccw', 11) + '</button>' +
@@ -654,7 +677,7 @@ export function getQueuePanelClientScript(): string {
         e.stopPropagation();
         vscode.postMessage({
           command: 'queueAction',
-          action: lcQueueSnapshot && lcQueueSnapshot.paused ? 'resume' : 'pause'
+          action: lcCanResumeSnapshot(lcQueueSnapshot) ? 'resume' : 'pause'
         });
       });
     }

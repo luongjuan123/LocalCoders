@@ -263,6 +263,12 @@ export class AgentOrchestrator {
       this.abortController.abort();
       this.abortController = null;
     }
+    for (const [reqId, resolver] of this.pendingApprovals.entries()) {
+      try {
+        resolver(false);
+      } catch {}
+      this.pendingApprovals.delete(reqId);
+    }
     const runId = this.activeRunId || `run_${Date.now()}`;
     if (this.currentTask) {
       this.currentTask.status = 'cancelled';

@@ -297,10 +297,25 @@ export function getActivityStreamStyles(): string {
       font-family: var(--vscode-editor-font-family, "JetBrains Mono", monospace);
       font-size: 11px;
       line-height: 1.45;
-      max-height: 220px;
+      max-height: 260px;
       overflow: auto;
+      overscroll-behavior: contain;
+      overflow-anchor: none;
+      scrollbar-gutter: stable;
+      scrollbar-width: thin;
       white-space: pre-wrap;
       word-break: break-word;
+    }
+    .lc-terminal-pre::-webkit-scrollbar {
+      width: 6px;
+      height: 6px;
+    }
+    .lc-terminal-pre::-webkit-scrollbar-thumb {
+      background: rgba(148, 163, 184, 0.28);
+      border-radius: 999px;
+    }
+    .lc-terminal-pre::-webkit-scrollbar-thumb:hover {
+      background: rgba(148, 163, 184, 0.48);
     }
     .lc-terminal-pre.is-stderr {
       border-color: rgba(239, 68, 68, 0.35);
@@ -630,6 +645,7 @@ export function getActivityStreamStyles(): string {
       display: flex;
       flex-direction: column;
       gap: 4px;
+      min-height: 0;
     }
     .lc-thought-entry.running {
       border-left-color: #38bdf8;
@@ -643,6 +659,30 @@ export function getActivityStreamStyles(): string {
       font-weight: 600;
       color: var(--vscode-descriptionForeground, #94a3b8);
     }
+    .lc-thought-meta-right {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      flex-shrink: 0;
+    }
+    .lc-thought-expand-btn {
+      background: transparent;
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      border-radius: 4px;
+      color: var(--vscode-descriptionForeground, #94a3b8);
+      font-size: 10px;
+      font-weight: 500;
+      font-family: inherit;
+      padding: 1px 6px;
+      cursor: pointer;
+      line-height: 1.35;
+      transition: background 0.14s ease, color 0.14s ease, border-color 0.14s ease;
+    }
+    .lc-thought-expand-btn:hover {
+      background: rgba(148, 163, 184, 0.12);
+      border-color: rgba(148, 163, 184, 0.4);
+      color: var(--vscode-editor-foreground, #f8fafc);
+    }
     .lc-thought-agent {
       display: inline-flex;
       align-items: center;
@@ -655,12 +695,31 @@ export function getActivityStreamStyles(): string {
     }
     .lc-thought-body {
       font-size: 12px;
-      line-height: 1.5;
+      line-height: 1.55;
       color: var(--vscode-descriptionForeground, #cbd5e1);
       white-space: pre-wrap;
       word-break: break-word;
-      max-height: 220px;
+      max-height: 340px;
       overflow-y: auto;
+      overscroll-behavior: contain;
+      overflow-anchor: none;
+      scrollbar-gutter: stable;
+      scrollbar-width: thin;
+      padding-right: 4px;
+    }
+    .lc-thought-body.is-expanded {
+      max-height: none;
+      overflow-y: visible;
+    }
+    .lc-thought-body::-webkit-scrollbar {
+      width: 6px;
+    }
+    .lc-thought-body::-webkit-scrollbar-thumb {
+      background: rgba(148, 163, 184, 0.28);
+      border-radius: 999px;
+    }
+    .lc-thought-body::-webkit-scrollbar-thumb:hover {
+      background: rgba(148, 163, 184, 0.48);
     }
   `;
 }
@@ -719,20 +778,167 @@ export function getActivityClientScript(): string {
       return next;
     }
 
-    function lcBuildActivityCardElement(item, isExpanded, onToggle) {
-      var card = document.createElement('div');
-      var st = item.status || 'completed';
-      card.className = 'lc-activity-card status-' + st + (isExpanded ? ' expanded' : '');
-      card.setAttribute('data-act-id', item.id);
+    function lcFindChildByAttr(root, attrName, attrVal) {
+      if (!root || !attrVal || typeof root.querySelectorAll !== 'function') return null;
+      var nodes = root.querySelectorAll('[' + attrName + ']');
+      for (var i = 0; i < nodes.length; i++) {
+        if (nodes[i] && nodes[i].getAttribute(attrName) === attrVal) {
+          return nodes[i];
+        }
+      }
+      return null;
+    }
 
-      var iconName = lcCategoryIconName(item.category);
+    function lcApplyTextPreservingScroll(el, nextText) {
+      if (!el) return;
+      var str = (nextText === null || nextText === undefined) ? '' : String(nextText);
+      var prev = el.textContent || '';
+      if (prev === str) return;
+
+      var prevTop = Number(el.scrollTop || 0);
+      var prevH = Number(el.scrollHeight || 0);
+      var prevC = Number(el.clientHeight || 0);
+      var wasAtBottom = prevTop > 0 && (prevH - prevTop - prevC) <= 24;
+
+      if (prev.length > 0 && str.indexOf(prev) === 0 && typeof document !== 'undefined' && typeof document.createTextNode === 'function') {
+        var delta = str.slice(prev.length);
+        if (el.lastChild && el.lastChild.nodeType === 3 && typeof el.lastChild.appendData === 'function') {
+          el.lastChild.appendData(delta);
+        } else {
+          el.appendChild(document.createTextNode(delta));
+        }
+      } else {
+        el.textContent = str;
+      }
+
+      if (wasAtBottom) {
+        var nextTop = Math.max(0, Number(el.scrollHeight || 0) - Number(el.clientHeight || 0));
+        if (Math.abs(Number(el.scrollTop || 0) - nextTop) > 1) {
+          el.scrollTop = nextTop;
+        }
+      } else if (prevTop > 0 && Math.abs(Number(el.scrollTop || 0) - prevTop) > 1) {
+        el.scrollTop = prevTop;
+      }
+    }
+
+    function lcActivityDisplayParts(item) {
+      var st = item.status || 'completed';
       var durText = item.durationMs ? lcFormatDuration(item.durationMs) : (st === 'running' ? 'live' : '');
       var exitHtml = '';
       if (item.category === 'command' && (item.exitCode !== undefined && item.exitCode !== null || st !== 'running')) {
         var ecLabel = (item.exitCode !== undefined && item.exitCode !== null) ? String(item.exitCode) : (st === 'cancelled' ? 'cancelled' : 'n/a');
         exitHtml = '<span>Exit code: <strong>' + lcEscapeHtml(ecLabel) + '</strong></span>';
       }
+      var sublineInner = exitHtml + (item.toolName ? '<span>Tool: ' + lcEscapeHtml(item.toolName) + '</span>' : '');
+      var startTimeStr = item.startTime ? new Date(item.startTime).toLocaleTimeString() : '';
+      var kvInner =
+        (item.command ? '<span>Command: <code>' + lcEscapeHtml(item.command) + '</code></span>' : '') +
+        (item.filePath ? '<span>Path: <code>' + lcEscapeHtml(item.filePath) + '</code></span>' : '') +
+        (item.cwd ? '<span>CWD: <code>' + lcEscapeHtml(item.cwd) + '</code></span>' : '') +
+        (startTimeStr ? '<span>Started: <code>' + lcEscapeHtml(startTimeStr) + '</code></span>' : '');
+      return {
+        st: st,
+        durText: durText,
+        summaryText: item.command ? ('$ ' + item.command) : (item.summary || ''),
+        sublineInner: sublineInner,
+        kvInner: kvInner,
+      };
+    }
 
+    function lcSyncActivityPre(detailsEl, clsName, text) {
+      if (!detailsEl) return null;
+      var pre = detailsEl.querySelector('.' + clsName);
+      if (text) {
+        if (!pre && typeof document !== 'undefined' && typeof document.createElement === 'function') {
+          pre = document.createElement('pre');
+          pre.className = 'lc-terminal-pre ' + clsName;
+          var emptyNote = detailsEl.querySelector('.lc-act-empty-out');
+          if (emptyNote) emptyNote.remove();
+          detailsEl.appendChild(pre);
+        }
+        lcApplyTextPreservingScroll(pre, text);
+        return pre;
+      }
+      if (pre) pre.remove();
+      return null;
+    }
+
+    function lcUpdateActivityCardElement(card, item) {
+      if (!card || !item) return;
+      var parts = lcActivityDisplayParts(item);
+      var wasExpanded = card.classList ? card.classList.contains('expanded') : String(card.className || '').indexOf('expanded') !== -1;
+      card.className = 'lc-activity-card status-' + parts.st + (wasExpanded ? ' expanded' : '');
+
+      var summaryEl = card.querySelector('.lc-activity-summary-line');
+      if (summaryEl && (summaryEl.textContent || '') !== parts.summaryText) {
+        summaryEl.textContent = parts.summaryText;
+      }
+      var sublineEl = card.querySelector('.lc-activity-subline');
+      if (parts.sublineInner) {
+        if (!sublineEl && typeof document !== 'undefined') {
+          var headings = card.querySelector('.lc-activity-headings');
+          if (headings) {
+            sublineEl = document.createElement('div');
+            sublineEl.className = 'lc-activity-subline';
+            headings.appendChild(sublineEl);
+          }
+        }
+        if (sublineEl && sublineEl.innerHTML !== parts.sublineInner) {
+          sublineEl.innerHTML = parts.sublineInner;
+        }
+      } else if (sublineEl) {
+        sublineEl.remove();
+      }
+
+      var pillEl = card.querySelector('.lc-act-status-pill');
+      if (pillEl) {
+        pillEl.className = 'lc-act-status-pill ' + lcEscapeHtml(parts.st);
+        var nextLbl = lcStatusLabel(parts.st);
+        if ((pillEl.textContent || '') !== nextLbl) pillEl.textContent = nextLbl;
+      }
+      var rightEl = card.querySelector('.lc-activity-right');
+      var durEl = card.querySelector('.lc-act-dur');
+      if (parts.durText) {
+        if (!durEl && rightEl && typeof document !== 'undefined') {
+          durEl = document.createElement('span');
+          durEl.className = 'lc-act-dur';
+          var chev = rightEl.querySelector('.lc-act-chevron');
+          rightEl.insertBefore(durEl, chev || null);
+        }
+        if (durEl && (durEl.textContent || '') !== parts.durText) durEl.textContent = parts.durText;
+      } else if (durEl) {
+        durEl.remove();
+      }
+
+      var detailsEl = card.querySelector('.lc-activity-details');
+      if (detailsEl) {
+        var kvEl = detailsEl.querySelector('.lc-act-detail-kv');
+        if (kvEl && kvEl.innerHTML !== parts.kvInner) kvEl.innerHTML = parts.kvInner;
+        lcSyncActivityPre(detailsEl, 'is-stdout', item.stdout || '');
+        lcSyncActivityPre(detailsEl, 'is-stderr', item.stderr || '');
+        var emptyEl = detailsEl.querySelector('.lc-act-empty-out');
+        if (!item.stdout && !item.stderr) {
+          var emptyMsg = parts.st === 'running' ? 'Waiting for output...' : 'No console output captured.';
+          if (!emptyEl && typeof document !== 'undefined') {
+            emptyEl = document.createElement('div');
+            emptyEl.className = 'lc-act-empty-out';
+            emptyEl.style.cssText = 'font-size:11px;color:var(--vscode-descriptionForeground,#64748b);';
+            detailsEl.appendChild(emptyEl);
+          }
+          if (emptyEl && (emptyEl.textContent || '') !== emptyMsg) emptyEl.textContent = emptyMsg;
+        } else if (emptyEl) {
+          emptyEl.remove();
+        }
+      }
+    }
+
+    function lcBuildActivityCardElement(item, isExpanded, onToggle) {
+      var card = document.createElement('div');
+      var parts = lcActivityDisplayParts(item);
+      card.className = 'lc-activity-card status-' + parts.st + (isExpanded ? ' expanded' : '');
+      card.setAttribute('data-act-id', item.id);
+
+      var iconName = lcCategoryIconName(item.category);
       var headerHtml =
         '<div class="lc-activity-header">' +
           '<div class="lc-activity-left">' +
@@ -743,28 +949,22 @@ export function getActivityClientScript(): string {
                 '<span class="lc-activity-sep">&mdash;</span>' +
                 '<span>' + lcEscapeHtml(item.title || item.toolName || 'Tool Execution') + '</span>' +
               '</div>' +
-              '<div class="lc-activity-summary-line">' + lcEscapeHtml(item.command ? ('$ ' + item.command) : (item.summary || '')) + '</div>' +
-              (exitHtml || item.toolName ? '<div class="lc-activity-subline">' + exitHtml + (item.toolName ? '<span>Tool: ' + lcEscapeHtml(item.toolName) + '</span>' : '') + '</div>' : '') +
+              '<div class="lc-activity-summary-line">' + lcEscapeHtml(parts.summaryText) + '</div>' +
+              (parts.sublineInner ? '<div class="lc-activity-subline">' + parts.sublineInner + '</div>' : '') +
             '</div>' +
           '</div>' +
           '<div class="lc-activity-right">' +
-            '<span class="lc-act-status-pill ' + lcEscapeHtml(st) + '">' + lcEscapeHtml(lcStatusLabel(st)) + '</span>' +
-            (durText ? '<span class="lc-act-dur">' + lcEscapeHtml(durText) + '</span>' : '') +
+            '<span class="lc-act-status-pill ' + lcEscapeHtml(parts.st) + '">' + lcEscapeHtml(lcStatusLabel(parts.st)) + '</span>' +
+            (parts.durText ? '<span class="lc-act-dur">' + lcEscapeHtml(parts.durText) + '</span>' : '') +
             '<span class="lc-act-chevron">' + lcIcon('chevron-right', 13) + '</span>' +
           '</div>' +
         '</div>';
 
-      var startTimeStr = item.startTime ? new Date(item.startTime).toLocaleTimeString() : '';
       var detailsHtml = '<div class="lc-activity-details">' +
-        '<div class="lc-act-detail-kv">' +
-          (item.command ? '<span>Command: <code>' + lcEscapeHtml(item.command) + '</code></span>' : '') +
-          (item.filePath ? '<span>Path: <code>' + lcEscapeHtml(item.filePath) + '</code></span>' : '') +
-          (item.cwd ? '<span>CWD: <code>' + lcEscapeHtml(item.cwd) + '</code></span>' : '') +
-          (startTimeStr ? '<span>Started: <code>' + lcEscapeHtml(startTimeStr) + '</code></span>' : '') +
-        '</div>' +
-        (item.stdout ? '<pre class="lc-terminal-pre">' + lcEscapeHtml(item.stdout) + '</pre>' : '') +
+        '<div class="lc-act-detail-kv">' + parts.kvInner + '</div>' +
+        (item.stdout ? '<pre class="lc-terminal-pre is-stdout">' + lcEscapeHtml(item.stdout) + '</pre>' : '') +
         (item.stderr ? '<pre class="lc-terminal-pre is-stderr">' + lcEscapeHtml(item.stderr) + '</pre>' : '') +
-        ((!item.stdout && !item.stderr) ? '<div style="font-size:11px;color:var(--vscode-descriptionForeground,#64748b);">' + (st === 'running' ? 'Waiting for output...' : 'No console output captured.') + '</div>' : '') +
+        ((!item.stdout && !item.stderr) ? '<div class="lc-act-empty-out" style="font-size:11px;color:var(--vscode-descriptionForeground,#64748b);">' + (parts.st === 'running' ? 'Waiting for output...' : 'No console output captured.') + '</div>' : '') +
       '</div>';
 
       card.innerHTML = headerHtml + detailsHtml;
@@ -857,14 +1057,57 @@ export function getActivityClientScript(): string {
       return 'Thinking · ' + parts.join(', ');
     }
 
-    function lcBuildThoughtEntryElement(act) {
+    function lcThoughtDurText(act) {
+      if (act && act.durationMs) return lcFormatDuration(act.durationMs);
+      if (act && act.status === 'running') return 'thinking...';
+      return '';
+    }
+
+    function lcCanExpandThoughtText(bodyText) {
+      if (!bodyText) return false;
+      var s = String(bodyText);
+      return s.length > 260 || s.split('\\n').length > 8;
+    }
+
+    function lcUpdateThoughtEntryElement(box, act, opts) {
+      if (!box || !act) return;
+      var isRunning = act.status === 'running';
+      if (box.classList && typeof box.classList.toggle === 'function') {
+        box.classList.toggle('running', isRunning);
+      } else {
+        box.className = 'lc-thought-entry' + (isRunning ? ' running' : '');
+      }
+      var durEl = box.querySelector('.lc-thought-dur');
+      var nextDur = lcThoughtDurText(act);
+      if (durEl && (durEl.textContent || '') !== nextDur) {
+        durEl.textContent = nextDur;
+      }
+      var bodyText = act.stdout || act.summary || '';
+      var bodyEl = box.querySelector('.lc-thought-body');
+      if (bodyEl) {
+        lcApplyTextPreservingScroll(bodyEl, bodyText);
+        if (opts && typeof opts.isExpanded === 'boolean' && bodyEl.classList) {
+          bodyEl.classList.toggle('is-expanded', opts.isExpanded);
+        }
+      }
+      var expandBtn = box.querySelector('.lc-thought-expand-btn');
+      if (expandBtn && bodyEl && bodyEl.classList) {
+        var isExp = bodyEl.classList.contains('is-expanded');
+        expandBtn.style.display = (isExp || lcCanExpandThoughtText(bodyText)) ? 'inline-block' : 'none';
+        expandBtn.textContent = isExp ? 'Compact' : 'Expand';
+      }
+    }
+
+    function lcBuildThoughtEntryElement(act, opts) {
       var box = document.createElement('div');
       var isRunning = act.status === 'running';
+      var isExpanded = Boolean(opts && opts.isExpanded);
       box.className = 'lc-thought-entry' + (isRunning ? ' running' : '');
       box.setAttribute('data-act-id', act.id || '');
       var bodyText = act.stdout || act.summary || '';
       var roleHtml = act.agentRole ? '<span class="lc-thought-role">(' + lcEscapeHtml(act.agentRole) + ')</span>' : '';
-      var durHtml = act.durationMs ? ('<span>' + lcEscapeHtml(lcFormatDuration(act.durationMs)) + '</span>') : (isRunning ? '<span>thinking...</span>' : '');
+      var durText = lcThoughtDurText(act);
+      var showExpand = isExpanded || lcCanExpandThoughtText(bodyText);
       box.innerHTML =
         '<div class="lc-thought-meta">' +
           '<span class="lc-thought-agent">' +
@@ -872,10 +1115,61 @@ export function getActivityClientScript(): string {
             '<span>' + lcEscapeHtml(act.agentName || 'Main Agent') + '</span>' +
             roleHtml +
           '</span>' +
-          durHtml +
+          '<span class="lc-thought-meta-right">' +
+            '<button type="button" class="lc-thought-expand-btn" style="display:' + (showExpand ? 'inline-block' : 'none') + '">' + (isExpanded ? 'Compact' : 'Expand') + '</button>' +
+            '<span class="lc-thought-dur">' + lcEscapeHtml(durText) + '</span>' +
+          '</span>' +
         '</div>' +
-        '<div class="lc-thought-body">' + lcEscapeHtml(bodyText) + '</div>';
+        '<div class="lc-thought-body' + (isExpanded ? ' is-expanded' : '') + '">' + lcEscapeHtml(bodyText) + '</div>';
+
+      var expandBtn = box.querySelector('.lc-thought-expand-btn');
+      var bodyEl = box.querySelector('.lc-thought-body');
+      if (expandBtn && bodyEl) {
+        expandBtn.addEventListener('click', function (e) {
+          if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
+          var open = bodyEl.classList.toggle('is-expanded');
+          expandBtn.textContent = open ? 'Compact' : 'Expand';
+          if (opts && typeof opts.onToggleExpand === 'function') {
+            opts.onToggleExpand(act.id, open);
+          }
+        });
+      }
       return box;
+    }
+
+    function lcBuildPlanMiniHtml(planItems) {
+      if (!Array.isArray(planItems) || planItems.length === 0) return '';
+      return planItems.map(function (p) {
+        var done = p.status === 'completed';
+        return '<div class="lc-plan-mini-item' + (done ? ' completed' : '') + '">' +
+          '<span>' + lcEscapeHtml(p.title || p.description) + '</span>' +
+          '<span class="lc-act-status-pill ' + lcEscapeHtml(p.status === 'in_progress' ? 'running' : p.status) + '">' + lcEscapeHtml(p.status) + '</span>' +
+          '</div>';
+      }).join('');
+    }
+
+    function lcUpdateInlineThinkingGroupHeader(wrap, opts) {
+      if (!wrap) return;
+      var activities = Array.isArray(opts.activities) ? opts.activities : [];
+      var isLive = !!opts.isLive;
+      var hasFailed = activities.some(function (a) { return a && a.status === 'failed'; });
+      var trigger = wrap.querySelector('.lc-thinking-trigger');
+      if (!trigger) return;
+
+      var dotEl = trigger.querySelector('.lc-status-pulse, .lc-status-dot-static');
+      if (dotEl) {
+        var nextDotClass = isLive ? 'lc-status-pulse' : ('lc-status-dot-static ' + (hasFailed ? 'failed' : 'completed'));
+        if (dotEl.className !== nextDotClass) dotEl.className = nextDotClass;
+      }
+      var labelEl = trigger.querySelector('.lc-thinking-label');
+      var nextLabel = lcFormatTurnThinkingLabel({
+        activities: activities,
+        isLive: isLive,
+        statusSummary: opts.statusSummary,
+      });
+      if (labelEl && (labelEl.textContent || '') !== nextLabel) {
+        labelEl.textContent = nextLabel;
+      }
     }
 
     function lcBuildInlineThinkingGroup(opts) {
@@ -913,19 +1207,18 @@ export function getActivityClientScript(): string {
         planListEl.className = 'lc-plan-checklist-mini';
         planListEl.style.borderBottom = 'none';
         planListEl.style.padding = '2px 0 4px 0';
-        planListEl.innerHTML = planItems.map(function (p) {
-          var done = p.status === 'completed';
-          return '<div class="lc-plan-mini-item' + (done ? ' completed' : '') + '">' +
-            '<span>' + lcEscapeHtml(p.title || p.description) + '</span>' +
-            '<span class="lc-act-status-pill ' + lcEscapeHtml(p.status === 'in_progress' ? 'running' : p.status) + '">' + lcEscapeHtml(p.status) + '</span>' +
-            '</div>';
-        }).join('');
+        planListEl.innerHTML = lcBuildPlanMiniHtml(planItems);
         drawer.appendChild(planListEl);
       }
 
+      var expandedThoughtMap = opts.expandedThoughtIds;
       activities.forEach(function (act) {
         if (act && act.category === 'thinking_summary') {
-          drawer.appendChild(lcBuildThoughtEntryElement(act));
+          var isThoughtExpanded = expandedThoughtMap && typeof expandedThoughtMap.has === 'function' ? expandedThoughtMap.has(act.id) : false;
+          drawer.appendChild(lcBuildThoughtEntryElement(act, {
+            isExpanded: isThoughtExpanded,
+            onToggleExpand: opts.onToggleExpandThought,
+          }));
           return;
         }
         var expandedMap = opts.expandedActivityIds;
@@ -939,6 +1232,7 @@ export function getActivityClientScript(): string {
 
       if (activities.length === 0 && planItems.length === 0) {
         var note = document.createElement('div');
+        note.className = 'lc-thinking-empty-note';
         note.style.cssText = 'font-size:11.5px;color:var(--vscode-descriptionForeground,#94a3b8);padding:2px 4px;';
         note.textContent = opts.statusSummary || 'Working...';
         drawer.appendChild(note);

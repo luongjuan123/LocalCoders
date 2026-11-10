@@ -33,6 +33,7 @@ export interface RuntimeModelOptions {
   runId?: string;
   streamMessageId?: string;
   executeOnly?: boolean;
+  launchedApps?: Set<string>;
   conversationHistory?: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
   onStreamEvent?: (event: AgentStreamEvent) => void;
   onCriticReport?: (report: CriticReport) => void;
@@ -680,6 +681,11 @@ ${rulesText}
     queue.setPlan(plan);
     const subagentMap = new Map<string, Subagent>(subagents.map((s) => [s.config.id, s]));
     const modifiedFilesSet = new Set<string>();
+    const launchedApps = runtimeOptions?.launchedApps || new Set<string>();
+    const runRuntimeOptions: RuntimeModelOptions = {
+      ...runtimeOptions,
+      launchedApps,
+    };
 
     const toolCtx: ToolExecutionContext = {
       workspaceRoot: this.workspaceRoot,
@@ -764,7 +770,7 @@ ${rulesText}
               onActivity,
               requestApproval,
               abortSignal,
-              runtimeOptions
+              runRuntimeOptions
             );
 
             const subEnd = Date.now();
@@ -809,7 +815,7 @@ ${rulesText}
               'working',
               runtimeOptions?.executeOnly ? 'Running application' : `Working on ${task.title}`
             );
-            const res = await this.executeMainTask(task, userPrompt, onActivity, requestApproval, abortSignal, runtimeOptions);
+            const res = await this.executeMainTask(task, userPrompt, onActivity, requestApproval, abortSignal, runRuntimeOptions);
             if (res.output) lastMainTaskOutput = res.output;
             for (const f of res.modifiedFiles || []) modifiedFilesSet.add(f);
             if (res.verificationSummary) {
@@ -991,7 +997,7 @@ ${rulesText}
           onActivity,
           requestApproval,
           abortSignal,
-          runtimeOptions
+          runRuntimeOptions
         );
 
         const prevVerifFailed: boolean = verificationFailed;
@@ -1040,7 +1046,7 @@ ${rulesText}
         onActivity,
         requestApproval,
         abortSignal,
-        runtimeOptions
+        runRuntimeOptions
       );
       verificationFailed = fixRes.verificationFailed;
       verificationSummary = fixRes.verificationSummary || verificationSummary;
@@ -1192,8 +1198,10 @@ ${targetFilePrompt}`;
     const maxTurns = isExecuteOnly ? 6 : 12;
     let finalOutput = '';
     const filesWritten: string[] = [];
-    const progressGuard = createTurnProgressGuard({ maxStuckTurns: 2 });
+    const launchedApps = runtimeOptions?.launchedApps || new Set<string>();
+    const progressGuard = createTurnProgressGuard({ maxStuckTurns: 2, launchedApps });
     let toolsExecutedCount = 0;
+    let lastExecutedAppCmd = '';
 
     const isImplementationTask =
       !isExecuteOnly &&
@@ -1400,7 +1408,17 @@ ${targetFilePrompt}`;
 
           const outcome = progressGuard.recordOutcome(call.name, call.args, res);
           if (outcome.modifiedFile) filesWritten.push(outcome.modifiedFile);
-          if (outcome.madeProgress) turnMadeProgress = true;
+          if (outcome.madeProgress) {
+            turnMadeProgress = true;
+            if (
+              call.name === 'start_process' ||
+              call.name === 'app.launch' ||
+              call.name === 'run_command'
+            ) {
+              const rawCmd = String(call.args?.command || call.args?.cmd || '').trim();
+              if (rawCmd) lastExecutedAppCmd = rawCmd;
+            }
+          }
           if (outcome.commandHint) lastCommandHint = outcome.commandHint;
 
           const resStr = JSON.stringify(res);
@@ -1418,6 +1436,8 @@ ${targetFilePrompt}`;
               content: `[Tool Result for ${call.name}]: ${boundedStr}\n${
                 lastCommandHint
                   ? lastCommandHint
+                  : isExecuteOnly && launchedApps.size > 0
+                  ? `Application '${lastExecutedAppCmd || 'command'}' already ran/started. Do NOT reopen or rerun it if the user closes it — concisely summarize completion now.`
                   : isExecuteOnly
                   ? 'Execution step recorded. If the application/command has now run or started, reply concisely with the observed command and output. Do NOT rewrite existing files.'
                   : filesWritten.length > 0
@@ -1429,7 +1449,10 @@ ${targetFilePrompt}`;
         }
 
         if (progressGuard.shouldStopTurn({ skippedAll: skippedAllAsDuplicate, turnMadeProgress, executedReadOnly })) {
-          finalOutput = `Stopped task after repeated unchanged/blocked operations (${Array.from(new Set(filesWritten)).join(', ') || 'no file changes'}).`;
+          finalOutput =
+            launchedApps.size > 0 && lastExecutedAppCmd
+              ? `Executed \`${lastExecutedAppCmd}\` successfully.`
+              : `Stopped task after repeated unchanged/blocked operations (${Array.from(new Set(filesWritten)).join(', ') || 'no file changes'}).`;
           break;
         }
 
@@ -1439,6 +1462,8 @@ ${targetFilePrompt}`;
             role: 'user',
             content: lastCommandHint
               ? `Command guidance: ${lastCommandHint}`
+              : isExecuteOnly && launchedApps.size > 0
+              ? `Application '${lastExecutedAppCmd || 'target'}' has already been started/executed. Do NOT call run_command or start_process again — summarize what was run and finish now.`
               : isExecuteOnly
               ? `Tool executions completed. If you already ran or started the target application/command, report the exact command and output concisely. Otherwise run it with 'run_command' or 'start_process' now.`
               : filesWritten.length > 0
@@ -1584,7 +1609,16 @@ ${targetFilePrompt}`;
       requestApproval,
     };
 
-    const tools = this.toolManager.getOllamaTools();
+    const remediationBlockedTools = new Set([
+      'start_process',
+      'write_stdin',
+      'app.launch',
+      'app.open_url',
+      'app.open_file',
+    ]);
+    const tools = this.toolManager
+      .getOllamaTools()
+      .filter((t: any) => !remediationBlockedTools.has(t?.function?.name || ''));
     const findingsList = (report.findings || [])
       .map(
         (f, i) =>
@@ -1631,19 +1665,23 @@ ${fileSnapshots.length > 0 ? `\nACTUAL FILE CONTENTS ON DISK:\n${fileSnapshots.j
 INSTRUCTIONS:
 1. Fix EVERY defect reported above using exact substrings in 'edit_file' or complete corrected contents in 'write_file'.
 2. Ensure valid, complete source code — never write JSON tool payloads into source files, and never repeat an identical failing 'edit_file'.
-3. Run verification tests with 'run_command' only AFTER saving edits to confirm errors are resolved.`;
+3. Run automated verification tests (unittest, pytest, py_compile, npm test) with 'run_command' ONLY AFTER saving edits. Do NOT launch interactive GUI applications.`;
 
     const messages: any[] = [
       {
         role: 'system',
-        content: `You are the Lead Main Agent working in ${this.workspaceRoot}. Fix all defects reported by the Critic Agent using file tools and run tests to verify.`,
+        content: `You are the Lead Main Agent working in ${this.workspaceRoot}. Fix all defects reported by the Critic Agent using file tools and run automated tests only (never launch interactive GUI applications).`,
       },
       { role: 'user', content: prompt },
     ];
 
     const modifiedFiles: string[] = [];
     const fixRunId = runtimeOptions?.runId || `run_${Date.now()}`;
-    const progressGuard = createTurnProgressGuard({ maxStuckTurns: 2 });
+    const progressGuard = createTurnProgressGuard({
+      maxStuckTurns: 2,
+      blockInteractiveApps: true,
+      launchedApps: runtimeOptions?.launchedApps,
+    });
     let turns = 0;
 
     while (turns < 5) {

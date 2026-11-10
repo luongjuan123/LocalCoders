@@ -254,4 +254,31 @@ describe('ToolManager — Filesystem, Git, and Security Boundaries', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('should abort long-running run_command quickly even when subprocess spawns background sleepers', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-abort-cmd-'));
+    try {
+      const tm = new ToolManager();
+      const ac = new AbortController();
+      const t0 = Date.now();
+      setTimeout(() => ac.abort(), 120);
+      const res = await tm.executeTool(
+        'run_command',
+        { command: 'python3 -c "import subprocess, time; subprocess.Popen([\'python3\', \'-c\', \'import time; time.sleep(10)\']); time.sleep(10)"' },
+        {
+          workspaceRoot: tmpDir,
+          agentId: 'main',
+          agentName: 'Main Agent',
+          requireApproval: false,
+          requestApproval: async () => true,
+          abortSignal: ac.signal,
+        }
+      );
+      const elapsed = Date.now() - t0;
+      assert.strictEqual(res.cancelled, true);
+      assert.ok(elapsed < 2000, `Expected fast abort (<2000ms), took ${elapsed}ms`);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

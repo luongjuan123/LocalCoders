@@ -77,7 +77,7 @@ CRITICAL EXECUTION MANDATE:
 - YOU MUST EXECUTE TOOLS:
   * write_file(path, content): Create or overwrite source files in the workspace.
   * edit_file(path, target, replacement): Modify existing files with targeted changes.
-  * run_command(command, stdin?): Run shell commands, tests, package managers, and builds. Pass optional 'stdin' text when interactive scripts request input(), or use start_process + write_stdin + read_output + terminate_process for interactive/UI/long-running processes.
+  * run_command(command, stdin?): Run shell commands, tests, package managers, and builds. Pass optional 'stdin' text when interactive scripts request input(), or use start_process + write_stdin + read_output + terminate_process only when explicitly asked to launch a UI/server (never re-launch an application repeatedly after it exits or is closed).
   * read_file(path): Inspect file contents.
   * list_directory(path): Inspect directory structures.
 - Whenever you implement a feature, module, or test, YOU MUST CALL write_file TO SAVE THE CODE TO DISK.
@@ -108,7 +108,10 @@ ${targetFilePrompt}`;
     const maxTurns = 8;
     let finalSummary = '';
     const filesWritten: string[] = [];
-    const progressGuard = createTurnProgressGuard({ maxStuckTurns: 2 });
+    const progressGuard = createTurnProgressGuard({
+      maxStuckTurns: 2,
+      launchedApps: runtimeOptions?.launchedApps,
+    });
     let toolsExecutedCount = 0;
     let lastCommandOutput = '';
     let lastCommandFailed = false;

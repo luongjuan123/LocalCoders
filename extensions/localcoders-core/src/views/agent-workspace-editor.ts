@@ -376,11 +376,17 @@ export class AgentWorkspaceEditorPanel {
             break;
           }
 
+          case 'cancelTask':
           case 'stopTask': {
             this._slashAbortController?.abort();
             this._slashAbortController = undefined;
             const activeSess = this.sessionManager.getActiveSession();
             this.queueManager.cancelActiveTask(activeSess?.id);
+            this.orchestrator.cancelTask();
+            if (activeSess) {
+              this.postMessageSafe({ type: 'queueUpdated', snapshot: this.queueManager.getSnapshot(activeSess.id) });
+            }
+            this.postMessageSafe({ type: 'runFinished', status: 'cancelled' });
             await this.syncActiveSession();
             break;
           }
@@ -393,7 +399,11 @@ export class AgentWorkspaceEditorPanel {
             }
             const res = await handleQueueActionCommand(this.queueManager, activeSess.id, data);
             this.postMessageSafe({ type: 'queueUpdated', snapshot: res.snapshot });
-            if (!res.ok && res.error) {
+            if (data?.action === 'stopActive') {
+              this.orchestrator.cancelTask();
+              this.postMessageSafe({ type: 'runFinished', status: 'cancelled' });
+              await this.syncActiveSession();
+            } else if (!res.ok && res.error) {
               this.postMessageSafe({ type: 'queueActionError', error: res.error });
             }
             break;
@@ -1799,6 +1809,8 @@ export class AgentWorkspaceEditorPanel {
       flex: 1;
       min-height: 0;
       overflow-y: auto;
+      scrollbar-gutter: stable;
+      scrollbar-width: thin;
       padding: 24px 20px 20px 20px;
       display: flex;
       flex-direction: column;
@@ -2910,6 +2922,7 @@ export class AgentWorkspaceEditorPanel {
     let activeActivityFilter = 'all';
     const expandedActivityIds = new Set();
     const expandedTurnIds = new Set();
+    const expandedThoughtIds = new Set();
     const streamingMessages = {};
     let liveStatusState = { active: false, phase: 'idle', summary: '' };
     let activeInspectorTab = 'changes';
@@ -3314,6 +3327,9 @@ export class AgentWorkspaceEditorPanel {
 
     btnSend.addEventListener('click', submitPrompt);
     btnStop.addEventListener('click', () => {
+      isWorking = false;
+      liveStatusState = { active: false, phase: 'cancelled', summary: 'Cancelled' };
+      updateStatusUI();
       vscode.postMessage({ command: 'stopTask' });
     });
 
@@ -3343,6 +3359,7 @@ export class AgentWorkspaceEditorPanel {
       slashCtrl.close();
       promptInput.value = '';
       promptInput.style.height = 'auto';
+      chatPinnedToBottom = true;
 
       if (!isWorking) {
         isWorking = true;
@@ -3636,6 +3653,28 @@ export class AgentWorkspaceEditorPanel {
       });
     }
 
+    function matchesActivityFilter(item) {
+      if (!item) return false;
+      if (activeActivityFilter === 'all') return true;
+      if (activeActivityFilter === 'tool') {
+        return item.category === 'tool' || item.category === 'mcp' || item.category === 'browser';
+      }
+      return item.category === activeActivityFilter;
+    }
+
+    function upsertActivityInPane(item) {
+      const countBadge = document.getElementById('activityCountBadge');
+      if (countBadge) countBadge.textContent = String(currentActivities.length);
+      const feed = document.getElementById('activityFeedList');
+      if (!feed || !item || !matchesActivityFilter(item)) return;
+      const existingCard = lcFindChildByAttr(feed, 'data-act-id', item.id);
+      if (existingCard) {
+        lcUpdateActivityCardElement(existingCard, item);
+        return;
+      }
+      renderActivityPane();
+    }
+
     function renderActivityPane() {
       const countBadge = document.getElementById('activityCountBadge');
       if (countBadge) countBadge.textContent = String(currentActivities.length);
@@ -3644,13 +3683,7 @@ export class AgentWorkspaceEditorPanel {
       if (planMini) {
         if (activePlan && activePlan.length > 0) {
           planMini.style.display = 'flex';
-          planMini.innerHTML = activePlan.map((p) => {
-            const done = p.status === 'completed';
-            return '<div class="lc-plan-mini-item' + (done ? ' completed' : '') + '">' +
-              '<span>' + escapeHtml(p.title || p.description) + '</span>' +
-              '<span class="lc-act-status-pill ' + escapeHtml(p.status === 'in_progress' ? 'running' : p.status) + '">' + escapeHtml(p.status) + '</span>' +
-              '</div>';
-          }).join('');
+          planMini.innerHTML = lcBuildPlanMiniHtml(activePlan);
         } else {
           planMini.style.display = 'none';
           planMini.innerHTML = '';
@@ -3660,18 +3693,14 @@ export class AgentWorkspaceEditorPanel {
       const feed = document.getElementById('activityFeedList');
       if (!feed) return;
 
-      const filtered = currentActivities.filter((item) => {
-        if (activeActivityFilter === 'all') return true;
-        if (activeActivityFilter === 'tool') {
-          return item.category === 'tool' || item.category === 'mcp' || item.category === 'browser';
-        }
-        return item.category === activeActivityFilter;
-      });
-
+      const filtered = currentActivities.filter(matchesActivityFilter);
       if (filtered.length === 0) {
         feed.innerHTML = '<div class="lc-empty-pane">' + lcIcon('zap', 20) + '<span>No activity recorded for this filter.</span></div>';
         return;
       }
+
+      const prevTop = Number(feed.scrollTop || 0);
+      const wasPinned = (feed.scrollHeight - prevTop - feed.clientHeight) <= 32;
 
       feed.innerHTML = '';
       filtered.forEach((item) => {
@@ -3685,7 +3714,11 @@ export class AgentWorkspaceEditorPanel {
         );
         feed.appendChild(card);
       });
-      feed.scrollTop = feed.scrollHeight;
+      if (wasPinned) {
+        feed.scrollTop = feed.scrollHeight;
+      } else if (prevTop > 0) {
+        feed.scrollTop = prevTop;
+      }
     }
 
     document.getElementById('btnRefreshTelemetry')?.addEventListener('click', () => {
@@ -3872,27 +3905,7 @@ export class AgentWorkspaceEditorPanel {
       }
     }
 
-    function renderFullConversation() {
-      conversationFlow.innerHTML = '';
-
-      if (planExplicit && activePlan && activePlan.length > 0) {
-        const planCard = document.createElement('div');
-        planCard.className = 'plan-card';
-        let planHtml = '<div class="plan-header"><span>Execution Plan</span><span>' +
-          activePlan.filter(p => p.status === 'completed').length + '/' + activePlan.length + ' Done</span></div><ul class="plan-list">';
-        activePlan.forEach((p) => {
-          const isDone = p.status === 'completed';
-          const badgeClass = p.status === 'completed' ? 'plan-completed' : p.status === 'in_progress' ? 'plan-in_progress' : 'plan-pending';
-          planHtml += '<li class="plan-item' + (isDone ? ' completed' : '') + '">' +
-            '<span>' + escapeHtml(p.description || p.title) + '</span>' +
-            '<span class="plan-badge ' + badgeClass + '">' + p.status + '</span>' +
-            '</li>';
-        });
-        planHtml += '</ul>';
-        planCard.innerHTML = planHtml;
-        conversationFlow.appendChild(planCard);
-      }
-
+    function getDisplayMessages() {
       const displayMessages = [];
       if (currentSession && currentSession.messages) {
         const seenIds = new Set();
@@ -3914,8 +3927,247 @@ export class AgentWorkspaceEditorPanel {
           displayMessages.push(msg);
         });
       }
+      return displayMessages;
+    }
 
+    function thinkingGroupHandlers() {
+      return {
+        expandedActivityIds,
+        expandedThoughtIds,
+        onToggleTurn: (k, open) => {
+          if (open) expandedTurnIds.add(k);
+          else expandedTurnIds.delete(k);
+        },
+        onToggleActivity: (id, open) => {
+          if (open) expandedActivityIds.add(id);
+          else expandedActivityIds.delete(id);
+        },
+        onToggleExpandThought: (id, open) => {
+          if (open) expandedThoughtIds.add(id);
+          else expandedThoughtIds.delete(id);
+        },
+      };
+    }
+
+    function captureInnerScrollState() {
+      const thoughtScrolls = new Map();
+      const preScrolls = new Map();
+      conversationFlow.querySelectorAll('.lc-thought-entry[data-act-id]').forEach((entry) => {
+        const actId = entry.getAttribute('data-act-id');
+        const body = entry.querySelector('.lc-thought-body');
+        if (!actId || !body) return;
+        const top = Number(body.scrollTop || 0);
+        const gap = Number(body.scrollHeight || 0) - top - Number(body.clientHeight || 0);
+        thoughtScrolls.set(actId, { scrollTop: top, wasAtBottom: top > 0 && gap <= 24 });
+      });
+      conversationFlow.querySelectorAll('.lc-activity-card[data-act-id]').forEach((card) => {
+        const actId = card.getAttribute('data-act-id');
+        if (!actId) return;
+        const outPre = card.querySelector('.lc-terminal-pre.is-stdout');
+        const errPre = card.querySelector('.lc-terminal-pre.is-stderr');
+        const snap = (el) => {
+          if (!el) return null;
+          const top = Number(el.scrollTop || 0);
+          const gap = Number(el.scrollHeight || 0) - top - Number(el.clientHeight || 0);
+          return { scrollTop: top, wasAtBottom: top > 0 && gap <= 24 };
+        };
+        const outSnap = snap(outPre);
+        const errSnap = snap(errPre);
+        if (outSnap || errSnap) {
+          preScrolls.set(actId, { out: outSnap, err: errSnap });
+        }
+      });
+      return { thoughtScrolls, preScrolls };
+    }
+
+    function restoreInnerScrollState(saved) {
+      if (!saved) return;
+      const applySnap = (el, snap) => {
+        if (!el || !snap) return;
+        if (snap.wasAtBottom) {
+          el.scrollTop = Math.max(0, Number(el.scrollHeight || 0) - Number(el.clientHeight || 0));
+        } else if (snap.scrollTop > 0) {
+          el.scrollTop = snap.scrollTop;
+        }
+      };
+      saved.thoughtScrolls.forEach((snap, actId) => {
+        const entry = lcFindChildByAttr(conversationFlow, 'data-act-id', actId);
+        const body = entry ? entry.querySelector('.lc-thought-body') : null;
+        applySnap(body, snap);
+      });
+      saved.preScrolls.forEach((pair, actId) => {
+        const card = lcFindChildByAttr(conversationFlow, 'data-act-id', actId);
+        if (!card) return;
+        applySnap(card.querySelector('.lc-terminal-pre.is-stdout'), pair.out);
+        applySnap(card.querySelector('.lc-terminal-pre.is-stderr'), pair.err);
+      });
+    }
+
+    function syncContainerScroll(forceBottom, prevTop) {
+      if (!scrollContainer) return;
+      if (forceBottom || chatPinnedToBottom) {
+        const targetTop = Math.max(0, Number(scrollContainer.scrollHeight || 0) - Number(scrollContainer.clientHeight || 0));
+        if (forceBottom || Math.abs(Number(scrollContainer.scrollTop || 0) - targetTop) > 2) {
+          scrollContainer.scrollTop = scrollContainer.scrollHeight;
+        }
+        chatPinnedToBottom = true;
+      } else if (typeof prevTop === 'number' && prevTop >= 0) {
+        if (Math.abs(Number(scrollContainer.scrollTop || 0) - prevTop) > 1) {
+          scrollContainer.scrollTop = prevTop;
+        }
+      }
+    }
+
+    function upsertActivityInConversation(item) {
+      if (!item || !item.id) return false;
+      const displayMessages = getDisplayMessages();
       const turnGrouping = lcGroupActivitiesByUserTurn(displayMessages, currentActivities);
+      let targetTurnIdx = -1;
+      const turnKeys = Object.keys(turnGrouping.byMsgIndex || {});
+      for (let i = 0; i < turnKeys.length; i++) {
+        const list = turnGrouping.byMsgIndex[turnKeys[i]] || [];
+        if (list.some((a) => a && a.id === item.id)) {
+          targetTurnIdx = Number(turnKeys[i]);
+          break;
+        }
+      }
+
+      let turnKey = 'turn_fallback';
+      let turnActs = currentActivities;
+      let isLatestTurn = turnGrouping.lastTurnMsgIndex === -1;
+      if (targetTurnIdx >= 0 && displayMessages[targetTurnIdx]) {
+        turnKey = displayMessages[targetTurnIdx].id || ('turn_' + targetTurnIdx);
+        turnActs = turnGrouping.byMsgIndex[targetTurnIdx] || [];
+        isLatestTurn = targetTurnIdx === turnGrouping.lastTurnMsgIndex;
+      } else if (turnGrouping.lastTurnMsgIndex >= 0 && displayMessages[turnGrouping.lastTurnMsgIndex]) {
+        const lt = turnGrouping.lastTurnMsgIndex;
+        turnKey = displayMessages[lt].id || ('turn_' + lt);
+        turnActs = turnGrouping.byMsgIndex[lt] || [];
+        isLatestTurn = true;
+      }
+
+      const groupEl = lcFindChildByAttr(conversationFlow, 'data-turn-key', turnKey);
+      if (!groupEl) {
+        renderFullConversation();
+        return false;
+      }
+
+      lcUpdateInlineThinkingGroupHeader(groupEl, {
+        activities: turnActs,
+        isLive: isLatestTurn && isWorking,
+        statusSummary: isLatestTurn ? liveStatusState.summary : '',
+      });
+
+      const drawer = groupEl.querySelector('.lc-thinking-drawer');
+      if (!drawer) {
+        renderFullConversation();
+        return false;
+      }
+
+      const emptyNote = drawer.querySelector('.lc-thinking-empty-note');
+      if (emptyNote) emptyNote.remove();
+
+      const liveRow = document.getElementById('liveSafeStatusRow');
+      if (liveRow && isLatestTurn && isWorking) liveRow.remove();
+
+      const existingNode = lcFindChildByAttr(drawer, 'data-act-id', item.id);
+      if (existingNode) {
+        if (item.category === 'thinking_summary') {
+          lcUpdateThoughtEntryElement(existingNode, item, {
+            isExpanded: expandedThoughtIds.has(item.id),
+          });
+        } else {
+          lcUpdateActivityCardElement(existingNode, item);
+        }
+      } else {
+        const handlers = thinkingGroupHandlers();
+        if (item.category === 'thinking_summary') {
+          drawer.appendChild(lcBuildThoughtEntryElement(item, {
+            isExpanded: expandedThoughtIds.has(item.id),
+            onToggleExpand: handlers.onToggleExpandThought,
+          }));
+        } else {
+          drawer.appendChild(lcBuildActivityCardElement(
+            item,
+            expandedActivityIds.has(item.id),
+            handlers.onToggleActivity
+          ));
+        }
+      }
+
+      if (chatPinnedToBottom) {
+        syncContainerScroll(false);
+      }
+      return true;
+    }
+
+    function updatePlanInConversation() {
+      if (planExplicit) {
+        renderFullConversation();
+        return;
+      }
+      const displayMessages = getDisplayMessages();
+      const turnGrouping = lcGroupActivitiesByUserTurn(displayMessages, currentActivities);
+      let turnKey = 'turn_fallback';
+      if (turnGrouping.lastTurnMsgIndex >= 0 && displayMessages[turnGrouping.lastTurnMsgIndex]) {
+        const lt = turnGrouping.lastTurnMsgIndex;
+        turnKey = displayMessages[lt].id || ('turn_' + lt);
+      }
+      const groupEl = lcFindChildByAttr(conversationFlow, 'data-turn-key', turnKey);
+      const drawer = groupEl ? groupEl.querySelector('.lc-thinking-drawer') : null;
+      if (!drawer) {
+        renderFullConversation();
+        return;
+      }
+      const emptyNote = drawer.querySelector('.lc-thinking-empty-note');
+      if (emptyNote && activePlan.length > 0) emptyNote.remove();
+      let planListEl = drawer.querySelector('.lc-plan-checklist-mini');
+      if (activePlan && activePlan.length > 0) {
+        if (!planListEl) {
+          planListEl = document.createElement('div');
+          planListEl.className = 'lc-plan-checklist-mini';
+          planListEl.style.borderBottom = 'none';
+          planListEl.style.padding = '2px 0 4px 0';
+          drawer.insertBefore(planListEl, drawer.firstChild || null);
+        }
+        planListEl.innerHTML = lcBuildPlanMiniHtml(activePlan);
+      } else if (planListEl) {
+        planListEl.remove();
+      }
+      if (chatPinnedToBottom) {
+        syncContainerScroll(false);
+      }
+    }
+
+    function renderFullConversation(opts) {
+      const forceBottom = Boolean(opts && opts.forceScrollBottom);
+      const prevContainerTop = scrollContainer ? Number(scrollContainer.scrollTop || 0) : 0;
+      const shouldStickBottom = forceBottom || chatPinnedToBottom;
+      const savedScrolls = captureInnerScrollState();
+
+      conversationFlow.innerHTML = '';
+
+      if (planExplicit && activePlan && activePlan.length > 0) {
+        const planCard = document.createElement('div');
+        planCard.className = 'plan-card';
+        let planHtml = '<div class="plan-header"><span>Execution Plan</span><span>' +
+          activePlan.filter(p => p.status === 'completed').length + '/' + activePlan.length + ' Done</span></div><ul class="plan-list">';
+        activePlan.forEach((p) => {
+          const isDone = p.status === 'completed';
+          const badgeClass = p.status === 'completed' ? 'plan-completed' : p.status === 'in_progress' ? 'plan-in_progress' : 'plan-pending';
+          planHtml += '<li class="plan-item' + (isDone ? ' completed' : '') + '">' +
+            '<span>' + escapeHtml(p.description || p.title) + '</span>' +
+            '<span class="plan-badge ' + badgeClass + '">' + p.status + '</span>' +
+            '</li>';
+        });
+        planHtml += '</ul>';
+        planCard.innerHTML = planHtml;
+        conversationFlow.appendChild(planCard);
+      }
+
+      const displayMessages = getDisplayMessages();
+      const turnGrouping = lcGroupActivitiesByUserTurn(displayMessages, currentActivities);
+      const handlers = thinkingGroupHandlers();
       let renderedLatestLiveBlock = false;
 
       const mergedCmdMap = new Map();
@@ -3958,23 +4210,14 @@ export class AgentWorkspaceEditorPanel {
           if (turnActs.length > 0 || (isLatestTurn && isWorking) || turnPlan.length > 0) {
             if (isLatestTurn && isWorking) renderedLatestLiveBlock = true;
             const turnKey = msg.id || ('turn_' + idx);
-            conversationFlow.appendChild(lcBuildInlineThinkingGroup({
+            conversationFlow.appendChild(lcBuildInlineThinkingGroup(Object.assign({
               turnKey,
               activities: turnActs,
               planItems: turnPlan,
               isLive: isLatestTurn && isWorking,
               isExpanded: expandedTurnIds.has(turnKey),
               statusSummary: isLatestTurn ? liveStatusState.summary : '',
-              expandedActivityIds,
-              onToggleTurn: (k, open) => {
-                if (open) expandedTurnIds.add(k);
-                else expandedTurnIds.delete(k);
-              },
-              onToggleActivity: (id, open) => {
-                if (open) expandedActivityIds.add(id);
-                else expandedActivityIds.delete(id);
-              },
-            }));
+            }, handlers)));
           }
         } else {
           conversationFlow.appendChild(createAssistantCardElement(msg));
@@ -3983,23 +4226,14 @@ export class AgentWorkspaceEditorPanel {
 
       if (turnGrouping.lastTurnMsgIndex === -1 && (currentActivities.length > 0 || isWorking)) {
         if (isWorking) renderedLatestLiveBlock = true;
-        conversationFlow.appendChild(lcBuildInlineThinkingGroup({
+        conversationFlow.appendChild(lcBuildInlineThinkingGroup(Object.assign({
           turnKey: 'turn_fallback',
           activities: currentActivities,
           planItems: !planExplicit ? activePlan : [],
           isLive: isWorking,
           isExpanded: expandedTurnIds.has('turn_fallback'),
           statusSummary: liveStatusState.summary,
-          expandedActivityIds,
-          onToggleTurn: (k, open) => {
-            if (open) expandedTurnIds.add(k);
-            else expandedTurnIds.delete(k);
-          },
-          onToggleActivity: (id, open) => {
-            if (open) expandedActivityIds.add(id);
-            else expandedActivityIds.delete(id);
-          },
-        }));
+        }, handlers)));
       }
 
       while (nextCmdIdx < allCmdResults.length) {
@@ -4034,8 +4268,8 @@ export class AgentWorkspaceEditorPanel {
         conversationFlow.appendChild(empty);
       }
 
-      scrollContainer.scrollTop = scrollContainer.scrollHeight;
-      chatPinnedToBottom = true;
+      restoreInnerScrollState(savedScrolls);
+      syncContainerScroll(shouldStickBottom, prevContainerTop);
     }
 
     function formatDuration(ms) {
@@ -4327,9 +4561,11 @@ export class AgentWorkspaceEditorPanel {
             }
             updateModelConfigurationUI(activeModel);
           }
+          let isNewSessionLoad = false;
           {
             const nextSessionId = currentSession ? currentSession.id : null;
             if (lastLoadedSessionId !== nextSessionId) {
+              isNewSessionLoad = true;
               ephemeralCommandResults = [];
               lcQueueUserToggled = false;
               lcQueueEditingId = null;
@@ -4348,7 +4584,7 @@ export class AgentWorkspaceEditorPanel {
               phase: currentSession.activePhase || (isWorking ? 'working' : 'idle'),
               summary: currentSession.activePhaseSummary || '',
             };
-            renderFullConversation();
+            renderFullConversation({ forceScrollBottom: isNewSessionLoad });
             renderActivityPane();
           } else {
             topSessionTitle.textContent = 'No active session';
@@ -4358,7 +4594,7 @@ export class AgentWorkspaceEditorPanel {
             currentActivities = [];
             currentCommandResults = [];
             liveStatusState = { active: false, phase: 'idle', summary: '' };
-            renderFullConversation();
+            renderFullConversation({ forceScrollBottom: true });
             renderActivityPane();
           }
           if (msg.queueSnapshot) {
@@ -4429,7 +4665,7 @@ export class AgentWorkspaceEditorPanel {
               }
             }
             currentSession.messages.push(incoming);
-            renderFullConversation();
+            renderFullConversation({ forceScrollBottom: incoming.senderRole === 'user' });
           }
           break;
 
@@ -4441,10 +4677,13 @@ export class AgentWorkspaceEditorPanel {
             senderRole: ev.senderRole || 'assistant',
             content: ev.fullContent || '',
           };
-          const existingEl = conversationFlow.querySelector('.message-card[data-msg-id="' + ev.messageId + '"] .agent-text');
+          const existingCard = lcFindChildByAttr(conversationFlow, 'data-msg-id', ev.messageId);
+          const existingEl = existingCard ? existingCard.querySelector('.agent-text') : null;
           if (existingEl) {
             existingEl.innerHTML = formatMarkdown(ev.fullContent || '');
-            scrollContainer.scrollTop = scrollContainer.scrollHeight;
+            if (chatPinnedToBottom) {
+              syncContainerScroll(false);
+            }
           } else {
             renderFullConversation();
           }
@@ -4458,11 +4697,13 @@ export class AgentWorkspaceEditorPanel {
           isWorking = !terminal;
           liveStatusState = { active: !terminal, phase: ev.phase, summary: ev.summary || '' };
           updateStatusUI();
-          const activeLabel = conversationFlow.querySelector('.lc-thinking-group:last-of-type .lc-thinking-label');
-          if (!terminal && activeLabel) {
-            const grouped = lcGroupActivitiesByUserTurn(currentSession?.messages || [], currentActivities);
+          const groups = conversationFlow.querySelectorAll('.lc-thinking-group');
+          const activeGroup = groups.length > 0 ? groups[groups.length - 1] : null;
+          if (!terminal && activeGroup) {
+            const displayMsgs = getDisplayMessages();
+            const grouped = lcGroupActivitiesByUserTurn(displayMsgs, currentActivities);
             const turnActs = grouped.lastTurnMsgIndex >= 0 ? (grouped.byMsgIndex[grouped.lastTurnMsgIndex] || []) : currentActivities;
-            activeLabel.textContent = lcFormatTurnThinkingLabel({
+            lcUpdateInlineThinkingGroupHeader(activeGroup, {
               activities: turnActs,
               isLive: true,
               statusSummary: liveStatusState.summary,
@@ -4477,7 +4718,8 @@ export class AgentWorkspaceEditorPanel {
           if (msg.item) {
             currentActivities = lcUpsertActivityList(currentActivities, msg.item);
             if (currentSession) currentSession.activities = currentActivities;
-            renderFullConversation();
+            upsertActivityInConversation(msg.item);
+            upsertActivityInPane(msg.item);
           }
           break;
 
@@ -4517,7 +4759,7 @@ export class AgentWorkspaceEditorPanel {
         case 'planUpdate':
           activePlan = msg.plan || [];
           if (msg.explicit !== undefined) planExplicit = !!msg.explicit;
-          renderFullConversation();
+          updatePlanInConversation();
           break;
 
         case 'activity':

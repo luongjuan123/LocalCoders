@@ -1150,11 +1150,15 @@ export class MessageQueueManager {
         subs.push(
           runner.onMessage((msg: AgentMessage) => {
             if (msg.senderRole === 'user') return;
-            this.deps.sessionManager.updateSession(sessionId, (s) => {
-              if (!s.messages.some((m) => m.id === msg.id)) {
-                s.messages.push(msg);
-              }
-            });
+            this.deps.sessionManager.updateSession(
+              sessionId,
+              (s) => {
+                if (!s.messages.some((m) => m.id === msg.id)) {
+                  s.messages.push(msg);
+                }
+              },
+              { silent: true }
+            );
             this._onDidSessionEvent.fire({ sessionId, type: 'addMessage', payload: msg });
           })
         );
@@ -1166,14 +1170,18 @@ export class MessageQueueManager {
             if (ev.runId) currentRunnerRunId = ev.runId;
             switch (ev.kind) {
               case 'status':
-                this.deps.sessionManager.updateSession(sessionId, (s) => {
-                  s.activePhase = ev.phase;
-                  s.activePhaseSummary = ev.summary;
-                  if (ev.phase === 'completed' || ev.phase === 'failed' || ev.phase === 'cancelled') {
-                    s.activities = finalizeRunningActivities(s.activities || [], currentRunnerRunId, ev.phase);
-                    if (s.status === 'running') s.status = ev.phase;
-                  }
-                });
+                this.deps.sessionManager.updateSession(
+                  sessionId,
+                  (s) => {
+                    s.activePhase = ev.phase;
+                    s.activePhaseSummary = ev.summary;
+                    if (ev.phase === 'completed' || ev.phase === 'failed' || ev.phase === 'cancelled') {
+                      s.activities = finalizeRunningActivities(s.activities || [], currentRunnerRunId, ev.phase);
+                      if (s.status === 'running') s.status = ev.phase;
+                    }
+                  },
+                  { silent: true }
+                );
                 this._onDidSessionEvent.fire({ sessionId, type: 'streamStatus', payload: ev });
                 break;
 
@@ -1182,9 +1190,13 @@ export class MessageQueueManager {
                 break;
 
               case 'activity_upsert':
-                this.deps.sessionManager.updateSession(sessionId, (s) => {
-                  s.activities = upsertActivityItem(s.activities || [], ev.item);
-                });
+                this.deps.sessionManager.updateSession(
+                  sessionId,
+                  (s) => {
+                    s.activities = upsertActivityItem(s.activities || [], ev.item);
+                  },
+                  { silent: true }
+                );
                 this._onDidSessionEvent.fire({ sessionId, type: 'activityUpsert', payload: ev.item });
                 if (ev.item.category === 'file' && ev.item.status === 'completed') {
                   this.deps.changesManager?.refresh().catch(() => {});
@@ -1192,10 +1204,14 @@ export class MessageQueueManager {
                 break;
 
               case 'plan':
-                this.deps.sessionManager.updateSession(sessionId, (s) => {
-                  s.plan = ev.plan;
-                  s.planExplicit = ev.explicit;
-                });
+                this.deps.sessionManager.updateSession(
+                  sessionId,
+                  (s) => {
+                    s.plan = ev.plan;
+                    s.planExplicit = ev.explicit;
+                  },
+                  { silent: true }
+                );
                 this._onDidSessionEvent.fire({
                   sessionId,
                   type: 'planUpdate',

@@ -91,14 +91,32 @@ export class PermissionManager {
       return tool.permissionLevel === 'destructive';
     }
 
-    // 5. Smart Approval mode (default / auto-approve safe policy):
-    // - Read / search / safe diagnostic inspections: auto-approved
-    // - Write / execute / network / destructive: require approval according to policy
+    // 5. Smart Approval mode (default / auto-approve safe workspace policy):
+    // - Auto-approves reads, workspace file edits, and non-destructive workspace commands
+    // - Prompts on destructive tools, risky commands, or sensitive paths
+    if (tool.permissionLevel === 'destructive') {
+      return true;
+    }
+    if (this.isRiskySmartCommand(rawCommandOrArgs)) {
+      return true;
+    }
     if (tool.permissionLevel === 'read' || this.isSafePolicyTool(tool)) {
       return false;
     }
 
     return true;
+  }
+
+  public isRiskySmartCommand(payload?: any): boolean {
+    if (!payload) return false;
+    const str = typeof payload === 'string' ? payload : JSON.stringify(payload);
+    const riskyPatterns: RegExp[] = [
+      /\brm\s+(-[a-z]*[rf][a-z]*\b|--recursive\b|--force\b)/i,
+      /\bgit\s+(?:reset\s+--hard|clean\s+-[a-z]*f|push\s+.*(?:--force|-f\b))/i,
+      /\b(?:kill|pkill|killall)\s+-9\b/i,
+      /\b(?:shutdown|reboot|poweroff|halt)\b/i,
+    ];
+    return riskyPatterns.some((pattern) => pattern.test(str));
   }
 
   public isSafePolicyTool(tool: ToolDefinition): boolean {
@@ -113,10 +131,33 @@ export class PermissionManager {
       'get_metadata',
       'get_project_structure',
       'git_status',
+      'inspect_git_status',
       'read_git_diff',
       'git_log',
       'git_show',
       'create_checkpoint',
+      'write_file',
+      'edit_file',
+      'create_file',
+      'mkdir',
+      'copy_file',
+      'rename_file',
+      'stage_file',
+      'git_commit',
+      'git_branch',
+      'git_checkout',
+      'run_command',
+      'run_tests',
+      'run_build',
+      'run_lint',
+      'start_process',
+      'write_stdin',
+      'read_output',
+      'terminate_process',
+      'list_processes',
+      'app.launch',
+      'app.open_url',
+      'app.open_file',
     ]);
     return safeNames.has(tool.name);
   }

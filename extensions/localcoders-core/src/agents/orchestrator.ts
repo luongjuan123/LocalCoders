@@ -48,12 +48,14 @@ export class AgentOrchestrator {
   private activeRunId: string | null = null;
   private abortController: AbortController | null = null;
   private pendingApprovals: Map<string, (approved: boolean) => void> = new Map();
+  private pendingApprovalRequests: Map<string, ToolApprovalRequest> = new Map();
 
   // Event callbacks for UI
   private onActivityListeners: ((event: AgentActivityEvent) => void)[] = [];
   private onMessageListeners: ((message: AgentMessage) => void)[] = [];
   private onPlanUpdateListeners: ((plan: TaskPlanItem[]) => void)[] = [];
   private onApprovalListeners: ((req: ToolApprovalRequest) => void)[] = [];
+  private onApprovalResolvedListeners: ((ev: { requestId: string; approved: boolean }) => void)[] = [];
   private onCriticReportListeners: ((report: CriticReport) => void)[] = [];
   private onStreamEventListeners: ((event: AgentStreamEvent) => void)[] = [];
 
@@ -208,6 +210,30 @@ export class AgentOrchestrator {
     }
   }
 
+  onApprovalResolved(cb: (ev: { requestId: string; approved: boolean }) => void): { dispose: () => void } {
+    this.onApprovalResolvedListeners.push(cb);
+    return {
+      dispose: () => {
+        const idx = this.onApprovalResolvedListeners.indexOf(cb);
+        if (idx >= 0) this.onApprovalResolvedListeners.splice(idx, 1);
+      },
+    };
+  }
+
+  private emitApprovalResolved(requestId: string, approved: boolean) {
+    for (const cb of [...this.onApprovalResolvedListeners]) {
+      try {
+        cb({ requestId, approved });
+      } catch (e) {
+        console.warn('[Orchestrator] onApprovalResolved listener error:', e);
+      }
+    }
+  }
+
+  public getPendingApprovalRequests(): ToolApprovalRequest[] {
+    return Array.from(this.pendingApprovalRequests.values());
+  }
+
   private emitCritic(report: CriticReport) {
     for (const cb of [...this.onCriticReportListeners]) {
       try {
@@ -220,11 +246,13 @@ export class AgentOrchestrator {
 
   // Resolve pending user approval
   resolveApproval(requestId: string, approved: boolean) {
+    this.pendingApprovalRequests.delete(requestId);
     const resolver = this.pendingApprovals.get(requestId);
     if (resolver) {
-      resolver(approved);
       this.pendingApprovals.delete(requestId);
+      resolver(approved);
     }
+    this.emitApprovalResolved(requestId, approved);
   }
 
   public isTaskRunning(): boolean {
@@ -251,8 +279,14 @@ export class AgentOrchestrator {
       }
     });
     runner.onApproval((req) => {
+      this.pendingApprovalRequests.set(req.id, req);
       this.pendingApprovals.set(req.id, (approved) => runner.resolveApproval(req.id, approved));
       this.emitApproval(req);
+    });
+    runner.onApprovalResolved((ev) => {
+      this.pendingApprovalRequests.delete(ev.requestId);
+      this.pendingApprovals.delete(ev.requestId);
+      this.emitApprovalResolved(ev.requestId, ev.approved);
     });
     return runner;
   }
@@ -264,10 +298,12 @@ export class AgentOrchestrator {
       this.abortController = null;
     }
     for (const [reqId, resolver] of this.pendingApprovals.entries()) {
+      this.pendingApprovalRequests.delete(reqId);
+      this.pendingApprovals.delete(reqId);
       try {
         resolver(false);
       } catch {}
-      this.pendingApprovals.delete(reqId);
+      this.emitApprovalResolved(reqId, false);
     }
     const runId = this.activeRunId || `run_${Date.now()}`;
     if (this.currentTask) {
@@ -403,6 +439,7 @@ export class AgentOrchestrator {
       // 1. Hard safety boundary: prohibited commands/secrets/destructive actions ALWAYS require explicit confirmation
       if (pm && pm.isStrictlyProhibited(req.args)) {
         if (this.onApprovalListeners.length === 0) return false;
+        this.pendingApprovalRequests.set(req.id, req);
         this.emitApproval(req);
         return new Promise<boolean>((resolve) => {
           this.pendingApprovals.set(req.id, resolve);
@@ -417,16 +454,18 @@ export class AgentOrchestrator {
       } else {
         // 3. Fallback when tool has no registered definition (e.g. git.commit or internal)
         const effectivePermMode = sessionConfig?.permissionMode || pm?.getNormalizedMode() || 'smart';
-        if (effectivePermMode === 'bypass' && !req.isDestructive) {
+        if ((effectivePermMode === 'bypass' || effectivePermMode === 'smart') && !req.isDestructive) {
           return true;
         }
       }
 
       // 4. Headless / test fallback when no UI listener is attached
       if (this.onApprovalListeners.length === 0) {
-        return !req.isDestructive && (sessionConfig?.permissionMode === 'bypass' || !toolDef || toolDef.permissionLevel === 'read');
+        const effMode = sessionConfig?.permissionMode || pm?.getNormalizedMode() || 'smart';
+        return !req.isDestructive && (effMode === 'bypass' || effMode === 'smart' || !toolDef || toolDef.permissionLevel === 'read');
       }
 
+      this.pendingApprovalRequests.set(req.id, req);
       this.emitApproval(req);
       return new Promise<boolean>((resolve) => {
         this.pendingApprovals.set(req.id, resolve);

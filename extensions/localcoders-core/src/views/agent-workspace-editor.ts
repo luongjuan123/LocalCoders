@@ -242,6 +242,11 @@ export class AgentWorkspaceEditorPanel {
         this.postMessageSafe({ type: 'approvalRequest', request: req });
       })
     );
+    this._disposables.push(
+      this.orchestrator.onApprovalResolved((ev) => {
+        this.postMessageSafe({ type: 'approvalResolved', requestId: ev.requestId, approved: ev.approved });
+      })
+    );
 
     // Session manager events
     this._disposables.push(
@@ -1136,6 +1141,7 @@ export class AgentWorkspaceEditorPanel {
       terminalTabs: TerminalSessionManager.getInstance().getTabs(),
       systemTelemetry: telemetry,
       queueSnapshot,
+      pendingApprovals: this.orchestrator.getPendingApprovalRequests(),
     });
     this.updateTitle();
   }
@@ -4257,7 +4263,13 @@ export class AgentWorkspaceEditorPanel {
         updateOrAppendSafeStatus();
       }
 
-      const hasMsgs = (currentSession && currentSession.messages && currentSession.messages.length > 0) || allCmdResults.length > 0 || Object.keys(streamingMessages).length > 0;
+      if (Array.isArray(pendingApprovalRequests) && pendingApprovalRequests.length > 0) {
+        pendingApprovalRequests.forEach((req) => {
+          conversationFlow.appendChild(buildApprovalCardElement(req));
+        });
+      }
+
+      const hasMsgs = (currentSession && currentSession.messages && currentSession.messages.length > 0) || allCmdResults.length > 0 || Object.keys(streamingMessages).length > 0 || (Array.isArray(pendingApprovalRequests) && pendingApprovalRequests.length > 0);
       if (!hasMsgs && !isWorking) {
         const wsName = document.getElementById('topWorkspacePill')?.textContent?.trim() || 'workspace';
         const empty = document.createElement('div');
@@ -4562,6 +4574,9 @@ export class AgentWorkspaceEditorPanel {
             updateModelConfigurationUI(activeModel);
           }
           let isNewSessionLoad = false;
+          if (Array.isArray(msg.pendingApprovals)) {
+            pendingApprovalRequests = msg.pendingApprovals.slice();
+          }
           {
             const nextSessionId = currentSession ? currentSession.id : null;
             if (lastLoadedSessionId !== nextSessionId) {
@@ -4769,6 +4784,14 @@ export class AgentWorkspaceEditorPanel {
           renderApprovalPrompt(msg.request);
           break;
 
+        case 'approvalResolved':
+          if (msg.requestId) {
+            pendingApprovalRequests = pendingApprovalRequests.filter((r) => r && r.id !== msg.requestId);
+            const existingCard = document.getElementById('approvalCard_' + msg.requestId);
+            if (existingCard) existingCard.remove();
+          }
+          break;
+
         case 'focusPrompt':
           if (promptInput) {
             promptInput.focus();
@@ -4832,9 +4855,12 @@ export class AgentWorkspaceEditorPanel {
 
     ${getCockpitModalScript()}
 
-    function renderApprovalPrompt(req) {
+    let pendingApprovalRequests = [];
+
+    function buildApprovalCardElement(req) {
       const card = document.createElement('div');
       card.className = 'approval-card';
+      card.id = 'approvalCard_' + req.id;
       card.innerHTML = '<div style="font-weight:700;color:#f59e0b;font-size:12.5px;display:flex;align-items:center;gap:6px;">' + lcIcon('triangle-alert', 14) + '<span>Security Approval Required</span></div>' +
         '<div style="font-size:12px;color:#f1f5f9;">' + escapeHtml(req.description) + '</div>' +
         '<div style="font-family:monospace;font-size:11.5px;background:rgba(0,0,0,0.4);padding:6px 10px;border-radius:4px;color:#38bdf8;">' +
@@ -4845,17 +4871,38 @@ export class AgentWorkspaceEditorPanel {
         '<button class="btn-action-sm btn-reject" id="btnReject_' + req.id + '">Reject Action</button>' +
         '</div>';
 
+      const btnApprove = card.querySelector('#btnApprove_' + req.id);
+      if (btnApprove) {
+        btnApprove.addEventListener('click', () => {
+          pendingApprovalRequests = pendingApprovalRequests.filter((r) => r && r.id !== req.id);
+          card.remove();
+          vscode.postMessage({ command: 'resolveApproval', requestId: req.id, approved: true });
+        });
+      }
+      const btnReject = card.querySelector('#btnReject_' + req.id);
+      if (btnReject) {
+        btnReject.addEventListener('click', () => {
+          pendingApprovalRequests = pendingApprovalRequests.filter((r) => r && r.id !== req.id);
+          card.remove();
+          vscode.postMessage({ command: 'resolveApproval', requestId: req.id, approved: false });
+        });
+      }
+      return card;
+    }
+
+    function renderApprovalPrompt(req) {
+      if (!req || !req.id) return;
+      const idx = pendingApprovalRequests.findIndex((r) => r && r.id === req.id);
+      if (idx >= 0) {
+        pendingApprovalRequests[idx] = req;
+      } else {
+        pendingApprovalRequests.push(req);
+      }
+      const existing = document.getElementById('approvalCard_' + req.id);
+      if (existing) existing.remove();
+      const card = buildApprovalCardElement(req);
       conversationFlow.appendChild(card);
       scrollContainer.scrollTop = scrollContainer.scrollHeight;
-
-      document.getElementById('btnApprove_' + req.id).addEventListener('click', () => {
-        card.remove();
-        vscode.postMessage({ command: 'resolveApproval', requestId: req.id, approved: true });
-      });
-      document.getElementById('btnReject_' + req.id).addEventListener('click', () => {
-        card.remove();
-        vscode.postMessage({ command: 'resolveApproval', requestId: req.id, approved: false });
-      });
     }
 
     function escapeHtml(str) {

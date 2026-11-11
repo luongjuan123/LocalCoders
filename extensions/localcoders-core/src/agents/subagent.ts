@@ -59,7 +59,7 @@ export class Subagent {
       agentId: this.config.id,
       agentName: this.config.name,
       taskId: task.id,
-      requireApproval: pmMode === 'bypass' ? false : true,
+      requireApproval: pmMode === 'bypass' || pmMode === 'smart' ? false : true,
       requestApproval,
     };
 

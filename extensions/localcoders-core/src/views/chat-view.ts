@@ -190,6 +190,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     this.orchestrator.onApproval((req) => {
       this.postMessageSafe({ type: 'approvalRequest', request: req });
     });
+    this.orchestrator.onApprovalResolved((ev) => {
+      this.postMessageSafe({ type: 'approvalResolved', requestId: ev.requestId, approved: ev.approved });
+    });
 
     this.sessionManager.onDidChangeSessions(() => {
       this.syncActiveSession();
@@ -799,6 +802,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       permissionMode,
       slashCommands,
       queueSnapshot,
+      pendingApprovals: this.orchestrator.getPendingApprovalRequests(),
     });
   }
 
@@ -2951,7 +2955,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       chatContainer.innerHTML = '';
       Object.keys(streamingMsgNodes).forEach((k) => delete streamingMsgNodes[k]);
 
-      if (currentSessionMessagesCache.length === 0 && allCmdResults.length === 0) {
+      if (currentSessionMessagesCache.length === 0 && allCmdResults.length === 0 && pendingApprovalRequests.length === 0) {
         if (emptyWelcome) {
           emptyWelcome.style.display = 'flex';
           chatContainer.appendChild(emptyWelcome);
@@ -2987,6 +2991,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
       if (currentSessionPlanExplicit && currentSessionPlanCache && currentSessionPlanCache.length > 0) {
         renderPlan(currentSessionPlanCache);
+      }
+      if (pendingApprovalRequests.length > 0) {
+        pendingApprovalRequests.forEach((req) => {
+          chatContainer.appendChild(buildApprovalBoxElement(req));
+        });
       }
       if (shouldStick) {
         chatContainer.scrollTop = chatContainer.scrollHeight;
@@ -3093,6 +3102,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             });
           }
 
+          if (Array.isArray(data.pendingApprovals)) {
+            pendingApprovalRequests = data.pendingApprovals.slice();
+          }
           currentSessionMessagesCache = Array.isArray(data.session?.messages) ? data.session.messages.slice() : [];
           currentCommandResults = Array.isArray(data.session?.commandResults) ? data.session.commandResults.slice() : [];
           currentSessionPlanCache = Array.isArray(data.session?.plan) ? data.session.plan.slice() : [];
@@ -3222,6 +3234,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           renderApproval(data.request);
           break;
 
+        case 'approvalResolved':
+          if (data.requestId) {
+            pendingApprovalRequests = pendingApprovalRequests.filter((r) => r && r.id !== data.requestId);
+            const existingBox = document.getElementById('approvalBox_' + data.requestId);
+            if (existingBox) existingBox.remove();
+          }
+          break;
+
         case 'slashCommandResult': {
           const res = data.result;
           if (!res) break;
@@ -3335,24 +3355,49 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       }
     }
 
-    function renderApproval(req) {
+    let pendingApprovalRequests = [];
+
+    function buildApprovalBoxElement(req) {
       const box = document.createElement('div');
       box.className = 'approval-box';
+      box.id = 'approvalBox_' + req.id;
       box.innerHTML =
-        '<div style="font-weight: 600; color: var(--warning); margin-bottom: 6px; display:flex; align-items:center; gap:6px;">' + lcIcon('triangle-alert', 14) + '<span>Approval Required: ' + escapeHtml(req.toolName) + '</span></div>' +
+        '<div style="font-weight: 600; color: var(--warning); margin-bottom: 6px; display:flex; align-items:center; gap:6px;">' + lcIcon('triangle-alert', 14) + '<span>Approval Required: ' + escapeHtml(req.tool || req.toolName || 'tool') + '</span></div>' +
         '<div style="font-size: 12px; color: var(--fg);">' + escapeHtml(req.description) + '</div>' +
         '<div class="approval-btns">' +
-        '<button class="btn-approve" id="app-yes">Approve</button>' +
-        '<button class="btn-reject" id="app-no">Reject</button>' +
+        '<button class="btn-approve" id="app-yes-' + req.id + '">Approve</button>' +
+        '<button class="btn-reject" id="app-no-' + req.id + '">Reject</button>' +
         '</div>';
-      box.querySelector('#app-yes').addEventListener('click', () => {
-        vscode.postMessage({ command: 'resolveApproval', requestId: req.id, approved: true });
-        box.remove();
-      });
-      box.querySelector('#app-no').addEventListener('click', () => {
-        vscode.postMessage({ command: 'resolveApproval', requestId: req.id, approved: false });
-        box.remove();
-      });
+      const btnYes = box.querySelector('#app-yes-' + req.id);
+      if (btnYes) {
+        btnYes.addEventListener('click', () => {
+          pendingApprovalRequests = pendingApprovalRequests.filter((r) => r && r.id !== req.id);
+          vscode.postMessage({ command: 'resolveApproval', requestId: req.id, approved: true });
+          box.remove();
+        });
+      }
+      const btnNo = box.querySelector('#app-no-' + req.id);
+      if (btnNo) {
+        btnNo.addEventListener('click', () => {
+          pendingApprovalRequests = pendingApprovalRequests.filter((r) => r && r.id !== req.id);
+          vscode.postMessage({ command: 'resolveApproval', requestId: req.id, approved: false });
+          box.remove();
+        });
+      }
+      return box;
+    }
+
+    function renderApproval(req) {
+      if (!req || !req.id) return;
+      const idx = pendingApprovalRequests.findIndex((r) => r && r.id === req.id);
+      if (idx >= 0) {
+        pendingApprovalRequests[idx] = req;
+      } else {
+        pendingApprovalRequests.push(req);
+      }
+      const existing = document.getElementById('approvalBox_' + req.id);
+      if (existing) existing.remove();
+      const box = buildApprovalBoxElement(req);
       chatContainer.appendChild(box);
       chatContainer.scrollTop = chatContainer.scrollHeight;
     }

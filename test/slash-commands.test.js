@@ -532,7 +532,10 @@ describe('Complete Slash Command System for LocalCoders', () => {
       assert.strictEqual(autoRes.ok, true);
       assert.strictEqual(h.permissionManager.getNormalizedMode(), 'smart');
       assert.strictEqual(h.permissionManager.isApprovalRequired(readToolDef, 'sess1', { path: 'x.ts' }), false);
-      assert.strictEqual(h.permissionManager.isApprovalRequired(writeToolDef, 'sess1', { path: 'x.ts' }), true);
+      assert.strictEqual(h.permissionManager.isApprovalRequired(writeToolDef, 'sess1', { path: 'x.ts' }), false);
+      assert.strictEqual(h.permissionManager.isApprovalRequired(execToolDef, 'sess1', { command: 'npm test' }), false);
+      assert.strictEqual(h.permissionManager.isApprovalRequired(execToolDef, 'sess1', { command: 'git reset --hard HEAD~1' }), true);
+      assert.strictEqual(h.permissionManager.isApprovalRequired(delToolDef, 'sess1', { path: 'x.ts' }), true);
 
       // /permissions reports current settings
       const permsRes = await runSlashCommandForWorkspace({

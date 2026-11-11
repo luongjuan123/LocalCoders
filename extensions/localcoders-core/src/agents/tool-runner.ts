@@ -111,6 +111,40 @@ export async function executeTrackedTool(params: TrackedToolParams): Promise<{
   const trackedCtx: ToolExecutionContext = {
     ...baseCtx,
     abortSignal: abortSignal || baseCtx.abortSignal,
+    requestApproval: async (req) => {
+      if (onStreamEvent) {
+        onStreamEvent({
+          kind: 'status',
+          id: `st_${runId}_${callId}_appr`,
+          runId,
+          agentId,
+          agentName,
+          phase: 'waiting_tool',
+          summary: `Waiting for approval: ${formatted.title}`,
+          timestamp: Date.now(),
+        });
+      }
+      emitItem({
+        ...baseItem,
+        summary: `Waiting for approval — ${formatted.summary}`,
+        stdout:
+          liveStdout ||
+          `Approval required: ${req.description || formatted.title}\nApprove or Reject in the confirmation card below to continue.`,
+        stderr: liveStderr,
+        durationMs: Date.now() - startTime,
+        timestamp: Date.now(),
+      });
+      const approved = await baseCtx.requestApproval(req);
+      emitItem({
+        ...baseItem,
+        summary: formatted.summary,
+        stdout: liveStdout,
+        stderr: liveStderr,
+        durationMs: Date.now() - startTime,
+        timestamp: Date.now(),
+      });
+      return approved;
+    },
     onOutput: (stream, chunk) => {
       const cap = 64 * 1024;
       if (stream === 'stdout') {
@@ -145,10 +179,17 @@ export async function executeTrackedTool(params: TrackedToolParams): Promise<{
   const finalStatus = wasCancelled ? 'cancelled' : result.success ? 'completed' : 'failed';
   const outObj = result.output && typeof result.output === 'object' ? result.output : undefined;
 
+  const fileActionOut =
+    result.success &&
+    typeof outObj?.path === 'string' &&
+    typeof outObj?.action === 'string'
+      ? `${outObj.action === 'created' ? 'Created' : outObj.action === 'modified' ? 'Updated' : outObj.action} ${outObj.path}${typeof outObj.bytesWritten === 'number' ? ` (${outObj.bytesWritten} bytes)` : ''}`
+      : '';
+
   const stdoutText =
     typeof outObj?.stdout === 'string' && outObj.stdout.length > 0
       ? outObj.stdout
-      : liveStdout.trim();
+      : liveStdout.trim() || fileActionOut;
   const stderrText =
     typeof outObj?.stderr === 'string' && outObj.stderr.length > 0
       ? outObj.stderr
@@ -288,6 +329,7 @@ export interface TurnProgressGuardOptions {
   maxStuckTurns?: number;
   blockInteractiveApps?: boolean;
   launchedApps?: Set<string>;
+  isExecuteOnly?: boolean;
 }
 
 const APP_LAUNCH_TOOL_NAMES = new Set([
@@ -343,7 +385,8 @@ export function normalizeCommandTarget(toolName: string, args: Record<string, an
  * re-running identical failing tests, or infinitely re-launching desktop/GUI apps after close.
  */
 export function createTurnProgressGuard(options: TurnProgressGuardOptions = {}) {
-  const maxStuckTurns = Math.max(1, options.maxStuckTurns ?? 2);
+  const isExecuteOnly = Boolean(options.isExecuteOnly);
+  const maxStuckTurns = Math.max(1, options.maxStuckTurns ?? (isExecuteOnly ? 4 : 2));
   const blockInteractiveApps = Boolean(options.blockInteractiveApps);
   const launchedApps = options.launchedApps || new Set<string>();
   const succeededMutations = new Set<string>();
@@ -352,6 +395,7 @@ export function createTurnProgressGuard(options: TurnProgressGuardOptions = {}) 
   const failedCommandsSinceLastWrite = new Map<string, { error: string; count: number }>();
   const executedTestsSinceLastWrite = new Set<string>();
   let stuckTurns = 0;
+  let lastFailedCommand: { command: string; error: string } | undefined;
 
   const isMutationTool = (name: string) =>
     name === 'write_file' || name === 'create_file' || name === 'edit_file';
@@ -459,9 +503,10 @@ export function createTurnProgressGuard(options: TurnProgressGuardOptions = {}) 
             cachedResultJson: JSON.stringify({
               success: false,
               skippedDuplicate: true,
-              error:
-                `Skipped redundant retry of failing command '${args?.command || toolName}': no files were modified since its last failure. ` +
-                `Read/fix the failing file with read_file + write_file before running tests again.`,
+              error: isExecuteOnly
+                ? `Skipped redundant retry of failing command '${args?.command || toolName}'. Inspect workspace files with read_file/list_directory or compile/run the correct target.`
+                : `Skipped redundant retry of failing command '${args?.command || toolName}': no files were modified since its last failure. ` +
+                  `Read/fix the failing file with read_file + write_file before running tests again.`,
             }),
           };
         }
@@ -538,13 +583,16 @@ export function createTurnProgressGuard(options: TurnProgressGuardOptions = {}) 
           }
           madeProgress = true;
         } else if (!result?.cancelled) {
+          const errStr = String(result?.error || result?.output?.stderr || result?.output?.stdout || 'Command failed');
+          const rawCmd = String(args?.command || args?.cmd || toolName);
+          lastFailedCommand = { command: rawCmd, error: errStr };
           if (result?.output?.interactiveRequired || result?.output?.timedOut) {
             commandHint = String(result.error || 'Command blocked waiting on stdin or long-running process.');
             blockedCommands.set(sig, commandHint);
           } else {
             const prevCount = failedCommandsSinceLastWrite.get(sig)?.count || 0;
             failedCommandsSinceLastWrite.set(sig, {
-              error: String(result?.error || result?.output?.stderr || 'Command failed'),
+              error: errStr,
               count: prevCount + 1,
             });
           }
@@ -554,12 +602,19 @@ export function createTurnProgressGuard(options: TurnProgressGuardOptions = {}) 
       return { modifiedFile, madeProgress, commandHint };
     },
 
+    getLastCommandFailure(): { command: string; error: string } | undefined {
+      return lastFailedCommand;
+    },
+
     shouldStopTurn(params: { skippedAll: boolean; turnMadeProgress: boolean; executedReadOnly: boolean }): boolean {
       if (params.skippedAll && !params.turnMadeProgress && !params.executedReadOnly && launchedApps.size > 0) {
         return true;
       }
       if (params.turnMadeProgress) {
         stuckTurns = 0;
+        return false;
+      }
+      if (isExecuteOnly && params.executedReadOnly && launchedApps.size === 0) {
         return false;
       }
       if (params.skippedAll || !params.executedReadOnly) {

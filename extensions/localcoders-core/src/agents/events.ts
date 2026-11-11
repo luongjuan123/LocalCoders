@@ -577,8 +577,7 @@ export function classifyUserPrompt(prompt: string, executionMode: string = 'code
     }
   } else if (
     !CODE_AUTHORING_VERBS_REGEX.test(candidate) &&
-    HOW_TO_QUESTION_REGEX.test(candidate) &&
-    /\?\s*$/.test(raw)
+    HOW_TO_QUESTION_REGEX.test(candidate)
   ) {
     return 'question';
   }

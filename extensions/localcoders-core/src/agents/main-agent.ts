@@ -39,6 +39,141 @@ export interface RuntimeModelOptions {
   onCriticReport?: (report: CriticReport) => void;
 }
 
+export interface WorkspaceProjectDetails {
+  rootFiles: string[];
+  primaryLanguage: 'cpp' | 'c' | 'rust' | 'go' | 'python' | 'node' | 'unknown';
+  buildSystem: 'cmake' | 'make' | 'cargo' | 'go' | 'npm' | 'none';
+  existingBinaries: string[];
+  sourceEntrypoints: string[];
+  guidanceText: string;
+}
+
+export function detectWorkspaceProjectType(workspaceRoot: string): WorkspaceProjectDetails {
+  let rootFiles: string[] = [];
+  try {
+    rootFiles = fs
+      .readdirSync(workspaceRoot, { withFileTypes: true })
+      .filter((e) => !['.git', 'node_modules', '__pycache__', '.localcoders', 'venv', '.venv'].includes(e.name))
+      .slice(0, 35)
+      .map((e) => (e.isDirectory() ? `${e.name}/` : e.name));
+  } catch {}
+
+  const lowerFiles = rootFiles.map((f) => f.toLowerCase());
+  const hasCmake = lowerFiles.includes('cmakelists.txt');
+  const hasMakefile = lowerFiles.includes('makefile') || lowerFiles.includes('gnumakefile');
+  const hasCargo = lowerFiles.includes('cargo.toml');
+  const hasGoMod = lowerFiles.includes('go.mod');
+  const hasPkgJson = lowerFiles.includes('package.json');
+  const cppFiles = rootFiles.filter((f) => /\.(cpp|cc|cxx|c\+\+|hpp|hxx|h)$/i.test(f));
+  const cFiles = rootFiles.filter((f) => /\.(c|h)$/i.test(f));
+  const pyFiles = rootFiles.filter((f) => /\.py$/i.test(f));
+  const jsTsFiles = rootFiles.filter((f) => /\.(js|ts|jsx|tsx|vue|svelte)$/i.test(f));
+
+  // Search common binary locations: root, build/, bin/, out/, target/debug/
+  const existingBinaries: string[] = [];
+  const checkBinary = (relPath: string) => {
+    try {
+      const full = path.join(workspaceRoot, relPath);
+      const stat = fs.statSync(full);
+      if (stat.isFile() && !relPath.endsWith('.txt') && !relPath.endsWith('.md') && !relPath.endsWith('.json') && !relPath.endsWith('.cpp') && !relPath.endsWith('.h')) {
+        if ((stat.mode & 0o111) !== 0 || !path.extname(relPath)) {
+          existingBinaries.push(relPath);
+        }
+      }
+    } catch {}
+  };
+
+  for (const f of rootFiles) {
+    if (!f.endsWith('/') && !path.extname(f)) {
+      checkBinary(f);
+    }
+  }
+  for (const subDir of ['build', 'bin', 'out', 'target/debug', 'target/release']) {
+    try {
+      const fullSub = path.join(workspaceRoot, subDir);
+      if (fs.existsSync(fullSub) && fs.statSync(fullSub).isDirectory()) {
+        const subEntries = fs.readdirSync(fullSub);
+        for (const subF of subEntries.slice(0, 10)) {
+          checkBinary(path.join(subDir, subF));
+        }
+      }
+    } catch {}
+  }
+
+  let primaryLanguage: WorkspaceProjectDetails['primaryLanguage'] = 'unknown';
+  let buildSystem: WorkspaceProjectDetails['buildSystem'] = 'none';
+
+  if (hasCmake || cppFiles.length > 0) {
+    primaryLanguage = 'cpp';
+    buildSystem = hasCmake ? 'cmake' : hasMakefile ? 'make' : 'none';
+  } else if (hasMakefile || cFiles.length > 0) {
+    primaryLanguage = 'c';
+    buildSystem = hasMakefile ? 'make' : 'none';
+  } else if (hasCargo) {
+    primaryLanguage = 'rust';
+    buildSystem = 'cargo';
+  } else if (hasGoMod) {
+    primaryLanguage = 'go';
+    buildSystem = 'go';
+  } else if (pyFiles.length > 0 || lowerFiles.includes('requirements.txt') || lowerFiles.includes('pyproject.toml')) {
+    primaryLanguage = 'python';
+    buildSystem = 'none';
+  } else if (hasPkgJson || jsTsFiles.length > 0) {
+    primaryLanguage = 'node';
+    buildSystem = 'npm';
+  }
+
+  let guidanceText = '';
+  if (primaryLanguage === 'cpp' || primaryLanguage === 'c') {
+    const binHint = existingBinaries.length > 0
+      ? `Existing executable binary found: ${existingBinaries.map((b) => `./${b}`).join(', ')}. Run directly via start_process or run_command.`
+      : `No compiled binary exists yet. You MUST compile/build first with run_command before executing! Build commands:\n` +
+        (hasCmake
+          ? `  * CMake: cmake -B build && cmake --build build (binary will be in ./build/)\n`
+          : '') +
+        (hasMakefile ? `  * Make: make\n` : '') +
+        `  * Direct g++: g++ -std=c++17 ${cppFiles.slice(0, 4).join(' ') || 'main.cpp'} -o app && ./app`;
+
+    guidanceText =
+      `WORKSPACE PROJECT TYPE: C/C++ (${rootFiles.join(', ') || 'root'})\n` +
+      `CRITICAL EXECUTION RULES FOR C/C++:\n` +
+      `- This is a C/C++ project, NOT a Python or Node project! NEVER call 'python3' on .cpp files or hallucinate 'main.py'!\n` +
+      `- ${binHint}\n` +
+      `- Once the binary exists, launch GUI applications using 'start_process("./<binary>")' or run CLI apps using 'run_command("./<binary>")'.`;
+  } else if (primaryLanguage === 'python') {
+    guidanceText =
+      `WORKSPACE PROJECT TYPE: Python (${rootFiles.join(', ') || 'root'})\n` +
+      `Available Python files: ${pyFiles.join(', ') || 'none found in root'}.\n` +
+      `- Run using 'python3 <existing_file.py>' (or 'start_process' for GUI apps like Tkinter/PyQt). Do NOT guess filenames that do not exist on disk.\n` +
+      `- Any workspace venv/bin is already on PATH so run 'python3', 'pip', or 'pytest' directly.`;
+  } else if (primaryLanguage === 'node') {
+    guidanceText =
+      `WORKSPACE PROJECT TYPE: Node.js (${rootFiles.join(', ') || 'root'})\n` +
+      `- Run using 'npm start', 'npm run dev', or 'node <existing_script.js>'.`;
+  } else if (primaryLanguage === 'rust') {
+    guidanceText =
+      `WORKSPACE PROJECT TYPE: Rust (${rootFiles.join(', ') || 'root'})\n` +
+      `- Run using 'cargo run' or build with 'cargo build'.`;
+  } else if (primaryLanguage === 'go') {
+    guidanceText =
+      `WORKSPACE PROJECT TYPE: Go (${rootFiles.join(', ') || 'root'})\n` +
+      `- Run using 'go run .' or build with 'go build'.`;
+  } else {
+    guidanceText =
+      `WORKSPACE FILES: ${rootFiles.join(', ') || '(empty)'}\n` +
+      `- Inspect existing files to determine entrypoint and start command.`;
+  }
+
+  return {
+    rootFiles,
+    primaryLanguage,
+    buildSystem,
+    existingBinaries,
+    sourceEntrypoints: cppFiles.length > 0 ? cppFiles : pyFiles.length > 0 ? pyFiles : jsTsFiles,
+    guidanceText,
+  };
+}
+
 /**
  * Determines whether another Critic -> Main Agent correction cycle is required.
  */
@@ -675,7 +810,10 @@ ${rulesText}
     // Local Ollama defaults to OLLAMA_NUM_PARALLEL=1; serializing prevents queue starvation and llama-server OOM crashes
     const maxConcurrency = isLocalExecution ? 1 : configuredConcurrency;
     const pmMode = this.toolManager.getPermissionManager()?.getNormalizedMode();
-    const requireApprovalForEdits = pmMode === 'bypass' ? false : (vsConfig.get<boolean>('requireApprovalForEdits') ?? true);
+    const requireApprovalForEdits =
+      pmMode === 'bypass' || pmMode === 'smart'
+        ? false
+        : (vsConfig.get<boolean>('requireApprovalForEdits') ?? true);
 
     const queue = new TaskQueue(maxConcurrency);
     queue.setPlan(plan);
@@ -1090,7 +1228,10 @@ ${rulesText}
   ): Promise<{ success: boolean; output: string; modifiedFiles: string[]; verificationSummary?: string; verificationFailed?: boolean }> {
     const vsConfig = vscode.workspace.getConfiguration('localcoders');
     const pmMode = this.toolManager.getPermissionManager()?.getNormalizedMode();
-    const requireApprovalForEdits = pmMode === 'bypass' ? false : (vsConfig.get<boolean>('requireApprovalForEdits') ?? true);
+    const requireApprovalForEdits =
+      pmMode === 'bypass' || pmMode === 'smart'
+        ? false
+        : (vsConfig.get<boolean>('requireApprovalForEdits') ?? true);
 
     const toolCtx: ToolExecutionContext = {
       workspaceRoot: this.workspaceRoot,
@@ -1105,15 +1246,8 @@ ${rulesText}
       affectedFiles: task.affectedFiles,
       prompt: `${task.title} ${task.description} ${userPrompt}`,
     };
-    let rootListingText = '(empty)';
-    try {
-      const rootEntries = require('fs')
-        .readdirSync(this.workspaceRoot, { withFileTypes: true })
-        .filter((e: any) => !['.git', 'node_modules', '__pycache__', '.localcoders', 'venv', '.venv'].includes(e.name))
-        .slice(0, 25)
-        .map((e: any) => (e.isDirectory() ? `${e.name}/` : e.name));
-      if (rootEntries.length > 0) rootListingText = rootEntries.join(', ');
-    } catch {}
+    const projectDetails = detectWorkspaceProjectType(this.workspaceRoot);
+    const rootListingText = projectDetails.rootFiles.join(', ') || '(empty)';
 
     const isExecuteOnly = Boolean(runtimeOptions?.executeOnly);
     const executeOnlyBlockedTools = new Set([
@@ -1142,12 +1276,12 @@ ${this.config.systemPrompt}
 EXECUTION-ONLY MODE:
 - The project code is ALREADY implemented on disk (Workspace Root Files: ${rootListingText}).
 - Do NOT rewrite, recreate, or modify existing source files or tests. Write/edit tools are disabled.
-- Use read_file / list_directory only if you need to check the entrypoint filename or start command.
+- Use read_file / list_directory only if you need to check the entrypoint filename or build configuration.
+${projectDetails.guidanceText}
 - Run the requested existing application or command right now using:
-  * start_process(command) + read_output(id): for GUI applications (Tkinter, Qt, Pygame, Electron), dev servers, or continuously running clocks/timers.
-  * run_command(command, stdin?): for finite scripts, CLIs (pass stdin if input() is needed), or test commands.
-- Never execute standalone 'source venv/bin/activate' or './venv/bin/activate' in run_command; any workspace venv/bin is already on PATH so run 'python3', 'pip', or 'pytest' directly.
-- Once executed, concisely report the exact command run and observed output/process status.`
+  * start_process(command) + read_output(id): for GUI applications (Tkinter, Qt, X11, Pygame, Electron), dev servers, or continuously running clocks/timers.
+  * run_command(command, stdin?): for finite scripts, compilation/build commands, CLIs (pass stdin if input() is needed), or test commands.
+${projectDetails.primaryLanguage === 'python' ? "- Any workspace venv/bin is already on PATH so run 'python3', 'pip', or 'pytest' directly.\n" : ''}- Once executed or started, concisely report the exact command run and observed output/process status.`
       : `You are the Lead Main Agent in LocalCoders, an autonomous development environment.
 ${this.config.systemPrompt}
 
@@ -1161,13 +1295,13 @@ CRITICAL EXECUTION MANDATE:
   * list_directory(path): Inspect directory structures.
 - Whenever you implement a feature, module, or test, YOU MUST CALL write_file TO SAVE THE CODE TO DISK.
 - Match the existing language and structure of the workspace (Workspace Root Files: ${rootListingText}). Never create TypeScript/JS files inside a Python workspace unless explicitly asked.
-- Never execute standalone 'source venv/bin/activate' or './venv/bin/activate' in run_command; any workspace venv/bin is already on PATH so run 'python3', 'pip', or 'pytest' directly.
-- Never retry the exact same timed-out or interactive-input-blocked command with identical arguments; pass 'stdin', add non-interactive CLI options/tests, or run via 'start_process' + 'write_stdin'.
+${projectDetails.guidanceText}
+${projectDetails.primaryLanguage === 'python' ? "- Any workspace venv/bin is already on PATH so run 'python3', 'pip', or 'pytest' directly.\n" : ''}- Never retry the exact same timed-out or interactive-input-blocked command with identical arguments; pass 'stdin', add non-interactive CLI options/tests, or run via 'start_process' + 'write_stdin'.
 - Never call write_file multiple times in a loop with identical path and content. Once a file is written and tests pass, provide your final concise summary.
 - Always write complete, production-ready, clean code with zero placeholders or omissions.`;
 
     const targetFilePrompt = isExecuteOnly
-      ? `Inspect root files (${rootListingText}) if needed and run the existing entrypoint using run_command or start_process now. Do NOT modify or rewrite code files.`
+      ? `Inspect root files (${rootListingText}) if needed and run the existing entrypoint using run_command or start_process now (compile first if needed). Do NOT modify or rewrite code files.\n${projectDetails.guidanceText}`
       : task.affectedFiles.length > 0
       ? `You MUST immediately write/update the required code for: ${task.affectedFiles.join(', ')} using write_file. Do not waste turns reading directory listings when files must be written.`
       : `Inspect/match existing workspace files (${rootListingText}) and use tools (write_file, edit_file, run_command) to execute this task now.`;
@@ -1199,7 +1333,7 @@ ${targetFilePrompt}`;
     let finalOutput = '';
     const filesWritten: string[] = [];
     const launchedApps = runtimeOptions?.launchedApps || new Set<string>();
-    const progressGuard = createTurnProgressGuard({ maxStuckTurns: 2, launchedApps });
+    const progressGuard = createTurnProgressGuard({ maxStuckTurns: isExecuteOnly ? 4 : 2, launchedApps, isExecuteOnly });
     let toolsExecutedCount = 0;
     let lastExecutedAppCmd = '';
 
@@ -1423,6 +1557,11 @@ ${targetFilePrompt}`;
 
           const resStr = JSON.stringify(res);
           const boundedStr = resStr.length > 12000 ? resStr.slice(0, 12000) + '... [truncated]' : resStr;
+          const callSuccess = Boolean(
+            res?.success &&
+            (res?.output?.exitCode === undefined || res.output.exitCode === 0)
+          );
+          const errSnippet = String(res?.error || res?.output?.stderr || res?.output?.stdout || '');
 
           if (toolCalls && toolCalls.length > 0) {
             messages.push({
@@ -1438,6 +1577,8 @@ ${targetFilePrompt}`;
                   ? lastCommandHint
                   : isExecuteOnly && launchedApps.size > 0
                   ? `Application '${lastExecutedAppCmd || 'command'}' already ran/started. Do NOT reopen or rerun it if the user closes it — concisely summarize completion now.`
+                  : isExecuteOnly && !callSuccess
+                  ? `Command failed: ${errSnippet.slice(0, 400)}. The application did NOT run successfully. Inspect workspace files (${rootListingText}), compile if needed using 'run_command', and execute the valid binary/script. Do NOT give up or repeat the exact same failing command.`
                   : isExecuteOnly
                   ? 'Execution step recorded. If the application/command has now run or started, reply concisely with the observed command and output. Do NOT rewrite existing files.'
                   : filesWritten.length > 0
@@ -1449,10 +1590,21 @@ ${targetFilePrompt}`;
         }
 
         if (progressGuard.shouldStopTurn({ skippedAll: skippedAllAsDuplicate, turnMadeProgress, executedReadOnly })) {
-          finalOutput =
-            launchedApps.size > 0 && lastExecutedAppCmd
-              ? `Executed \`${lastExecutedAppCmd}\` successfully.`
-              : `Stopped task after repeated unchanged/blocked operations (${Array.from(new Set(filesWritten)).join(', ') || 'no file changes'}).`;
+          if (isExecuteOnly) {
+            const lastFail = progressGuard.getLastCommandFailure();
+            if (launchedApps.size > 0 && lastExecutedAppCmd) {
+              finalOutput = `Application \`${lastExecutedAppCmd}\` was executed successfully.`;
+            } else if (lastFail) {
+              finalOutput = `Application could not be run. Command \`${lastFail.command}\` failed:\n${lastFail.error.slice(0, 400)}\n\nWorkspace files: ${rootListingText}.`;
+            } else {
+              finalOutput = `Could not run requested application. Available workspace files: ${rootListingText}.`;
+            }
+          } else {
+            finalOutput =
+              launchedApps.size > 0 && lastExecutedAppCmd
+                ? `Executed \`${lastExecutedAppCmd}\` successfully.`
+                : `Stopped task after repeated unchanged/blocked operations (${Array.from(new Set(filesWritten)).join(', ') || 'no file changes'}).`;
+          }
           break;
         }
 
@@ -1495,6 +1647,17 @@ ${targetFilePrompt}`;
 
       finalOutput = sanitizeAssistantContent(content);
       break;
+    }
+
+    if (isExecuteOnly && !finalOutput) {
+      const lastFail = progressGuard.getLastCommandFailure();
+      if (launchedApps.size > 0 && lastExecutedAppCmd) {
+        finalOutput = `Application \`${lastExecutedAppCmd}\` executed successfully.`;
+      } else if (lastFail) {
+        finalOutput = `Application failed to run. Command \`${lastFail.command}\` failed:\n${lastFail.error.slice(0, 400)}`;
+      } else {
+        finalOutput = `Application execution finished. Workspace files: ${rootListingText}.`;
+      }
     }
 
     // 6. Automated Verification: run real workspace tests / syntax checks without inventing fake commands
@@ -1605,7 +1768,7 @@ ${targetFilePrompt}`;
       workspaceRoot: this.workspaceRoot,
       agentId: this.config.id,
       agentName: this.config.name,
-      requireApproval: pmMode === 'bypass' ? false : true,
+      requireApproval: pmMode === 'bypass' || pmMode === 'smart' ? false : true,
       requestApproval,
     };
 

@@ -1772,6 +1772,10 @@ describe('Event Streaming, Thinking Filter, Command Cards & Cockpit UI (12 Scena
       assert.strictEqual(classifyUserPrompt(runPrompt, 'code'), 'execute_task', `Expected execute_task for "${runPrompt}"`);
     }
     assert.strictEqual(classifyUserPrompt('how do I run clock.py?', 'code'), 'question');
+    assert.strictEqual(classifyUserPrompt('how to run the clock by command', 'code'), 'question');
+    assert.strictEqual(classifyUserPrompt('how do I run the clock', 'code'), 'question');
+    assert.strictEqual(classifyUserPrompt('what command to run the clock', 'code'), 'question');
+    assert.strictEqual(classifyUserPrompt('which command runs the app', 'code'), 'question');
     assert.strictEqual(classifyUserPrompt('Build an UI for the clock then run the clock', 'code'), 'coding_task');
     assert.strictEqual(classifyUserPrompt('Fix clock.py and run tests', 'code'), 'coding_task');
 
@@ -2190,6 +2194,351 @@ describe('Event Streaming, Thinking Filter, Command Cards & Cockpit UI (12 Scena
       const launches = fs.readFileSync(markerLog, 'utf8').trim().split(/\r?\n/).filter(Boolean);
       assert.strictEqual(launches.length, 1, 'Application must launch only ONCE even if LLM tries reopening after close');
       assert.ok(llmTurns <= 2, `Should stop immediately on duplicate launch attempt (turns=${llmTurns})`);
+    } finally {
+      vscode.workspace.workspaceFolders = origFolders;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('38. Smart Approval auto-approves safe workspace write_file/run_command without hanging, while Ask mode preserves approval cards across renderFullConversation', async () => {
+    const vscode = require('vscode');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-smart-appr-'));
+    const origFolders = vscode.workspace.workspaceFolders;
+    vscode.workspace.workspaceFolders = [{ uri: { fsPath: tmpDir } }];
+    try {
+      const { PermissionManager } = require('../extensions/localcoders-core/dist/security/permission-manager');
+      const pm = new PermissionManager(tmpDir);
+      pm.setMode('smart');
+      const toolManager = new ToolManager(undefined, pm);
+      const registry = makeRegistry(makeMockContext(tmpDir));
+
+      let llmCall = 0;
+      const mockLlm = {
+        getHost: () => 'http://localhost:11434',
+        chatStream: async (params, onChunk) => {
+          const sys = String(params.messages[0]?.content || '');
+          if (/CRITICAL PLANNING INSTRUCTIONS/i.test(sys)) {
+            onChunk({
+              content: JSON.stringify({
+                tasks: [
+                  {
+                    id: 'task-1',
+                    title: 'Implement Clock Logic in C++',
+                    description: 'Create clock.h',
+                    assignedTo: 'main',
+                    dependencies: [],
+                    affectedFiles: ['clock.h'],
+                  },
+                ],
+              }),
+              done: true,
+            });
+            return;
+          }
+          llmCall++;
+          if (llmCall === 1) {
+            onChunk({
+              content: '',
+              toolCalls: [
+                {
+                  function: {
+                    name: 'write_file',
+                    arguments: { path: 'clock.h', content: '#pragma once\nclass Clock {};\n' },
+                  },
+                },
+              ],
+              done: true,
+            });
+          } else {
+            onChunk({ content: 'Created clock.h successfully.', done: true });
+          }
+        },
+      };
+
+      const orchestrator = new AgentOrchestrator(mockLlm, registry, toolManager, tmpDir);
+      let approvalEmittedInSmart = false;
+      orchestrator.onApproval(() => {
+        approvalEmittedInSmart = true;
+      });
+
+      const task = await orchestrator.submitTask('Build a clock using C++', {
+        providerId: 'ollama',
+        modelId: 'mock-model',
+        modelName: 'mock-model',
+        reasoningEffort: 'none',
+        fastMode: false,
+        executionMode: 'code',
+        permissionMode: 'smart',
+        enabledMcpServers: [],
+        enabledSkills: [],
+        activeRules: [],
+        attachedFiles: [],
+        projectContext: [],
+      });
+
+      assert.strictEqual(approvalEmittedInSmart, false, 'Smart Approval must not block safe workspace write_file on approval');
+      assert.strictEqual(task.status, 'completed');
+      assert.strictEqual(fs.existsSync(path.join(tmpDir, 'clock.h')), true, 'clock.h must be written to disk in Smart Approval mode');
+
+      // Also verify that when an approval request IS emitted (e.g. in Ask mode or destructive tool),
+      // subsequent loadSession / streamStatus / renderFullConversation calls do NOT wipe out the approval card in the webview!
+      const { AgentWorkspaceEditorPanel } = require('../extensions/localcoders-core/dist/views/agent-workspace-editor');
+      const html = AgentWorkspaceEditorPanel.prototype._getHtmlForWebview.call({
+        _panel: { webview: { cspSource: 'vscode-webview:' } },
+      });
+      const scriptMatch = html.match(/<script>([\s\S]*)<\/script>/);
+      const elements = new Map();
+      const makeEl = (id) => {
+        const listeners = {};
+        const children = [];
+        const attrs = {};
+        const el = {
+          id,
+          value: '',
+          placeholder: '',
+          textContent: '',
+          _innerHTML: '',
+          style: {},
+          dataset: {},
+          children,
+          scrollTop: 0,
+          scrollHeight: 500,
+          clientHeight: 400,
+          classList: {
+            _s: new Set(),
+            add(c) { this._s.add(c); },
+            remove(c) { this._s.delete(c); },
+            toggle(c, f) { (f === undefined ? !this._s.has(c) : f) ? this._s.add(c) : this._s.delete(c); },
+            contains(c) { return this._s.has(c); },
+          },
+          setAttribute(k, v) { attrs[k] = String(v); },
+          getAttribute(k) { return attrs[k] ?? null; },
+          addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
+          dispatch(ev, arg) { (listeners[ev] || []).forEach((fn) => fn(arg)); },
+          appendChild(c) { children.push(c); if (c && c.id) elements.set(c.id, c); return c; },
+          insertBefore(c) { children.unshift(c); return c; },
+          remove() { if (el.id) elements.delete(el.id); },
+          querySelectorAll() { return []; },
+          querySelector() { return null; },
+          closest() { return null; },
+          focus() {},
+          select() {},
+          getBoundingClientRect() { return { top: 0, left: 0, right: 0, bottom: 0, width: 100, height: 30 }; },
+        };
+        Object.defineProperty(el, 'className', {
+          get() { return Array.from(el.classList._s).join(' '); },
+          set(v) { el.classList._s = new Set(String(v || '').split(/\s+/).filter(Boolean)); },
+        });
+        Object.defineProperty(el, 'innerHTML', {
+          get() { return el._innerHTML || ''; },
+          set(v) { el._innerHTML = String(v); if (v === '') children.length = 0; },
+        });
+        return el;
+      };
+      const winListeners = {};
+      const sandbox = {
+        console, setTimeout, clearTimeout, Set, Map, Array, Object, String, Number, Math, JSON, RegExp, Date, Promise, Error,
+        acquireVsCodeApi: () => ({ postMessage: () => {}, getState: () => ({}), setState: () => {} }),
+        window: { addEventListener: (ev, fn) => (winListeners[ev] = winListeners[ev] || []).push(fn), getSelection: () => '', innerWidth: 1280, innerHeight: 820 },
+        document: {
+          getElementById(id) { if (!elements.has(id)) elements.set(id, makeEl(id)); return elements.get(id); },
+          querySelectorAll() { return []; },
+          querySelector() { return null; },
+          createElement(tag) { return makeEl('_' + tag); },
+          addEventListener() {},
+        },
+      };
+      vm.runInNewContext(scriptMatch[1], sandbox);
+      const dispatch = (data) => (winListeners.message || []).forEach((fn) => fn({ data }));
+
+      dispatch({
+        type: 'loadSession',
+        session: {
+          id: 'sess_appr',
+          title: 'Build a clock using C++',
+          status: 'running',
+          messages: [{ id: 'u1', senderRole: 'user', senderName: 'You', content: 'Build a clock', timestamp: 1000 }],
+          plan: [],
+          activities: [],
+        },
+        allSessions: [],
+        allModels: [],
+        modelsGrouped: { local: [], cloud: [], providers: [] },
+        currentConfig: { executionMode: 'code', permissionMode: 'ask', attachedFiles: [] },
+        permissionMode: 'ask',
+      });
+
+      dispatch({
+        type: 'approvalRequest',
+        request: {
+          id: 'appr_test_1',
+          toolCallId: 'call_1',
+          agentId: 'main',
+          agentName: 'Main Agent',
+          tool: 'write_file',
+          args: { path: 'clock.h' },
+          description: "Create new file 'clock.h'",
+          isDestructive: false,
+          filePath: 'clock.h',
+        },
+      });
+
+      // Simulate subsequent streamStatus & loadSession that trigger renderFullConversation() (conversationFlow.innerHTML = '')
+      dispatch({
+        type: 'streamStatus',
+        event: { id: 'st1', runId: 'r1', phase: 'waiting_tool', summary: 'Write File: clock.h', timestamp: 1005 },
+      });
+      dispatch({
+        type: 'loadSession',
+        session: {
+          id: 'sess_appr',
+          title: 'Build a clock using C++',
+          status: 'running',
+          messages: [{ id: 'u1', senderRole: 'user', senderName: 'You', content: 'Build a clock', timestamp: 1000 }],
+          plan: [],
+          activities: [],
+        },
+        allSessions: [],
+        allModels: [],
+        modelsGrouped: { local: [], cloud: [], providers: [] },
+        currentConfig: { executionMode: 'code', permissionMode: 'ask', attachedFiles: [] },
+        permissionMode: 'ask',
+      });
+
+      const flowEl = elements.get('conversationFlow');
+      const hasApprovalCard = flowEl.children.some((c) => c.id === 'approvalCard_appr_test_1');
+      assert.strictEqual(hasApprovalCard, true, 'Approval card must survive renderFullConversation / loadSession reloads');
+
+      // Resolving approval removes it cleanly
+      dispatch({ type: 'approvalResolved', requestId: 'appr_test_1', approved: true });
+      dispatch({
+        type: 'streamStatus',
+        event: { id: 'st2', runId: 'r1', phase: 'working', summary: 'Working', timestamp: 1010 },
+      });
+      assert.strictEqual(
+        flowEl.children.some((c) => c.id === 'approvalCard_appr_test_1'),
+        false,
+        'Resolved approval card must be removed after approvalResolved'
+      );
+    } finally {
+      vscode.workspace.workspaceFolders = origFolders;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('37. C++ project context detection & execute-only failure reporting prevents premature aborts and misleading output', async () => {
+    const { detectWorkspaceProjectType } = require('../extensions/localcoders-core/dist/agents/main-agent');
+    const { createTurnProgressGuard } = require('../extensions/localcoders-core/dist/agents/tool-runner');
+
+    const vscode = require('vscode');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-cpp-37-'));
+    const origFolders = vscode.workspace.workspaceFolders;
+    vscode.workspace.workspaceFolders = [{ uri: { fsPath: tmpDir } }];
+    try {
+      // 1. Setup C++ workspace mimicking user environment (CMakeLists.txt, main.cpp, clock.cpp, clock.h)
+      fs.writeFileSync(path.join(tmpDir, 'CMakeLists.txt'), 'project(Clock)\nadd_executable(Clock main.cpp clock.cpp)\n', 'utf8');
+      fs.writeFileSync(path.join(tmpDir, 'main.cpp'), '#include "clock.h"\nint main() { return 0; }\n', 'utf8');
+      fs.writeFileSync(path.join(tmpDir, 'clock.cpp'), '#include "clock.h"\n', 'utf8');
+      fs.writeFileSync(path.join(tmpDir, 'clock.h'), '#pragma once\n', 'utf8');
+
+      const details = detectWorkspaceProjectType(tmpDir);
+      assert.strictEqual(details.primaryLanguage, 'cpp');
+      assert.strictEqual(details.buildSystem, 'cmake');
+      assert.ok(details.guidanceText.includes('WORKSPACE PROJECT TYPE: C/C++'));
+      assert.ok(details.guidanceText.includes('NEVER call \'python3\' on .cpp files'));
+      assert.ok(details.guidanceText.includes('cmake -B build && cmake --build build'));
+
+      // 2. Turn progress guard in execute-only mode
+      const launchedApps = new Set();
+      const guard = createTurnProgressGuard({ isExecuteOnly: true, launchedApps });
+
+      // Simulate a failed command (e.g. attempting to run uncompiled binary or mistaken command)
+      const outcome = guard.recordOutcome(
+        'run_command',
+        { command: 'python3 main.cpp' },
+        { success: false, error: 'SyntaxError in main.cpp', output: { exitCode: 1, stderr: 'SyntaxError' } }
+      );
+      assert.strictEqual(outcome.madeProgress, false);
+      const failInfo = guard.getLastCommandFailure();
+      assert.ok(failInfo);
+      assert.strictEqual(failInfo.command, 'python3 main.cpp');
+      assert.ok(failInfo.error.includes('SyntaxError'));
+
+      // Read-only inspection (list_directory) does not burn stuck turns in execute-only mode
+      const shouldStopAfterReadOnly = guard.shouldStopTurn({
+        skippedAll: false,
+        turnMadeProgress: false,
+        executedReadOnly: true,
+      });
+      assert.strictEqual(shouldStopAfterReadOnly, false, 'Read-only inspection must not stop execute-only turns');
+
+      // Duplicate retry of failed command returns execute-only specific guidance (not "write_file")
+      const checkDup = guard.checkBeforeCall('run_command', { command: 'python3 main.cpp' });
+      assert.strictEqual(checkDup.skip, true);
+      assert.ok(checkDup.cachedResultJson.includes('read_file/list_directory or compile/run'));
+      assert.ok(!checkDup.cachedResultJson.includes('fix the failing file with read_file + write_file'));
+
+      // 3. Orchestrator execution with execute-only failure reporting
+      const { PermissionManager } = require('../extensions/localcoders-core/dist/security/permission-manager');
+      const pm = new PermissionManager(tmpDir);
+      pm.setMode('bypass');
+      const toolManager = new ToolManager(undefined, pm);
+      const registry = makeRegistry(makeMockContext(tmpDir));
+
+      let promptSeenByLlm = '';
+      const mockLlm = {
+        chatStream: async (req, onChunk) => {
+          promptSeenByLlm = req.messages.map((m) => m.content).join('\n');
+          // Model invokes run_command on cmake, which fails (simulating build error in broken C++ code)
+          const lastMsg = req.messages[req.messages.length - 1];
+          if (lastMsg.role === 'user' && !lastMsg.content.includes('[Tool Result')) {
+            onChunk({
+              content: '<tool_call>{"name":"run_command","arguments":{"command":"cmake -B build"}}</tool_call>',
+              done: true,
+            });
+          } else {
+            onChunk({ content: 'Build failed as expected.', done: true });
+          }
+        },
+      };
+
+      const orchestrator = new AgentOrchestrator(mockLlm, registry, toolManager, tmpDir);
+      let finalMessageContent = '';
+      orchestrator.onMessage((m) => {
+        if (m.id.startsWith('msg_final_')) finalMessageContent = m.content;
+      });
+
+      const task = await orchestrator.submitTask(
+        'run the clock',
+        {
+          providerId: 'ollama',
+          modelId: 'qwen2.5-coder:7b',
+          modelName: 'qwen2.5-coder:7b',
+          reasoningEffort: 'medium',
+          fastMode: false,
+          executionMode: 'code',
+          permissionMode: 'bypass',
+          enabledMcpServers: [],
+          enabledSkills: [],
+          activeRules: [],
+          attachedFiles: [],
+          projectContext: [],
+        }
+      );
+
+      // LLM prompt MUST include C/C++ project guidance so it does not blindly run python3 main.py
+      assert.ok(promptSeenByLlm.includes('WORKSPACE PROJECT TYPE: C/C++'), 'Prompt must inform LLM about C/C++ project');
+      assert.ok(promptSeenByLlm.includes('NEVER call \'python3\' on .cpp files'), 'Prompt must prohibit python3 on cpp files');
+
+      // Final message and task output must NOT say "Stopped task after repeated unchanged/blocked operations (no file changes)."
+      assert.ok(
+        !finalMessageContent.includes('Stopped task after repeated unchanged/blocked operations (no file changes).'),
+        'Must never show cryptic unchanged/blocked operations error in execute-only mode'
+      );
+      assert.ok(
+        !String(task.error || '').includes('Stopped task after repeated unchanged/blocked operations (no file changes).'),
+        'Task error must never be unchanged/blocked operations in execute-only mode'
+      );
     } finally {
       vscode.workspace.workspaceFolders = origFolders;
       fs.rmSync(tmpDir, { recursive: true, force: true });

@@ -53,6 +53,7 @@ export class CriticAgent {
     verificationSummary?: string;
     runId?: string;
     round?: number;
+    timeoutMs?: number;
     onStreamEvent?: (ev: AgentStreamEvent) => void;
     onProgress?: (status: string) => void;
     abortSignal?: AbortSignal;
@@ -111,12 +112,13 @@ AUDIT CATEGORIES TO EVALUATE:
 9. Violations of user requirements or project conventions
 
 RULES:
+- Be direct, concise, and structured. Do NOT output long stream-of-consciousness essays.
 - Never invent problems. Every finding MUST cite verifiable evidence in the diff, source files, or test output.
-- If automated verification failed or a file contains syntax errors/corrupted JSON/wrong code, ALWAYS return "blocker" or "changes_requested" with exact file and recommendedFix.
+- If automated verification failed or a file contains syntax errors/corrupted code/missing classes, ALWAYS return "blocker" or "changes_requested" with exact file and recommendedFix.
 - Assign "Critical" or "High" severity ONLY to real defects: failing tests, syntax/import/runtime errors, security vulnerabilities, race conditions, or clearly unmet user requirements.
-- Classify stylistic preferences, naming choices, or optional cleanup (e.g. redundant helper methods when tests pass) strictly as "Low" or "Informational" — NEVER mark working code with "Critical" or "blocker" over optional refactoring.
+- Classify stylistic preferences, naming choices, or optional cleanup strictly as "Low" or "Informational" — NEVER mark working code with "Critical" or "blocker" over optional refactoring.
 - Do not block completion when automated verification passed (Exit code: 0) and there are no real runtime, security, or requirement defects.
-- If the implementation and verification are completely solid and free of defects, return an empty findings list and "verdict": "approved".
+- If the implementation and verification are solid and free of defects, return an empty findings list and "verdict": "approved".
 
 OUTPUT FORMAT:
 Respond with a STRICT JSON block in this exact structure:
@@ -147,12 +149,12 @@ ${params.userRequirements}
 
 PROJECT RULES & CONVENTIONS:
 ${rulesText}
-${params.verificationSummary ? `\nRECENT TEST / VERIFICATION OUTPUT:\n${params.verificationSummary.slice(0, 6000)}\n` : ''}
+${params.verificationSummary ? `\nRECENT TEST / VERIFICATION OUTPUT:\n${params.verificationSummary.slice(0, 4000)}\n` : ''}
 DIFF OF CHANGES:
-${ctx.diffText.slice(0, 12000)}
+${ctx.diffText.slice(0, 8000)}
 ${ctx.fileSnapshotsText ? `\nCURRENT WORKSPACE FILE CONTENTS ON DISK:\n${ctx.fileSnapshotsText}` : ''}
 
-Please audit the implementation thoroughly according to your review strictness and return valid JSON.`;
+Please audit the implementation thoroughly and output valid JSON.`;
 
     let responseContent = '';
     let responseThinking = '';
@@ -165,6 +167,27 @@ Please audit the implementation thoroughly according to your review strictness a
       stepKey: `r${params.round || 1}`,
       onStreamEvent: params.onStreamEvent,
     });
+
+    // Hard timeout watchdog: prevent Critic from hanging indefinitely on slow CPU offloads or reasoning loops
+    const timeoutMs = Math.max(50, params.timeoutMs ?? 120_000);
+    const internalController = new AbortController();
+    let timedOut = false;
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      internalController.abort(new Error(`Critic review timed out after ${Math.round(timeoutMs / 1000)}s`));
+    }, timeoutMs);
+
+    const onExternalAbort = () => {
+      internalController.abort(params.abortSignal?.reason || new Error('Critic review aborted by user'));
+    };
+    if (params.abortSignal) {
+      if (params.abortSignal.aborted) {
+        clearTimeout(timeoutTimer);
+        throw new Error('Critic review aborted by user');
+      }
+      params.abortSignal.addEventListener('abort', onExternalAbort, { once: true });
+    }
+
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
         responseContent = '';
@@ -178,17 +201,19 @@ Please audit the implementation thoroughly according to your review strictness a
                 { role: 'user', content: userPrompt },
               ],
               temperature: 0.15,
+              maxOutputTokens: 2048,
             },
             (chunk) => {
               responseContent += chunk.content;
               if (chunk.thinking) responseThinking += chunk.thinking;
               criticThought.updateFromStream(responseContent, responseThinking);
             },
-            params.abortSignal
+            internalController.signal
           );
           break;
         } catch (innerErr: any) {
           if (params.abortSignal?.aborted) throw innerErr;
+          if (timedOut) break; // Break out so partial reasoning stream can be extracted
           const transient = /llama-server process no longer running|unexpected EOF|ECONNRESET|socket hang up/i.test(
             String(innerErr?.message || '')
           );
@@ -203,14 +228,56 @@ Please audit the implementation thoroughly according to your review strictness a
         }
       }
     } catch (err: any) {
-      criticThought.finalize(responseContent, responseThinking, `Critic review halted: ${err?.message || 'error'}`);
       if (params.abortSignal?.aborted || /cancelled/i.test(err?.message || '')) {
+        criticThought.finalize(responseContent, responseThinking, `Critic review cancelled: ${err?.message || 'aborted'}`);
         throw err;
       }
-      console.warn(`[CriticAgent] Audit with '${effectiveModel}' encountered error:`, err.message);
-      if (params.onProgress) {
-        params.onProgress(`[Critic Agent] Model '${effectiveModel}' error: ${err.message}`);
+      if (!timedOut) {
+        criticThought.finalize(responseContent, responseThinking, `Critic review halted: ${err?.message || 'error'}`);
+        console.warn(`[CriticAgent] Audit with '${effectiveModel}' encountered error:`, err.message);
+        if (params.onProgress) {
+          params.onProgress(`[Critic Agent] Model '${effectiveModel}' error: ${err.message}`);
+        }
+        return {
+          id: reportId,
+          timestamp,
+          targetCommit: params.targetCommit,
+          filesReviewed: ctx.filesReviewed,
+          verdict: 'changes_requested',
+          findings: [
+            {
+              id: 'critic-exec-err',
+              severity: 'High',
+              category: 'Critic execution',
+              filePath: 'workspace',
+              evidence: err.message || 'Unknown Critic model execution error',
+              explanation: `Critic model '${effectiveModel}' failed to complete automated review: ${err.message}`,
+              reproduction: `Invoke CriticAgent.review() with model '${effectiveModel}'`,
+              recommendedFix: `Verify that Critic model '${effectiveModel}' is installed/running cleanly in Agents settings.`,
+              confidence: 'Confirmed',
+              resolved: false,
+            },
+          ],
+          summary: `Critic model error (${effectiveModel}): ${err.message}`,
+        };
       }
+    } finally {
+      clearTimeout(timeoutTimer);
+      if (params.abortSignal) {
+        params.abortSignal.removeEventListener('abort', onExternalAbort);
+      }
+    }
+
+    if (timedOut && params.onProgress) {
+      params.onProgress(`[Critic Agent] Review reached ${Math.round(timeoutMs / 1000)}s limit; extracting findings from streamed reasoning...`);
+    }
+
+    const parsed = this.parseCriticResponse(responseContent, responseThinking);
+
+    // If review timed out and model produced zero findings, generate a non-blocking timeout report
+    if (timedOut && parsed.findings.length === 0) {
+      const timeoutSummary = `Critic review timed out after ${Math.round(timeoutMs / 1000)}s on '${effectiveModel}'.`;
+      criticThought.finalize(responseContent, responseThinking, timeoutSummary);
       return {
         id: reportId,
         timestamp,
@@ -219,27 +286,28 @@ Please audit the implementation thoroughly according to your review strictness a
         verdict: 'changes_requested',
         findings: [
           {
-            id: 'critic-exec-err',
-            severity: 'High',
+            id: 'critic-timeout',
+            severity: 'Medium',
             category: 'Critic execution',
-            filePath: 'workspace',
-            evidence: err.message || 'Unknown Critic model execution error',
-            explanation: `Critic model '${effectiveModel}' failed to complete automated review: ${err.message}`,
-            reproduction: `Invoke CriticAgent.review() with model '${effectiveModel}'`,
-            recommendedFix: `Verify that Critic model '${effectiveModel}' is installed/running cleanly in Agents settings.`,
-            confidence: 'Confirmed',
+            filePath: ctx.filesReviewed[0] || 'workspace',
+            evidence: `Critic model '${effectiveModel}' ran for ${Math.round(timeoutMs / 1000)}s without finalizing findings.`,
+            explanation: `Critic review exceeded the ${Math.round(timeoutMs / 1000)}s timeout on model '${effectiveModel}'.`,
+            reproduction: 'Check workspace changes and verify tests manually.',
+            recommendedFix: `Consider using a smaller or faster model for Critic Agent (e.g. qwen2.5-coder:7b) if using CPU offload.`,
+            confidence: 'Likely',
             resolved: false,
           },
         ],
-        summary: `Critic model error (${effectiveModel}): ${err.message}`,
+        summary: timeoutSummary,
       };
     }
 
-    const parsed = this.parseCriticResponse(responseContent);
     criticThought.finalize(
       responseContent,
       responseThinking,
-      `Audited ${ctx.filesReviewed.join(', ') || 'workspace changes'} -> ${parsed.verdict.toUpperCase()}: ${parsed.summary}`
+      timedOut
+        ? `Audited ${ctx.filesReviewed.join(', ') || 'workspace changes'} (timed out after ${Math.round(timeoutMs / 1000)}s) -> ${parsed.verdict.toUpperCase()}: ${parsed.summary}`
+        : `Audited ${ctx.filesReviewed.join(', ') || 'workspace changes'} -> ${parsed.verdict.toUpperCase()}: ${parsed.summary}`
     );
     return {
       id: reportId,
@@ -308,7 +376,7 @@ Please audit the implementation thoroughly according to your review strictness a
         const chunk = computed.diffText || `--- ${tc.filePath}\n(modified)`;
         parts.push(chunk);
         total += chunk.length;
-        if (total > 12000) break;
+        if (total > 8000) break;
       }
       diffText = parts.join('\n\n');
     } else if (filesReviewed.length > 0) {
@@ -316,7 +384,7 @@ Please audit the implementation thoroughly according to your review strictness a
     }
 
     let fileSnapshotsText = '';
-    let snapshotBudget = 16000;
+    let snapshotBudget = 8000;
     const rootResolved = path.resolve(this.workspaceRoot || '');
     if (this.workspaceRoot && fs.existsSync(rootResolved)) {
       const blocks: string[] = [];
@@ -327,10 +395,10 @@ Please audit the implementation thoroughly according to your review strictness a
         try {
           if (!fs.existsSync(abs) || fs.statSync(abs).isDirectory()) continue;
           const content = fs.readFileSync(abs, 'utf8');
-          const snippet = content.length > 3500 ? content.slice(0, 3500) + '\n... [truncated]' : content;
+          const snippet = content.length > 2500 ? content.slice(0, 2500) + '\n... [truncated]' : content;
           const numbered = snippet
             .split('\n')
-            .slice(0, 140)
+            .slice(0, 80)
             .map((line, i) => `${i + 1}: ${line}`)
             .join('\n');
           const entry = `=== FILE: ${rel} ===\n${numbered}`;
@@ -393,7 +461,7 @@ Please audit the implementation thoroughly according to your review strictness a
     return found;
   }
 
-  private parseCriticResponse(text: string): {
+  parseCriticResponse(text: string, rawThinking?: string): {
     verdict: 'approved' | 'changes_requested' | 'blocker';
     summary: string;
     findings: CriticFinding[];
@@ -457,16 +525,33 @@ Please audit the implementation thoroughly according to your review strictness a
       return { verdict, summary, findings };
     } catch (e) {
       console.warn('[CriticAgent] Failed to parse JSON response from model, extracting fallback findings:', e);
+
+      // Check both responseContent AND rawThinking (including unclosed <think> content)
+      const allText =
+        rawThinking && !text.includes(rawThinking)
+          ? `${text}\n\n${rawThinking}`
+          : text || rawThinking || '';
+
+      // 1. Try extracting structured markdown bullet findings (e.g. **CRITICAL**: ..., [Critical] ..., etc.)
+      const extracted = this.extractMarkdownFindings(allText);
+      if (extracted.length > 0) {
+        const hasCritical = extracted.some((f) => f.severity === 'Critical');
+        const verdict: 'blocker' | 'changes_requested' = hasCritical ? 'blocker' : 'changes_requested';
+        const summary = `Found ${extracted.length} issue(s) in Critic analysis: ${extracted.map((f) => f.explanation).slice(0, 2).join('; ')}`;
+        return { verdict, summary, findings: extracted };
+      }
+
+      // 2. Unstructured error prose detection
       const explicitlyClean = /\b(no\s+(?:issues|defects|bugs|errors|problems)|0\s+(?:issues|defects|errors)|task completed successfully|all clear|looks good)\b/i.test(
-        cleaned
+        allText
       );
       const reportsError =
         !explicitlyClean &&
         /\b(syntaxerror|traceback|exception|typeerror|nameerror|referenceerror|blocker|critical|defect|bug\b|broken|fails?\b|failing|missing\b|not working|unterminated)\b/i.test(
-          cleaned
+          allText
         );
-      if (reportsError && cleaned.length > 0) {
-        const excerpt = cleaned.slice(0, 500);
+      if (reportsError && allText.length > 0) {
+        const excerpt = allText.slice(0, 500);
         return {
           verdict: 'changes_requested',
           summary: 'Critic reported defects (unstructured output) requiring Main Agent attention.',
@@ -492,6 +577,75 @@ Please audit the implementation thoroughly according to your review strictness a
         findings: [],
       };
     }
+  }
+
+  extractMarkdownFindings(allText: string): CriticFinding[] {
+    const findings: CriticFinding[] = [];
+    if (!allText) return findings;
+
+    const seen = new Set<string>();
+    const findingPattern = /(?:^|\n)(?:\s*[-*]\s*)?(?:\*\*|\#\#?\s*|\[)?\s*(CRITICAL|HIGH|MEDIUM|LOW|INFORMATIONAL)\b(?:\*\*|\])?\s*[:\-–]\s*([^\n]+(?:\n(?!\s*(?:[-*]\s*)?(?:\*\*|\#\#?\s*|\[)?\s*(?:CRITICAL|HIGH|MEDIUM|LOW|INFORMATIONAL)\b)[^\n]+)*)/gi;
+
+    let match: RegExpExecArray | null;
+    while ((match = findingPattern.exec(allText)) !== null) {
+      const sev = this.normalizeSeverity(match[1]);
+      const rawBody = (match[2] || '').trim();
+      if (!rawBody || rawBody.length < 5) continue;
+
+      // Extract referenced file path and line number if present
+      let filePath = 'workspace';
+      let lineRange: string | undefined = undefined;
+      const fileMatch = rawBody.match(/['"`]?([a-zA-Z0-9_\-./\\]+\.(?:[a-zA-Z0-9_-]+))['"`]?(?::(\d+(?:-\d+)?))?/);
+      if (fileMatch) {
+        filePath = fileMatch[1];
+        lineRange = fileMatch[2];
+      }
+
+      const dedupeKey = `${sev}|${filePath}|${rawBody.slice(0, 100)}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+
+      // Infer category
+      let category = 'Logical correctness';
+      if (/syntax|compil|undefined|symbol|header|import|typeerror|nameerror/i.test(rawBody)) {
+        category = 'Logical correctness & compilation';
+      } else if (/test|verification|gtest|assert/i.test(rawBody)) {
+        category = 'Missing or failing unit/regression tests';
+      } else if (/secur|vuln|injection|secret|auth|bypass/i.test(rawBody)) {
+        category = 'Security vulnerabilities';
+      } else if (/leak|unclosed|handle|memory/i.test(rawBody)) {
+        category = 'Memory leaks and unclosed resource handles';
+      } else if (/race|concurr|deadlock|thread/i.test(rawBody)) {
+        category = 'Race conditions, concurrency issues, deadlocks';
+      } else if (/requirement|user requirement|convention/i.test(rawBody)) {
+        category = 'Violations of user requirements or project conventions';
+      }
+
+      // Extract recommended fix if mentioned
+      let recommendedFix = rawBody;
+      const fixMatch = rawBody.match(/(?:fix|solution|resolution|recommend(?:ed)?(?:\s+fix)?):\s*(.+)$/i);
+      if (fixMatch) {
+        recommendedFix = fixMatch[1].trim();
+      }
+
+      findings.push({
+        id: `find-extracted-${findings.length + 1}`,
+        severity: sev,
+        category,
+        filePath,
+        lineRange,
+        evidence: rawBody.slice(0, 500),
+        explanation: rawBody,
+        reproduction: `Inspect ${filePath}${lineRange ? ':' + lineRange : ''}`,
+        recommendedFix,
+        confidence: 'Confirmed',
+        resolved: false,
+      });
+
+      if (findings.length >= 10) break;
+    }
+
+    return findings;
   }
 
   private normalizeSeverity(sev: string): FindingSeverity {

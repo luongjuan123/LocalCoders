@@ -188,4 +188,88 @@ Here is my independent audit:
       'Missing/broken Critic model should not loop Main Agent'
     );
   });
+
+  it('should extract structured markdown findings from raw thinking streams and unclosed <think> blocks', () => {
+    const rawThinking = `
+Let me focus on the critical issues:
+
+**CRITICAL**: 'main.cpp' references 'ClockUI' class which doesn't exist anywhere in the codebase. This is a compilation error.
+
+**CRITICAL**: 'clock_tests.cpp' references 'ClockUI' class with methods 'update_time()' and 'get_time()' which don't exist. This is a compilation error.
+
+**CRITICAL**: Test verification FAILED - gtest not found, compilation error.
+
+**HIGH**: CMakeLists.txt doesn't include 'main.cpp' in the executable target, so even if 'ClockUI' existed, the app wouldn't build correctly.
+
+**MEDIUM**: Timing feature lacks bounds checking.
+`;
+
+    // Test extraction when output was stuck in <think> without JSON
+    const parsed = critic['parseCriticResponse']('<think>' + rawThinking, rawThinking);
+    assert.strictEqual(parsed.verdict, 'blocker');
+    assert.strictEqual(parsed.findings.length, 5);
+
+    const f1 = parsed.findings[0];
+    assert.strictEqual(f1.severity, 'Critical');
+    assert.strictEqual(f1.filePath, 'main.cpp');
+    assert.ok(f1.explanation.includes('ClockUI'));
+
+    const f2 = parsed.findings[1];
+    assert.strictEqual(f2.severity, 'Critical');
+    assert.strictEqual(f2.filePath, 'clock_tests.cpp');
+
+    const f4 = parsed.findings[3];
+    assert.strictEqual(f4.severity, 'High');
+    assert.strictEqual(f4.filePath, 'CMakeLists.txt');
+  });
+
+  it('should enforce hard timeout in review() and gracefully return extracted findings without hanging', async () => {
+    let streamAborted = false;
+    let receivedMaxTokens;
+
+    const timeoutCritic = new CriticAgent(
+      {
+        chatStream: async (req, onChunk, abortSignal) => {
+          receivedMaxTokens = req.maxOutputTokens;
+          onChunk({
+            content: '',
+            thinking: `**CRITICAL**: 'src/clock.ts' has unhandled exception in loop.\n**HIGH**: Missing validation in input.`,
+            done: false,
+          });
+
+          // Simulate slow LLM stuck generating
+          await new Promise((resolve, reject) => {
+            const timer = setTimeout(resolve, 5000);
+            if (abortSignal) {
+              abortSignal.addEventListener('abort', () => {
+                streamAborted = true;
+                clearTimeout(timer);
+                reject(new Error('Aborted by timeout watchdog'));
+              });
+            }
+          });
+        },
+      },
+      mockConfig,
+      { getProjectRules: async () => ({ rulesText: 'None' }) },
+      { executeTool: async () => ({ output: { diff: 'Mock diff' } }) },
+      '/mock/workspace'
+    );
+
+    const startTime = Date.now();
+    const report = await timeoutCritic.review({
+      userRequirements: 'Build clock',
+      changedFiles: ['src/clock.ts'],
+      timeoutMs: 80, // 80ms fast timeout for testing
+    });
+    const elapsed = Date.now() - startTime;
+
+    assert.ok(elapsed < 2000, `Expected fast timeout under 2s, but took ${elapsed}ms`);
+    assert.strictEqual(streamAborted, true, 'Stream should be cleanly aborted by timeout watchdog');
+    assert.strictEqual(receivedMaxTokens, 2048, 'Should cap maxOutputTokens to 2048');
+    assert.strictEqual(report.verdict, 'blocker', 'Should extract CRITICAL finding as blocker');
+    assert.strictEqual(report.findings.length, 2);
+    assert.strictEqual(report.findings[0].filePath, 'src/clock.ts');
+    assert.strictEqual(report.findings[0].severity, 'Critical');
+  });
 });

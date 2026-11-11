@@ -332,6 +332,12 @@ export class OllamaClient {
       } catch (err: any) {
         lastErr = err;
         const msg = String(err?.message || '');
+        const isThinkingUnsupported = /does not support thinking/i.test(msg);
+        if (attempt === 0 && !emittedChunk && isThinkingUnsupported && params.think !== undefined && !abortSignal?.aborted) {
+          console.warn(`[OllamaClient] Model '${params.model}' does not support thinking; retrying without think parameter...`);
+          params = { ...params, think: undefined };
+          continue;
+        }
         const isTransientCrash =
           /llama-server process no longer running|unexpected EOF|ECONNRESET|EPIPE|socket hang up|fetch failed/i.test(msg);
         if (attempt === 0 && !emittedChunk && isTransientCrash && !abortSignal?.aborted) {

@@ -1797,7 +1797,7 @@ ${targetFilePrompt}`;
         ...affectedFiles,
         ...(report.findings || []).map((f) => f.filePath).filter((p) => Boolean(p && p !== 'workspace')),
       ])
-    ).slice(0, 4);
+    ).slice(0, 10);
 
     const fileSnapshots: string[] = [];
     for (const rel of targetCandidates) {
@@ -1826,9 +1826,13 @@ ${verificationSummary ? `\nRECENT VERIFICATION OUTPUT:\n${verificationSummary}\n
 Currently affected files: ${affectedFiles.join(', ') || '(inspect workspace)'}
 ${fileSnapshots.length > 0 ? `\nACTUAL FILE CONTENTS ON DISK:\n${fileSnapshots.join('\n\n')}\n` : ''}
 INSTRUCTIONS:
-1. Fix EVERY defect reported above using exact substrings in 'edit_file' or complete corrected contents in 'write_file'.
-2. Ensure valid, complete source code — never write JSON tool payloads into source files, and never repeat an identical failing 'edit_file'.
-3. Run automated verification tests (unittest, pytest, py_compile, npm test) with 'run_command' ONLY AFTER saving edits. Do NOT launch interactive GUI applications.`;
+1. Fix EVERY defect reported above.
+2. RECOMMENDATION: Use 'write_file' with complete, clean, corrected file contents to write the fixes cleanly. This avoids syntax/indentation/target mismatch errors common with 'edit_file'.
+3. For C++:
+   - Ensure only ONE 'int main()' exists across the entire project (in main.cpp).
+   - Ensure all classes declared in headers (.h) are fully implemented with matching signatures in .cpp files.
+   - Ensure CMakeLists.txt and package.json targets are unique and valid. If external test libraries (e.g. gtest) are missing in the build environment, write self-contained tests using standard C++ <cassert> and <iostream>.
+4. Run automated tests with 'run_command' ONLY AFTER saving edits. Do NOT launch interactive GUI applications.`;
 
     const messages: any[] = [
       {
@@ -1847,7 +1851,7 @@ INSTRUCTIONS:
     });
     let turns = 0;
 
-    while (turns < 5) {
+    while (turns < 12) {
       turns++;
       if (abortSignal?.aborted) {
         throw new Error('Multi-agent execution cancelled by user.');
@@ -1905,7 +1909,7 @@ INSTRUCTIONS:
       }
 
       if (activeCalls.length === 0) {
-        const fallbackFiles = parseCodeBlocksFromContent(content, affectedFiles);
+        const fallbackFiles = parseCodeBlocksFromContent(content, targetCandidates);
         for (const ff of fallbackFiles) {
           activeCalls.push({ name: 'write_file', args: { path: ff.path, content: ff.content } });
         }
@@ -1920,7 +1924,17 @@ INSTRUCTIONS:
       );
 
       messages.push({ role: 'assistant', content, tool_calls: toolCalls && toolCalls.length > 0 ? toolCalls : undefined });
-      if (activeCalls.length === 0) break;
+      if (activeCalls.length === 0) {
+        if (turns <= 2 && modifiedFiles.length === 0) {
+          messages.push({
+            role: 'user',
+            content:
+              'You have not modified any files on disk yet. You MUST execute write_file or edit_file tools now to save your fixes to disk.',
+          });
+          continue;
+        }
+        break;
+      }
 
       let skippedAll = true;
       let turnMadeProgress = false;

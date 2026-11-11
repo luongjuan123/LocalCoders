@@ -4083,51 +4083,68 @@ export class AgentWorkspaceEditorPanel {
         isLatestTurn = true;
       }
 
-      const groupEl = lcFindChildByAttr(conversationFlow, 'data-turn-key', turnKey);
-      if (!groupEl) {
+      const feedEl = lcFindChildByAttr(conversationFlow, 'data-turn-feed', turnKey);
+      if (!feedEl) {
         renderFullConversation();
         return false;
       }
-
-      lcUpdateInlineThinkingGroupHeader(groupEl, {
-        activities: turnActs,
-        isLive: isLatestTurn && isWorking,
-        statusSummary: isLatestTurn ? liveStatusState.summary : '',
-      });
-
-      const drawer = groupEl.querySelector('.lc-thinking-drawer');
-      if (!drawer) {
-        renderFullConversation();
-        return false;
-      }
-
-      const emptyNote = drawer.querySelector('.lc-thinking-empty-note');
-      if (emptyNote) emptyNote.remove();
 
       const liveRow = document.getElementById('liveSafeStatusRow');
       if (liveRow && isLatestTurn && isWorking) liveRow.remove();
 
-      const existingNode = lcFindChildByAttr(drawer, 'data-act-id', item.id);
-      if (existingNode) {
-        if (item.category === 'thinking_summary') {
-          lcUpdateThoughtEntryElement(existingNode, item, {
-            isExpanded: expandedThoughtIds.has(item.id),
-          });
+      if (item.category === 'thinking_summary') {
+        let groupEl = lcFindChildByAttr(feedEl, 'data-turn-key', item.id);
+        if (!groupEl) {
+          // If there is an empty placeholder thinking group from turn init, remove it
+          const placeholder = lcFindChildByAttr(feedEl, 'data-turn-key', turnKey);
+          if (placeholder && !placeholder.querySelector('.lc-thought-entry')) {
+            placeholder.remove();
+          }
+          // Build and append new thinking group at the current chronological point in the feed
+          const isThoughtLive = isWorking && item.status === 'running';
+          const isExpanded = expandedTurnIds.has(item.id) || (expandedThoughtIds && expandedThoughtIds.has(item.id));
+          groupEl = lcBuildInlineThinkingGroup(Object.assign({
+            turnKey: item.id,
+            activities: [item],
+            planItems: [],
+            isLive: isThoughtLive,
+            isExpanded,
+            statusSummary: isThoughtLive ? (item.summary || liveStatusState.summary || '') : '',
+          }, thinkingGroupHandlers()));
+          feedEl.appendChild(groupEl);
         } else {
-          lcUpdateActivityCardElement(existingNode, item);
+          lcUpdateInlineThinkingGroupHeader(groupEl, {
+            activities: [item],
+            isLive: isWorking && item.status === 'running',
+            statusSummary: item.summary || (isWorking && item.status === 'running' ? liveStatusState.summary : '') || '',
+          });
+          const drawer = groupEl.querySelector('.lc-thinking-drawer');
+          if (drawer) {
+            const emptyNote = drawer.querySelector('.lc-thinking-empty-note');
+            if (emptyNote) emptyNote.remove();
+            const existingThought = lcFindChildByAttr(drawer, 'data-act-id', item.id);
+            if (existingThought) {
+              lcUpdateThoughtEntryElement(existingThought, item, {
+                isExpanded: expandedThoughtIds.has(item.id),
+              });
+            } else {
+              drawer.appendChild(lcBuildThoughtEntryElement(item, {
+                isExpanded: expandedThoughtIds.has(item.id),
+                onToggleExpand: thinkingGroupHandlers().onToggleExpandThought,
+              }));
+            }
+          }
         }
       } else {
-        const handlers = thinkingGroupHandlers();
-        if (item.category === 'thinking_summary') {
-          drawer.appendChild(lcBuildThoughtEntryElement(item, {
-            isExpanded: expandedThoughtIds.has(item.id),
-            onToggleExpand: handlers.onToggleExpandThought,
-          }));
+        // Visible work item -> top-level card in the chronological turn feed
+        const existingNode = lcFindChildByAttr(feedEl, 'data-act-id', item.id);
+        if (existingNode) {
+          lcUpdateActivityCardElement(existingNode, item);
         } else {
-          drawer.appendChild(lcBuildActivityCardElement(
+          feedEl.appendChild(lcBuildActivityCardElement(
             item,
             expandedActivityIds.has(item.id),
-            handlers.onToggleActivity
+            thinkingGroupHandlers().onToggleActivity
           ));
         }
       }
@@ -4204,8 +4221,112 @@ export class AgentWorkspaceEditorPanel {
 
       const displayMessages = getDisplayMessages();
       const turnGrouping = lcGroupActivitiesByUserTurn(displayMessages, currentActivities);
+      const msgGrouping = lcGroupMessagesByUserTurn(displayMessages);
       const handlers = thinkingGroupHandlers();
       let renderedLatestLiveBlock = false;
+
+      // Chronological per-step feed: respectively follows each step in the order it occurred:
+      // thought -> narration / convo -> task / tool execution -> next thought -> next task -> completion
+      const buildTurnFeed = (turnKey, msgIdx, turnActs, turnPlan, isLatestTurn) => {
+        const thoughtActs = (turnActs || []).filter((a) => a && a.category === 'thinking_summary');
+        const workActs = (turnActs || []).filter((a) => a && a.category !== 'thinking_summary');
+        const turnMsgs = (msgIdx >= 0 && msgGrouping && msgGrouping.byMsgIndex[msgIdx]) || [];
+        const isLive = isLatestTurn && isWorking;
+        const items = [];
+
+        workActs.forEach((a) => items.push({ ts: Number(a.startTime || a.timestamp || 0), kind: 'act', v: a }));
+        turnMsgs.forEach((m) => items.push({ ts: Number(m.timestamp || 0), kind: 'msg', v: m }));
+
+        const claimedMsgIds = new Set(turnMsgs.map((m) => m.id).filter(Boolean));
+        if (isLatestTurn) {
+          Object.keys(streamingMessages).forEach((mId) => {
+            if (claimedMsgIds.has(mId)) return;
+            const sm = streamingMessages[mId];
+            if (sm && sm.content) {
+              items.push({ ts: Number(sm.timestamp || 0), kind: 'stream', v: { id: mId, sm } });
+            }
+          });
+        }
+
+        let planAttached = false;
+        thoughtActs.forEach((th) => {
+          items.push({ ts: Number(th.startTime || th.timestamp || 0), kind: 'thought', v: th });
+        });
+
+        if (turnPlan && turnPlan.length > 0 && thoughtActs.length === 0) {
+          items.push({ ts: 0, kind: 'plan', v: turnPlan });
+          planAttached = true;
+        }
+
+        if (items.length === 0 && !isLive) return null;
+
+        // Stable chronological sort with priority tie-breaker (plan: 0, thought: 1, convo: 2, task: 3)
+        const kindRank = { plan: 0, thought: 1, stream: 2, msg: 2, act: 3 };
+        items.sort((a, b) => {
+          if (a.ts !== b.ts) return a.ts - b.ts;
+          const ra = kindRank[a.kind] !== undefined ? kindRank[a.kind] : 2;
+          const rb = kindRank[b.kind] !== undefined ? kindRank[b.kind] : 2;
+          return ra - rb;
+        });
+
+        const feed = document.createElement('div');
+        feed.className = 'lc-turn-feed';
+        feed.setAttribute('data-turn-feed', turnKey);
+
+        items.forEach((it) => {
+          if (it.kind === 'thought') {
+            const th = it.v;
+            const thPlan = !planAttached && turnPlan && turnPlan.length > 0 ? turnPlan : [];
+            if (thPlan.length > 0) planAttached = true;
+            const isThoughtLive = isLatestTurn && isWorking && th.status === 'running';
+            const isExpanded = expandedTurnIds.has(th.id) || (expandedThoughtIds && expandedThoughtIds.has(th.id));
+            if (isThoughtLive) renderedLatestLiveBlock = true;
+            feed.appendChild(lcBuildInlineThinkingGroup(Object.assign({
+              turnKey: th.id,
+              activities: [th],
+              planItems: thPlan,
+              isLive: isThoughtLive,
+              isExpanded,
+              statusSummary: isThoughtLive ? (th.summary || liveStatusState.summary || '') : '',
+            }, handlers)));
+          } else if (it.kind === 'plan') {
+            const planListEl = document.createElement('div');
+            planListEl.className = 'lc-plan-checklist-mini';
+            planListEl.style.borderBottom = 'none';
+            planListEl.style.padding = '4px 8px';
+            planListEl.innerHTML = lcBuildPlanMiniHtml(it.v);
+            feed.appendChild(planListEl);
+          } else if (it.kind === 'act') {
+            feed.appendChild(lcBuildActivityCardElement(
+              it.v,
+              expandedActivityIds.has(it.v.id),
+              handlers.onToggleActivity
+            ));
+          } else if (it.kind === 'msg') {
+            feed.appendChild(createAssistantCardElement(it.v));
+          } else {
+            feed.appendChild(createAssistantCardElement({
+              id: it.v.id,
+              senderName: it.v.sm.agentName || 'Main Agent',
+              senderRole: it.v.sm.senderRole || 'assistant',
+              content: it.v.sm.content,
+            }));
+          }
+        });
+
+        if (items.length === 0 && isLive) {
+          renderedLatestLiveBlock = true;
+          feed.appendChild(lcBuildInlineThinkingGroup(Object.assign({
+            turnKey,
+            activities: [],
+            planItems: turnPlan || [],
+            isLive: true,
+            isExpanded: false,
+            statusSummary: liveStatusState.summary || 'Working...',
+          }, handlers)));
+        }
+        return feed;
+      };
 
       const mergedCmdMap = new Map();
       (Array.isArray(currentCommandResults) ? currentCommandResults : []).forEach((cr) => {
@@ -4244,51 +4365,41 @@ export class AgentWorkspaceEditorPanel {
           const turnActs = turnGrouping.byMsgIndex[idx] || [];
           const isLatestTurn = idx === turnGrouping.lastTurnMsgIndex;
           const turnPlan = isLatestTurn && !planExplicit ? activePlan : [];
-          if (turnActs.length > 0 || (isLatestTurn && isWorking) || turnPlan.length > 0) {
-            if (isLatestTurn && isWorking) renderedLatestLiveBlock = true;
-            const turnKey = msg.id || ('turn_' + idx);
-            conversationFlow.appendChild(lcBuildInlineThinkingGroup(Object.assign({
-              turnKey,
-              activities: turnActs,
-              planItems: turnPlan,
-              isLive: isLatestTurn && isWorking,
-              isExpanded: expandedTurnIds.has(turnKey),
-              statusSummary: isLatestTurn ? liveStatusState.summary : '',
-            }, handlers)));
-          }
-        } else {
+          const turnKey = msg.id || ('turn_' + idx);
+          const feed = buildTurnFeed(turnKey, idx, turnActs, turnPlan, isLatestTurn);
+          if (feed) conversationFlow.appendChild(feed);
+        } else if (!msgGrouping.claimedIdx[idx]) {
           conversationFlow.appendChild(createAssistantCardElement(msg));
         }
       });
 
-      if (turnGrouping.lastTurnMsgIndex === -1 && (currentActivities.length > 0 || isWorking)) {
-        if (isWorking) renderedLatestLiveBlock = true;
-        conversationFlow.appendChild(lcBuildInlineThinkingGroup(Object.assign({
-          turnKey: 'turn_fallback',
-          activities: currentActivities,
-          planItems: !planExplicit ? activePlan : [],
-          isLive: isWorking,
-          isExpanded: expandedTurnIds.has('turn_fallback'),
-          statusSummary: liveStatusState.summary,
-        }, handlers)));
+      let fallbackFeedRendered = false;
+      if (turnGrouping.lastTurnMsgIndex === -1 && (currentActivities.length > 0 || isWorking || Object.keys(streamingMessages).length > 0)) {
+        const fallbackFeed = buildTurnFeed('turn_fallback', -1, currentActivities, !planExplicit ? activePlan : [], true);
+        if (fallbackFeed) {
+          conversationFlow.appendChild(fallbackFeed);
+          fallbackFeedRendered = true;
+        }
       }
 
       while (nextCmdIdx < allCmdResults.length) {
         appendCmdCard(allCmdResults[nextCmdIdx++]);
       }
 
-      // Render any active streaming assistant responses (in-place without duplicates)
-      Object.keys(streamingMessages).forEach((mId) => {
-        const sm = streamingMessages[mId];
-        if (sm && sm.content) {
-          conversationFlow.appendChild(createAssistantCardElement({
-            id: mId,
-            senderName: sm.agentName || 'Main Agent',
-            senderRole: sm.senderRole || 'assistant',
-            content: sm.content,
-          }));
-        }
-      });
+      // Streaming narratives when no turn feed exists yet (e.g. conversational reply before any run)
+      if (turnGrouping.lastTurnMsgIndex === -1 && !fallbackFeedRendered) {
+        Object.keys(streamingMessages).forEach((mId) => {
+          const sm = streamingMessages[mId];
+          if (sm && sm.content) {
+            conversationFlow.appendChild(createAssistantCardElement({
+              id: mId,
+              senderName: sm.agentName || 'Main Agent',
+              senderRole: sm.senderRole || 'assistant',
+              content: sm.content,
+            }));
+          }
+        });
+      }
 
       if (!renderedLatestLiveBlock) {
         updateOrAppendSafeStatus();
@@ -4722,6 +4833,7 @@ export class AgentWorkspaceEditorPanel {
             agentName: ev.agentName,
             senderRole: ev.senderRole || 'assistant',
             content: ev.fullContent || '',
+            timestamp: ev.timestamp || Date.now(),
           };
           const existingCard = lcFindChildByAttr(conversationFlow, 'data-msg-id', ev.messageId);
           const existingEl = existingCard ? existingCard.querySelector('.agent-text') : null;
@@ -4731,7 +4843,30 @@ export class AgentWorkspaceEditorPanel {
               syncContainerScroll(false);
             }
           } else {
-            renderFullConversation();
+            // Append straight into the latest turn feed — avoids a destructive full rebuild
+            const displayMsgs = getDisplayMessages();
+            const grouped = lcGroupActivitiesByUserTurn(displayMsgs, currentActivities);
+            let feedEl = null;
+            if (grouped.lastTurnMsgIndex >= 0 && displayMsgs[grouped.lastTurnMsgIndex]) {
+              const lt = grouped.lastTurnMsgIndex;
+              feedEl = lcFindChildByAttr(conversationFlow, 'data-turn-feed', displayMsgs[lt].id || ('turn_' + lt));
+            }
+            if (!feedEl) {
+              feedEl = lcFindChildByAttr(conversationFlow, 'data-turn-feed', 'turn_fallback');
+            }
+            if (feedEl) {
+              feedEl.appendChild(createAssistantCardElement({
+                id: ev.messageId,
+                senderName: ev.agentName || 'Main Agent',
+                senderRole: ev.senderRole || 'assistant',
+                content: ev.fullContent || '',
+              }));
+              if (chatPinnedToBottom) {
+                syncContainerScroll(false);
+              }
+            } else {
+              renderFullConversation();
+            }
           }
           break;
         }
@@ -4749,8 +4884,10 @@ export class AgentWorkspaceEditorPanel {
             const displayMsgs = getDisplayMessages();
             const grouped = lcGroupActivitiesByUserTurn(displayMsgs, currentActivities);
             const turnActs = grouped.lastTurnMsgIndex >= 0 ? (grouped.byMsgIndex[grouped.lastTurnMsgIndex] || []) : currentActivities;
+            const activeThoughtId = activeGroup.getAttribute('data-turn-key');
+            const activeThought = turnActs.find((a) => a && a.id === activeThoughtId);
             lcUpdateInlineThinkingGroupHeader(activeGroup, {
-              activities: turnActs,
+              activities: activeThought ? [activeThought] : turnActs.filter((a) => a && a.category === 'thinking_summary'),
               isLive: true,
               statusSummary: liveStatusState.summary,
             });

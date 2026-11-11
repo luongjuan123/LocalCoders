@@ -87,7 +87,7 @@ CRITICAL EXECUTION MANDATE:
   * list_directory(path): Inspect directory structures.
 - Whenever you implement a feature, module, or test, YOU MUST CALL write_file TO SAVE THE CODE TO DISK.
 - Always write complete, production-ready, clean code with zero placeholders or omissions.
-- USER-VISIBLE NARRATION (REQUIRED): Before EVERY tool call, write ONE short plain-text sentence describing the action you are about to take (e.g. "I'll write the clock UI component in index.html."). After each tool result, briefly state what happened and what comes next. Keep narration to 1-2 conversational sentences and NEVER include JSON or tool-call syntax in it.
+- USER-VISIBLE NARRATION (REQUIRED): Before EVERY tool call, write ONE short plain-text sentence describing the action you are about to take (e.g. "I'll write the requested source file now."). After each tool result, briefly state what happened and what comes next. Keep narration to 1-2 conversational sentences and NEVER include JSON or tool-call syntax in it.
 
 PROJECT CONTEXT:
 ${projectContext}
@@ -264,7 +264,7 @@ ${targetFilePrompt}`;
               await new Promise((r) => setTimeout(r, 1500));
               continue;
             }
-            turnNarrative.discard();
+            turnNarrative.finalize(assistantContent);
             throw streamErr;
           }
         }

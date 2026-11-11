@@ -2783,6 +2783,49 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     let currentViewTab = 'chat';
     let currentStatusSummary = '';
     const streamingMsgNodes = {};
+    const streamingMsgData = {};
+
+    function buildStreamRow(mId, data) {
+      const row = document.createElement('div');
+      row.className = 'msg-row';
+      row.setAttribute('data-msg-id', mId);
+      row.innerHTML =
+        '<div class="msg-assistant">' +
+        '<div class="msg-header">' +
+        lcIcon('bot', 13) +
+        '<span>' + escapeHtml((data && data.agentName) || 'Main Agent') + '</span>' +
+        '</div>' +
+        '<div class="msg-content">' + renderMarkdown((data && data.content) || '') + '</div>' +
+        '</div>';
+      return row;
+    }
+
+    function buildInlineActLine(item) {
+      const line = document.createElement('div');
+      const st = item.status || 'running';
+      line.className = 'lc-inline-act lc-inline-act-' + st;
+      line.setAttribute('data-act-id', item.id || '');
+      const icon = st === 'completed' ? lcIcon('circle-check', 12)
+        : (st === 'failed' || st === 'cancelled') ? lcIcon('triangle-alert', 12)
+        : '<span class="lc-status-pulse"></span>';
+      const who = item.agentName && item.agentName !== 'Main Agent' ? item.agentName + ' — ' : '';
+      line.innerHTML =
+        '<span class="lc-inline-act-icon">' + icon + '</span>' +
+        '<span class="lc-inline-act-text">' + escapeHtml(who + (item.title || item.summary || 'Working')) + '</span>';
+      return line;
+    }
+
+    function upsertChatActivityLine(item) {
+      if (!item || !item.id || item.category === 'thinking_summary') return;
+      const existing = lcFindChildByAttr(chatContainer, 'data-act-id', item.id);
+      if (existing) {
+        const next = buildInlineActLine(item);
+        existing.replaceWith(next);
+      } else {
+        chatContainer.appendChild(buildInlineActLine(item));
+      }
+      if (chatPinnedToBottom) chatContainer.scrollTop = chatContainer.scrollHeight;
+    }
 
     function switchSideTab(tab) {
       currentViewTab = tab === 'activity' ? 'activity' : 'chat';
@@ -2955,7 +2998,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       chatContainer.innerHTML = '';
       Object.keys(streamingMsgNodes).forEach((k) => delete streamingMsgNodes[k]);
 
-      if (currentSessionMessagesCache.length === 0 && allCmdResults.length === 0 && pendingApprovalRequests.length === 0) {
+      if (currentSessionMessagesCache.length === 0 && allCmdResults.length === 0 && pendingApprovalRequests.length === 0 && Object.keys(streamingMsgData).length === 0) {
         if (emptyWelcome) {
           emptyWelcome.style.display = 'flex';
           chatContainer.appendChild(emptyWelcome);
@@ -2978,16 +3021,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         }));
       };
 
-      currentSessionMessagesCache.forEach((m) => {
-        const msgTs = m?.timestamp || 0;
-        while (nextCmdIdx < allCmdResults.length && msgTs > 0 && (allCmdResults[nextCmdIdx].timestamp || 0) <= msgTs) {
+      // Interleave persisted messages with visible work activities chronologically
+      const timelineItems = [];
+      currentSessionMessagesCache.forEach((m) => timelineItems.push({ ts: Number(m?.timestamp || 0), kind: 'msg', v: m }));
+      (Array.isArray(cachedActivities) ? cachedActivities : [])
+        .filter((a) => a && a.category !== 'thinking_summary')
+        .forEach((a) => timelineItems.push({ ts: Number(a.startTime || a.timestamp || 0), kind: 'act', v: a }));
+      timelineItems.sort((a, b) => a.ts - b.ts);
+      timelineItems.forEach((it) => {
+        while (nextCmdIdx < allCmdResults.length && it.ts > 0 && (allCmdResults[nextCmdIdx].timestamp || 0) <= it.ts) {
           appendCmdCard(allCmdResults[nextCmdIdx++]);
         }
-        renderMessage(m);
+        if (it.kind === 'msg') renderMessage(it.v);
+        else chatContainer.appendChild(buildInlineActLine(it.v));
       });
       while (nextCmdIdx < allCmdResults.length) {
         appendCmdCard(allCmdResults[nextCmdIdx++]);
       }
+
+      // Recreate in-flight streaming bubbles (cleared by the DOM wipe above)
+      Object.keys(streamingMsgData).forEach((mId) => {
+        const row = buildStreamRow(mId, streamingMsgData[mId]);
+        chatContainer.appendChild(row);
+        streamingMsgNodes[mId] = row;
+      });
 
       if (currentSessionPlanExplicit && currentSessionPlanCache && currentSessionPlanCache.length > 0) {
         renderPlan(currentSessionPlanCache);
@@ -3124,6 +3181,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
               contentEl.innerHTML = renderMarkdown(data.message.content || '');
             }
             delete streamingMsgNodes[data.message.id];
+            delete streamingMsgData[data.message.id];
             if (chatPinnedToBottom) chatContainer.scrollTop = chatContainer.scrollHeight;
           } else {
             if (data.message?.senderRole === 'user') chatPinnedToBottom = true;
@@ -3140,19 +3198,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           const ev = data.event;
           if (!ev || !ev.messageId) break;
           if (emptyWelcome) emptyWelcome.style.display = 'none';
+          streamingMsgData[ev.messageId] = {
+            agentName: ev.agentName,
+            senderRole: ev.senderRole || 'assistant',
+            content: ev.fullContent || '',
+            timestamp: ev.timestamp || Date.now(),
+          };
           let row = streamingMsgNodes[ev.messageId];
           if (!row) {
-            row = document.createElement('div');
-            row.className = 'msg-row';
-            row.setAttribute('data-msg-id', ev.messageId);
-            row.innerHTML =
-              '<div class="msg-assistant">' +
-              '<div class="msg-header">' +
-              lcIcon('bot', 13) +
-              '<span>' + escapeHtml(ev.agentName || 'Main Agent') + '</span>' +
-              '</div>' +
-              '<div class="msg-content"></div>' +
-              '</div>';
+            row = buildStreamRow(ev.messageId, streamingMsgData[ev.messageId]);
             chatContainer.appendChild(row);
             streamingMsgNodes[ev.messageId] = row;
           }
@@ -3187,6 +3241,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
           updateActivityCounters();
           renderLiveStrip();
           upsertActivityPanelItem(data.item);
+          upsertChatActivityLine(data.item);
           break;
         }
 

@@ -1309,7 +1309,7 @@ CRITICAL EXECUTION MANDATE:
   * read_file(path): Inspect file contents.
   * list_directory(path): Inspect directory structures.
 - Whenever you implement a feature, module, or test, YOU MUST CALL write_file TO SAVE THE CODE TO DISK.
-- USER-VISIBLE NARRATION (REQUIRED): Before EVERY tool call, write ONE short plain-text sentence describing the action you are about to take (e.g. "I'll create clock.h with the Clock class definition."). After each tool result, briefly state what happened and what you will do next. Keep narration to 1-2 sentences, conversational, and NEVER include JSON, tool-call syntax, or internal reasoning in it.
+- USER-VISIBLE NARRATION (REQUIRED): Before EVERY tool call, write ONE short plain-text sentence describing the action you are about to take (e.g. "I'll create the requested source file now."). After each tool result, briefly state what happened and what you will do next. Keep narration to 1-2 sentences, conversational, and NEVER include JSON, tool-call syntax, or internal reasoning in it.
 - Match the existing language and structure of the workspace (Workspace Root Files: ${rootListingText}). Never create TypeScript/JS files inside a Python workspace unless explicitly asked.
 ${projectDetails.guidanceText}
 ${projectDetails.primaryLanguage === 'python' ? "- Any workspace venv/bin is already on PATH so run 'python3', 'pip', or 'pytest' directly.\n" : ''}- Never retry the exact same timed-out or interactive-input-blocked command with identical arguments; pass 'stdin', add non-interactive CLI options/tests, or run via 'start_process' + 'write_stdin'.
@@ -1436,7 +1436,7 @@ ${targetFilePrompt}`;
             continue;
           }
           turnThought.finalize(content, rawThinking);
-          turnNarrative.discard();
+          turnNarrative.finalize(content);
           throw streamErr;
         }
       }

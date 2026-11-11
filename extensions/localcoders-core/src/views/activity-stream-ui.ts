@@ -75,6 +75,51 @@ export function getActivityStreamStyles(): string {
       margin: 2px 0 4px 0;
       width: 100%;
     }
+    /* Chronological per-turn feed: narration cards + visible activity cards + thinking drawer */
+    .lc-turn-feed {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      width: 100%;
+    }
+    .lc-turn-feed > .lc-activity-card {
+      margin: 0;
+    }
+    .lc-turn-feed > .message-card {
+      margin: 0;
+    }
+    /* Compact one-line activity marker rendered inside the sidebar chat timeline */
+    .lc-inline-act {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 3px 10px;
+      font-size: 11.5px;
+      line-height: 1.5;
+      color: var(--vscode-descriptionForeground, #94a3b8);
+    }
+    .lc-inline-act-icon {
+      display: inline-flex;
+      align-items: center;
+      flex-shrink: 0;
+      color: inherit;
+    }
+    .lc-inline-act-completed .lc-inline-act-icon {
+      color: var(--vscode-testing-iconPassed, #34d399);
+    }
+    .lc-inline-act-failed .lc-inline-act-icon,
+    .lc-inline-act-cancelled .lc-inline-act-icon {
+      color: var(--vscode-testing-iconFailed, #f87171);
+    }
+    .lc-inline-act-running .lc-inline-act-icon {
+      color: var(--vscode-charts-blue, #38bdf8);
+    }
+    .lc-inline-act-text {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      min-width: 0;
+    }
     .lc-thinking-trigger {
       display: inline-flex;
       align-items: center;
@@ -1010,6 +1055,60 @@ export function getActivityClientScript(): string {
       return { byMsgIndex: byMsgIndex, lastTurnMsgIndex: userTurns[userTurns.length - 1].msgIndex };
     }
 
+    /**
+     * Claims non-user messages (assistant / critic / system) into the user turn they belong
+     * to, so the conversation timeline can interleave them chronologically inside the turn
+     * feed next to activity cards and the collapsed thinking drawer — Devin-style.
+     * Falls back to positional claiming when timestamps are missing.
+     */
+    function lcGroupMessagesByUserTurn(messages) {
+      var byMsgIndex = {};
+      var claimedIdx = {};
+      var userTurns = [];
+      if (!Array.isArray(messages)) {
+        return { byMsgIndex: byMsgIndex, claimedIdx: claimedIdx };
+      }
+      for (var i = 0; i < messages.length; i++) {
+        var m = messages[i];
+        if (m && m.senderRole === 'user') {
+          userTurns.push({ msgIndex: i, ts: Number(m.timestamp || 0) });
+        }
+      }
+      if (userTurns.length === 0) {
+        return { byMsgIndex: byMsgIndex, claimedIdx: claimedIdx };
+      }
+      for (var j = 0; j < messages.length; j++) {
+        var msg = messages[j];
+        if (!msg || msg.senderRole === 'user') continue;
+        var mTs = Number(msg.timestamp || 0);
+        var assigned = -1;
+        if (mTs > 0) {
+          for (var k = 0; k < userTurns.length; k++) {
+            if (mTs >= userTurns[k].ts || userTurns[k].ts === 0) {
+              assigned = userTurns[k].msgIndex;
+            } else {
+              break;
+            }
+          }
+        }
+        if (assigned === -1) {
+          // No usable timestamp -> claim to the user turn that precedes this message in the list
+          for (var k2 = 0; k2 < userTurns.length; k2++) {
+            if (userTurns[k2].msgIndex < j) {
+              assigned = userTurns[k2].msgIndex;
+            } else {
+              break;
+            }
+          }
+        }
+        if (assigned === -1) continue;
+        if (!byMsgIndex[assigned]) byMsgIndex[assigned] = [];
+        byMsgIndex[assigned].push(msg);
+        claimedIdx[j] = true;
+      }
+      return { byMsgIndex: byMsgIndex, claimedIdx: claimedIdx };
+    }
+
     function lcFormatTurnThinkingLabel(opts) {
       var list = Array.isArray(opts.activities) ? opts.activities : [];
       var isLive = !!opts.isLive;
@@ -1045,6 +1144,22 @@ export function getActivityClientScript(): string {
         var cmd = String(list[0].command).trim();
         if (cmd.length > 48) cmd = cmd.slice(0, 45) + '...';
         return 'Thinking · ' + cmd;
+      }
+      // Completed turn whose drawer holds only reasoning summaries -> Devin-style 'Worked for Xs'
+      if (!isLive && thoughtCount > 0 && actionCount === 0) {
+        var minTs = Infinity;
+        var maxTs = 0;
+        for (var si = 0; si < list.length; si++) {
+          var sit = list[si];
+          if (!sit) continue;
+          var st0 = Number(sit.startTime || sit.timestamp || 0);
+          var en0 = Number(sit.endTime || (sit.durationMs ? st0 + sit.durationMs : st0));
+          if (st0 > 0 && st0 < minTs) minTs = st0;
+          if (en0 > maxTs) maxTs = en0;
+        }
+        var spanMs = (minTs !== Infinity && maxTs > minTs) ? (maxTs - minTs) : 0;
+        if (spanMs > 0) return 'Worked for ' + lcFormatDuration(spanMs);
+        return 'Thinking · ' + thoughtCount + (thoughtCount === 1 ? ' thought' : ' thoughts');
       }
       var parts = [];
       if (thoughtCount > 0) parts.push(thoughtCount + (thoughtCount === 1 ? ' thought' : ' thoughts'));

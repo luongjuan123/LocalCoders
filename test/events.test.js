@@ -2548,3 +2548,195 @@ describe('Event Streaming, Thinking Filter, Command Cards & Cockpit UI (12 Scena
     }
   });
 });
+
+describe('Live Conversation Streaming (Devin-style narrate -> act -> narrate)', () => {
+  it('A. sanitizeNarrativeContent strips tool-call payloads & internal reasoning but keeps human prose', () => {
+    const { sanitizeNarrativeContent } = require('../extensions/localcoders-core/dist/agents/events');
+
+    assert.strictEqual(
+      sanitizeNarrativeContent('<think>secret plan</think>I will create clock.h now.<tool_call>{"name":"write_file","arguments":{"path":"clock.h"}}</tool_call>'),
+      'I will create clock.h now.'
+    );
+    assert.strictEqual(
+      sanitizeNarrativeContent('Writing the header file.\n```json\n{"name":"write_file","arguments":{"path":"a.cpp"}}\n```\nmore text'),
+      'Writing the header file.\n\nmore text'
+    );
+    assert.strictEqual(
+      sanitizeNarrativeContent('Plan ready:\n{"tasks":[{"id":"t1"}],"done":true}'),
+      'Plan ready:'
+    );
+    assert.strictEqual(
+      sanitizeNarrativeContent('Reviewing now ```json\n{"verdict":"approved"'),
+      'Reviewing now'
+    );
+    assert.strictEqual(
+      sanitizeNarrativeContent('<analysis>internal</analysis>Saved main.cpp, compiling next.'),
+      'Saved main.cpp, compiling next.'
+    );
+    // Pure tool-call output produces no narration at all
+    assert.strictEqual(sanitizeNarrativeContent('{"name":"write_file","arguments":{"path":"x"}}'), '');
+    assert.strictEqual(sanitizeNarrativeContent('<tool_call>{"name":"run_command"}</tool_call>'), '');
+  });
+
+  it('B. createTurnNarrativeStreamer emits incremental message_delta then message_complete', async () => {
+    const { createTurnNarrativeStreamer } = require('../extensions/localcoders-core/dist/agents/tool-runner');
+    const deltas = [];
+    const completes = [];
+    const streamer = createTurnNarrativeStreamer({
+      runId: 'run_1',
+      agentId: 'main',
+      agentName: 'Main Agent',
+      stepKey: 't1_1',
+      taskId: 't1',
+      onStreamEvent: (ev) => {
+        if (ev.kind === 'message_delta') deltas.push(ev);
+        if (ev.kind === 'message_complete') completes.push(ev);
+      },
+    });
+
+    streamer.update('I will write clock.h with the Clock class.');
+    assert.strictEqual(deltas.length, 1, 'First delta emitted immediately');
+    assert.strictEqual(deltas[0].messageId, streamer.messageId);
+    assert.ok(deltas[0].fullContent.includes('clock.h'));
+
+    // Identical content does not re-emit
+    streamer.update('I will write clock.h with the Clock class.');
+    assert.strictEqual(deltas.length, 1);
+
+    streamer.finalize("I will write clock.h with the Clock class.<tool_call>{\"name\":\"write_file\"}</tool_call>");
+    assert.strictEqual(completes.length, 1, 'message_complete emitted');
+    assert.strictEqual(completes[0].message.id, streamer.messageId, 'complete message id matches stream id');
+    assert.strictEqual(completes[0].message.senderName, 'Main Agent');
+    assert.ok(!completes[0].message.content.includes('tool_call'), 'persisted content is sanitized');
+    assert.strictEqual(completes[0].message.taskId, 't1');
+  });
+
+  it('C. Subagent execution loop streams visible narration deltas and persists a final message', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lc-ev-narr-'));
+    try {
+      const { Subagent } = require('../extensions/localcoders-core/dist/agents/subagent');
+      const { FileLockManager } = require('../extensions/localcoders-core/dist/agents/file-lock');
+      const { PermissionManager } = require('../extensions/localcoders-core/dist/security/permission-manager');
+      const pm = new PermissionManager(tmpDir);
+      pm.setMode('bypass');
+      const toolManager = new ToolManager(undefined, pm);
+
+      const fakeRouter = {
+        chatStream: async (params, onChunk) => {
+          const hasTool = params.messages.some(
+            (m) => m.role === 'tool' || (m.role === 'user' && String(m.content || '').includes('[Tool Result'))
+          );
+          if (!hasTool) {
+            onChunk({ content: 'I will create index.html for the clock UI. ', thinking: 'internal layout reasoning', done: false });
+            onChunk({
+              content: '<tool_call>{"name":"write_file","arguments":{"path":"index.html","content":"<div id=\\"clock\\"></div>"}}</tool_call>',
+              done: true,
+            });
+            return;
+          }
+          onChunk({ content: 'index.html is saved. The clock UI is complete.', done: true });
+        },
+      };
+
+      const sub = new Subagent(
+        { id: 'builtin_frontend', name: 'Frontend Specialist', role: 'frontend', model: 'mock', systemPrompt: '', enabled: true },
+        {},
+        toolManager,
+        new FileLockManager(),
+        tmpDir,
+        fakeRouter
+      );
+
+      const deltas = [];
+      const completes = [];
+      const res = await sub.executeTask(
+        { id: 't1', title: 'Build clock UI', description: 'Create index.html', assignedTo: 'builtin_frontend', dependencies: [], status: 'pending', affectedFiles: ['index.html'] },
+        '',
+        () => {},
+        async () => true,
+        undefined,
+        {
+          runId: 'run_narr',
+          onStreamEvent: (ev) => {
+            if (ev.kind === 'message_delta') deltas.push(ev);
+            if (ev.kind === 'message_complete') completes.push(ev);
+          },
+        }
+      );
+
+      assert.ok(res.success, 'Subagent task succeeds');
+      assert.ok(deltas.length >= 1, 'Emits message_delta while streaming');
+      assert.ok(
+        deltas.some((d) => (d.fullContent || '').includes('I will create index.html')),
+        'Delta carries user-visible narration prose'
+      );
+      assert.ok(
+        !deltas.some((d) => (d.fullContent || '').includes('tool_call') || (d.fullContent || '').includes('"arguments"')),
+        'Tool-call payloads never leak into narration deltas'
+      );
+      assert.ok(
+        !deltas.some((d) => (d.fullContent || '').includes('internal layout reasoning')),
+        'Internal reasoning never leaks into narration deltas'
+      );
+      assert.ok(completes.length >= 1, 'message_complete persists the narration');
+      assert.strictEqual(completes[0].message.senderName, 'Frontend Specialist');
+      assert.strictEqual(completes[0].message.senderRole, 'assistant');
+      assert.ok(fs.existsSync(path.join(tmpDir, 'index.html')), 'write_file still executes for real');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('D. lcGroupMessagesByUserTurn claims assistant replies into the preceding user turn', () => {
+    const actUi = require('../extensions/localcoders-core/dist/views/activity-stream-ui');
+    const sandbox = { document: { createElement: (t) => ({ tagName: t, children: [], appendChild(c) { this.children.push(c); } }) }, lcIcon: () => '' };
+    vm.createContext(sandbox);
+    vm.runInContext(actUi.getActivityClientScript(), sandbox);
+
+    const msgs = [
+      { id: 'u1', senderRole: 'user', timestamp: 1000, content: 'Build a clock' },
+      { id: 'n1', senderRole: 'assistant', timestamp: 1100, content: 'I will create clock.h' },
+      { id: 'n2', senderRole: 'assistant', timestamp: 1500, content: 'clock.h written, compiling' },
+      { id: 'u2', senderRole: 'user', timestamp: 2000, content: 'Now add tests' },
+      { id: 'n3', senderRole: 'assistant', timestamp: 2100, content: 'Writing test file' },
+    ];
+    const grouped = sandbox.lcGroupMessagesByUserTurn(msgs);
+    assert.strictEqual(((grouped.byMsgIndex[0] || []).map((m) => m.id)).join(','), 'n1,n2');
+    assert.strictEqual(((grouped.byMsgIndex[3] || []).map((m) => m.id)).join(','), 'n3');
+    assert.ok(grouped.claimedIdx[1] && grouped.claimedIdx[2] && grouped.claimedIdx[4], 'assistant msgs marked claimed');
+    assert.ok(!grouped.claimedIdx[0] && !grouped.claimedIdx[3], 'user msgs never claimed');
+  });
+
+  it('E. Completed thinking-only turn drawer labels itself "Worked for Xs"', () => {
+    const actUi = require('../extensions/localcoders-core/dist/views/activity-stream-ui');
+    const sandbox = { document: { createElement: (t) => ({ tagName: t, children: [], appendChild(c) { this.children.push(c); } }) }, lcIcon: () => '' };
+    vm.createContext(sandbox);
+    vm.runInContext(actUi.getActivityClientScript(), sandbox);
+
+    const label = sandbox.lcFormatTurnThinkingLabel({
+      isLive: false,
+      activities: [
+        { id: 'th1', category: 'thinking_summary', status: 'completed', startTime: 1000, endTime: 11000 },
+      ],
+    });
+    assert.strictEqual(label, 'Worked for 10s');
+
+    // Live drawers still show the running phase
+    const liveLabel = sandbox.lcFormatTurnThinkingLabel({
+      isLive: true,
+      statusSummary: 'Generating code',
+      activities: [{ id: 'th2', category: 'thinking_summary', status: 'running', startTime: 1000 }],
+    });
+    assert.ok(liveLabel.startsWith('Thinking'), 'Live drawer keeps Thinking label');
+  });
+
+  it('F. Turn feed renders thoughts, narration/messages, and tasks in respective chronological order', () => {
+    const editorSrc = fs.readFileSync(
+      path.join(__dirname, '..', 'extensions', 'localcoders-core', 'src', 'views', 'agent-workspace-editor.ts'),
+      'utf8'
+    );
+    assert.ok(editorSrc.includes('kindRank = { plan: 0, thought: 1, stream: 2, msg: 2, act: 3 }'), 'Turn feed must prioritize stable chronological sequence');
+    assert.ok(editorSrc.includes("it.kind === 'thought'"), 'Turn feed must interleave individual thought groups');
+    assert.ok(editorSrc.includes('// Chronological per-step feed'), 'Turn feed header documentation exists');
+  });
+});

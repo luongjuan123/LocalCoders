@@ -215,13 +215,31 @@ export function sanitizeNarrativeContent(raw: string): string {
   if (!raw) return '';
   let text = sanitizeAssistantContent(raw);
 
-  // Remove fenced blocks whose body is a tool-call/plan/critic JSON payload (closed or still streaming)
-  text = text.replace(/```[a-zA-Z0-9_-]*\s*\{[\s\S]*?"(?:name|tool|tasks|verdict|findings)"[\s\S]*?(?:```|$)/gi, '');
+  // Remove fenced blocks whose body is a JSON payload (tool calls like
+  // ```json {"path":...} — any object/array body — never user-facing prose)
+  text = text.replace(/```[a-zA-Z0-9_-]*\s*[[{][\s\S]*?(?:```|$)/gi, '');
 
-  // Truncate at the first bare tool-call/plan/critic JSON object (or its partial streaming prefix)
-  const braceIdx = text.search(/\{\s*"(?:name|tool|function|tasks|verdict|findings)"\s*:/);
-  if (braceIdx !== -1) {
-    text = text.slice(0, braceIdx);
+  // Truncate at the first bare JSON object — `{"key":` shape — a tool-call/plan/critic
+  // payload (or its partial streaming prefix), regardless of which keys it uses.
+  // Skip matches inside remaining (legit code) fences so inline dict literals survive.
+  const fenceRanges: Array<[number, number]> = [];
+  const fenceScan = /```[\s\S]*?(?:```|$)/g;
+  let fm: RegExpExecArray | null;
+  while ((fm = fenceScan.exec(text)) !== null) {
+    fenceRanges.push([fm.index, fm.index + fm[0].length]);
+  }
+  const jsonScan = /\{\s*"[A-Za-z_]{1,30}"\s*:/g;
+  let jm: RegExpExecArray | null;
+  let cutIdx = -1;
+  while ((jm = jsonScan.exec(text)) !== null) {
+    const inside = fenceRanges.some(([s, e]) => jm !== null && jm.index >= s && jm.index < e);
+    if (!inside) {
+      cutIdx = jm.index;
+      break;
+    }
+  }
+  if (cutIdx !== -1) {
+    text = text.slice(0, cutIdx);
   }
 
   // Cut a trailing incomplete fence opener that may hold a tool payload next chunk
@@ -230,7 +248,38 @@ export function sanitizeNarrativeContent(raw: string): string {
     text = text.slice(0, openFence);
   }
 
-  return text.trimStart();
+  // Cut a trailing bare `{` / `{"x` fragment — almost always the start of a tool-call
+  // JSON payload still streaming in; avoids a stray brace flashing into the bubble.
+  const partialBrace = text.search(/\{\s*"?(?:[a-zA-Z]+)?"?\s*:?$/);
+  if (partialBrace !== -1) {
+    text = text.slice(0, partialBrace);
+  }
+
+  text = text.replace(/\n{3,}/g, '\n\n').trim();
+
+  // Reasoning-dump guard: narration is meant to be a brief action line. When the model
+  // streams its whole scratchpad into content (3+ paragraphs or a very long blob), the
+  // action statement is the trailing paragraph ("Now we need to write the file") — keep
+  // only that so the conversation shows a Devin-style status line. Full reasoning stays
+  // in the thinking drawer via extractAgentReasoningText. Fenced code is excluded from
+  // the paragraph count so legit code samples aren't mistaken for reasoning dumps.
+  const proseOnly = text.replace(/```[\s\S]*?(?:```|$)/g, '').trim();
+  const paragraphs = proseOnly.split(/\n{2,}/).map((p) => p.trim()).filter(Boolean);
+  if (paragraphs.length >= 3 || proseOnly.length > 400) {
+    let last = paragraphs[paragraphs.length - 1] || '';
+    if (last.length > 320) {
+      const sentenceStart = Math.max(
+        last.lastIndexOf('. ', last.length - 320),
+        last.lastIndexOf('! ', last.length - 320),
+        last.lastIndexOf('? ', last.length - 320),
+        last.lastIndexOf('\n', last.length - 320)
+      );
+      last = sentenceStart > -1 ? last.slice(sentenceStart + 1).trim() : last.slice(-320).trim();
+    }
+    text = last;
+  }
+
+  return text;
 }
 
 /**

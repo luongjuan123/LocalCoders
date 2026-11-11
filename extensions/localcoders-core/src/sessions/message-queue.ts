@@ -1189,6 +1189,23 @@ export class MessageQueueManager {
                 this._onDidSessionEvent.fire({ sessionId, type: 'messageDelta', payload: ev });
                 break;
 
+              case 'message_complete': {
+                const msg = (ev as any).message as AgentMessage | undefined;
+                if (msg && msg.id && msg.senderRole !== 'user') {
+                  this.deps.sessionManager.updateSession(
+                    sessionId,
+                    (s) => {
+                      if (!s.messages.some((m) => m.id === msg.id)) {
+                        s.messages.push(msg);
+                      }
+                    },
+                    { silent: true }
+                  );
+                  this._onDidSessionEvent.fire({ sessionId, type: 'addMessage', payload: msg });
+                }
+                break;
+              }
+
               case 'activity_upsert':
                 this.deps.sessionManager.updateSession(
                   sessionId,

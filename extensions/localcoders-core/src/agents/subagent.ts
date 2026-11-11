@@ -6,7 +6,12 @@ import { ToolExecutionContext } from '../tools/types';
 import { FileLockManager } from './file-lock';
 import { parseToolCallsFromContent, parseCodeBlocksFromContent, RuntimeModelOptions } from './main-agent';
 import { getSafePhaseLabel, sanitizeAssistantContent } from './events';
-import { createTurnProgressGuard, createTurnThoughtTracker, executeTrackedTool } from './tool-runner';
+import {
+  createTurnNarrativeStreamer,
+  createTurnProgressGuard,
+  createTurnThoughtTracker,
+  executeTrackedTool,
+} from './tool-runner';
 
 export class Subagent {
   public config: AgentConfig;
@@ -82,6 +87,7 @@ CRITICAL EXECUTION MANDATE:
   * list_directory(path): Inspect directory structures.
 - Whenever you implement a feature, module, or test, YOU MUST CALL write_file TO SAVE THE CODE TO DISK.
 - Always write complete, production-ready, clean code with zero placeholders or omissions.
+- USER-VISIBLE NARRATION (REQUIRED): Before EVERY tool call, write ONE short plain-text sentence describing the action you are about to take (e.g. "I'll write the clock UI component in index.html."). After each tool result, briefly state what happened and what comes next. Keep narration to 1-2 conversational sentences and NEVER include JSON or tool-call syntax in it.
 
 PROJECT CONTEXT:
 ${projectContext}
@@ -143,6 +149,14 @@ ${targetFilePrompt}`;
           stepKey: `${task.id}_t${turns}`,
           onStreamEvent: runtimeOptions?.onStreamEvent,
         });
+        const turnNarrative = createTurnNarrativeStreamer({
+          runId,
+          agentId: this.config.id,
+          agentName: this.config.name,
+          stepKey: `${task.id}_t${turns}`,
+          taskId: task.id,
+          onStreamEvent: runtimeOptions?.onStreamEvent,
+        });
 
         runtimeOptions?.onStreamEvent?.({
           kind: 'status',
@@ -201,6 +215,7 @@ ${targetFilePrompt}`;
                 assistantContent += chunk.content;
                 if (chunk.thinking) assistantThinking += chunk.thinking;
                 turnThought.updateFromStream(assistantContent, assistantThinking);
+                turnNarrative.update(assistantContent);
                 if (chunk.toolCalls && chunk.toolCalls.length > 0) {
                   toolCalls = [...(toolCalls || []), ...chunk.toolCalls];
                 }
@@ -249,6 +264,7 @@ ${targetFilePrompt}`;
               await new Promise((r) => setTimeout(r, 1500));
               continue;
             }
+            turnNarrative.discard();
             throw streamErr;
           }
         }
@@ -276,6 +292,7 @@ ${targetFilePrompt}`;
             ? `Task "${task.title}": ${activeCalls.map((c) => `${c.name}(${c.args?.path || c.args?.command || ''})`).join(', ')}`
             : `Completed step "${task.title}"`;
         turnThought.finalize(assistantContent, assistantThinking, plannedFallback);
+        turnNarrative.finalize(assistantContent);
 
         // 3. Fallback: Parse code blocks with filenames and automatically persist them via write_file
         if (activeCalls.length === 0) {

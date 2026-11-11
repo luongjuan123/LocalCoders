@@ -145,6 +145,21 @@ describe('AgentRegistry — Agent Team Configuration & Mandatory Validation', ()
       assert.strictEqual(resetTest?.isCustomized, false);
       assert.strictEqual(resetTest?.model, '');
       assert.strictEqual(afterReset.some((s) => s.id === 'sub_sec'), false);
+
+      // Verify deletion of built-in subagents and restore
+      assert.strictEqual(reg.getDeletedBuiltinCount(), 0);
+      reg.deleteSubagent('builtin_frontend');
+      assert.strictEqual(reg.getDeletedBuiltinCount(), 1);
+      const afterDelete = reg.getManageableSubagents(true);
+      assert.strictEqual(afterDelete.some((s) => s.id === 'builtin_frontend'), false, 'Deleted built-in is excluded from manageable roster');
+      const effectiveAfterDelete = reg.getEffectiveSubagents('qwen2.5-coder:7b', true);
+      assert.strictEqual(effectiveAfterDelete.some((s) => s.id === 'builtin_frontend'), false, 'Deleted built-in is excluded from execution roster');
+
+      // Restore built-ins
+      reg.restoreBuiltinSubagents();
+      assert.strictEqual(reg.getDeletedBuiltinCount(), 0);
+      const afterRestore = reg.getManageableSubagents(true);
+      assert.strictEqual(afterRestore.some((s) => s.id === 'builtin_frontend'), true, 'Restored built-in returns to active roster');
     } finally {
       vscode.workspace.workspaceFolders = origFolders;
       fs.rmSync(tmpDir, { recursive: true, force: true });

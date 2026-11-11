@@ -1881,6 +1881,9 @@ describe('Event Streaming, Thinking Filter, Command Cards & Cockpit UI (12 Scena
     assert.ok(modalScript.includes('cmSubagentPrompt'), 'Create Subagent renders instruction textarea');
     assert.ok(modalScript.includes('Same as coding model'), 'Subagent dropdown matches Critic model inheritance option');
     assert.ok(modalScript.includes('cockpitUpdateSubagent'), 'Saves updated model and instructions per subagent');
+    assert.ok(modalScript.includes('data-delete-subagent='), 'Subagents render Delete button');
+    assert.ok(modalScript.includes('cockpitDeleteSubagent'), 'Posts delete message when subagent delete button is clicked');
+    assert.ok(modalScript.includes('Applied ✓'), 'Apply button renders immediate visual confirmation');
 
     // Verify runtime execution routes delegated subagent task to configured model & system instructions
     const vscode = require('vscode');

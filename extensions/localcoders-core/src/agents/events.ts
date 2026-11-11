@@ -205,6 +205,35 @@ export function extractAgentReasoningText(
 }
 
 /**
+ * Sanitizes agent output into user-visible narration prose for live streaming into the
+ * conversation timeline. Removes internal reasoning tags, tool-call payloads (<tool_call>,
+ * fenced ```json {name|tool} blocks, and bare {"name"|"tool"|"tasks"|"verdict"|"findings"}
+ * JSON objects including their unterminated streaming prefixes) while keeping human prose,
+ * code blocks, and markdown intact.
+ */
+export function sanitizeNarrativeContent(raw: string): string {
+  if (!raw) return '';
+  let text = sanitizeAssistantContent(raw);
+
+  // Remove fenced blocks whose body is a tool-call/plan/critic JSON payload (closed or still streaming)
+  text = text.replace(/```[a-zA-Z0-9_-]*\s*\{[\s\S]*?"(?:name|tool|tasks|verdict|findings)"[\s\S]*?(?:```|$)/gi, '');
+
+  // Truncate at the first bare tool-call/plan/critic JSON object (or its partial streaming prefix)
+  const braceIdx = text.search(/\{\s*"(?:name|tool|function|tasks|verdict|findings)"\s*:/);
+  if (braceIdx !== -1) {
+    text = text.slice(0, braceIdx);
+  }
+
+  // Cut a trailing incomplete fence opener that may hold a tool payload next chunk
+  const openFence = text.search(/```[a-zA-Z0-9_-]*\s*$/);
+  if (openFence !== -1) {
+    text = text.slice(0, openFence);
+  }
+
+  return text.trimStart();
+}
+
+/**
  * Filters raw activity strings to prevent leaking internal chain-of-thought or token counters.
  * Returns a safe status summary instead of "Thinking: ..." or "Generating implementation (19 tokens)...".
  */

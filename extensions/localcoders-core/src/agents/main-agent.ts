@@ -20,7 +20,12 @@ import {
   pairConversationHistory,
   sanitizeAssistantContent,
 } from './events';
-import { createTurnProgressGuard, createTurnThoughtTracker, executeTrackedTool } from './tool-runner';
+import {
+  createTurnNarrativeStreamer,
+  createTurnProgressGuard,
+  createTurnThoughtTracker,
+  executeTrackedTool,
+} from './tool-runner';
 
 export const DEFAULT_MAX_CRITIC_CYCLES = 0; // 0 = unlimited review/fix cycles until approved or cancelled
 
@@ -496,6 +501,13 @@ Respond with a STRICT JSON block matching this schema (replace placeholders with
       stepKey: 'plan',
       onStreamEvent: options?.onStreamEvent,
     });
+    const planNarrative = createTurnNarrativeStreamer({
+      runId: options?.runId || 'run_default',
+      agentId: this.config.id,
+      agentName: this.config.name,
+      stepKey: 'plan',
+      onStreamEvent: options?.onStreamEvent,
+    });
     // Cap planning reasoning effort & tokens so local models formulate JSON plans quickly instead of multi-minute CoT
     const planEffort: ReasoningEffort | undefined =
       options?.reasoningEffort === 'extra_high'
@@ -522,6 +534,7 @@ Respond with a STRICT JSON block matching this schema (replace placeholders with
         responseContent += chunk.content;
         if (chunk.thinking) responseThinking += chunk.thinking;
         planThought.updateFromStream(responseContent, responseThinking);
+        planNarrative.update(responseContent);
         if (!planningNotified && (chunk.content || chunk.thinking)) {
           planningNotified = true;
           this.emitSafeStatus(options, 'planning', 'Planning approach');
@@ -529,6 +542,7 @@ Respond with a STRICT JSON block matching this schema (replace placeholders with
       },
       abortSignal
     );
+    planNarrative.finalize(responseContent);
 
     const normalizePlanDelegation = (list: TaskPlanItem[]): TaskPlanItem[] => {
       if (availableSubagents.length === 0 || list.length <= 1) return list;
@@ -1281,7 +1295,8 @@ ${projectDetails.guidanceText}
 - Run the requested existing application or command right now using:
   * start_process(command) + read_output(id): for GUI applications (Tkinter, Qt, X11, Pygame, Electron), dev servers, or continuously running clocks/timers.
   * run_command(command, stdin?): for finite scripts, compilation/build commands, CLIs (pass stdin if input() is needed), or test commands.
-${projectDetails.primaryLanguage === 'python' ? "- Any workspace venv/bin is already on PATH so run 'python3', 'pip', or 'pytest' directly.\n" : ''}- Once executed or started, concisely report the exact command run and observed output/process status.`
+${projectDetails.primaryLanguage === 'python' ? "- Any workspace venv/bin is already on PATH so run 'python3', 'pip', or 'pytest' directly.\n" : ''}- USER-VISIBLE NARRATION (REQUIRED): Before each tool call, write ONE short plain-text sentence describing the action you are about to take. After each result, briefly state what happened and what comes next. Never output JSON or tool-call syntax as narration.
+- Once executed or started, concisely report the exact command run and observed output/process status.`
       : `You are the Lead Main Agent in LocalCoders, an autonomous development environment.
 ${this.config.systemPrompt}
 
@@ -1294,6 +1309,7 @@ CRITICAL EXECUTION MANDATE:
   * read_file(path): Inspect file contents.
   * list_directory(path): Inspect directory structures.
 - Whenever you implement a feature, module, or test, YOU MUST CALL write_file TO SAVE THE CODE TO DISK.
+- USER-VISIBLE NARRATION (REQUIRED): Before EVERY tool call, write ONE short plain-text sentence describing the action you are about to take (e.g. "I'll create clock.h with the Clock class definition."). After each tool result, briefly state what happened and what you will do next. Keep narration to 1-2 sentences, conversational, and NEVER include JSON, tool-call syntax, or internal reasoning in it.
 - Match the existing language and structure of the workspace (Workspace Root Files: ${rootListingText}). Never create TypeScript/JS files inside a Python workspace unless explicitly asked.
 ${projectDetails.guidanceText}
 ${projectDetails.primaryLanguage === 'python' ? "- Any workspace venv/bin is already on PATH so run 'python3', 'pip', or 'pytest' directly.\n" : ''}- Never retry the exact same timed-out or interactive-input-blocked command with identical arguments; pass 'stdin', add non-interactive CLI options/tests, or run via 'start_process' + 'write_stdin'.
@@ -1364,6 +1380,14 @@ ${targetFilePrompt}`;
         stepKey: `${task.id}_t${turns}`,
         onStreamEvent: runtimeOptions?.onStreamEvent,
       });
+      const turnNarrative = createTurnNarrativeStreamer({
+        runId,
+        agentId: this.config.id,
+        agentName: this.config.name,
+        stepKey: `${task.id}_t${turns}`,
+        taskId: task.id,
+        onStreamEvent: runtimeOptions?.onStreamEvent,
+      });
 
       for (let streamAttempt = 0; streamAttempt < 2; streamAttempt++) {
         content = '';
@@ -1386,6 +1410,7 @@ ${targetFilePrompt}`;
               content += chunk.content;
               if (chunk.thinking) rawThinking += chunk.thinking;
               turnThought.updateFromStream(content, rawThinking);
+              turnNarrative.update(content);
               if (chunk.toolCalls && chunk.toolCalls.length > 0) {
                 toolCalls = [...(toolCalls || []), ...chunk.toolCalls];
               }
@@ -1411,6 +1436,7 @@ ${targetFilePrompt}`;
             continue;
           }
           turnThought.finalize(content, rawThinking);
+          turnNarrative.discard();
           throw streamErr;
         }
       }
@@ -1443,6 +1469,7 @@ ${targetFilePrompt}`;
           ? `Step "${task.title}": executing ${activeCalls.map((c) => `${c.name}(${c.args?.path || c.args?.command || ''})`).join(', ')}`
           : undefined;
       turnThought.finalize(content, rawThinking, fallbackThoughtNote);
+      turnNarrative.finalize(content);
 
       // 3. Fallback: Parse code blocks with filenames and automatically persist them via write_file
       if (activeCalls.length === 0 && !isExecuteOnly) {
@@ -1869,6 +1896,13 @@ INSTRUCTIONS:
         stepKey: `fix_r${round}_t${turns}`,
         onStreamEvent: runtimeOptions?.onStreamEvent,
       });
+      const fixNarrative = createTurnNarrativeStreamer({
+        runId: fixRunId,
+        agentId: this.config.id,
+        agentName: this.config.name,
+        stepKey: `fix_r${round}_t${turns}`,
+        onStreamEvent: runtimeOptions?.onStreamEvent,
+      });
 
       await this.llmRouter.chatStream(
         {
@@ -1885,6 +1919,7 @@ INSTRUCTIONS:
           content += chunk.content;
           if (chunk.thinking) rawThinking += chunk.thinking;
           fixThought.updateFromStream(content, rawThinking);
+          fixNarrative.update(content);
           if (chunk.toolCalls && chunk.toolCalls.length > 0) {
             toolCalls = [...(toolCalls || []), ...chunk.toolCalls];
           }
@@ -1922,6 +1957,7 @@ INSTRUCTIONS:
           ? `Applying Critic Round ${round} fixes: ${activeCalls.map((c) => `${c.name}(${c.args?.path || c.args?.command || ''})`).join(', ')}`
           : undefined
       );
+      fixNarrative.finalize(content);
 
       messages.push({ role: 'assistant', content, tool_calls: toolCalls && toolCalls.length > 0 ? toolCalls : undefined });
       if (activeCalls.length === 0) {

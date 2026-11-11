@@ -901,6 +901,35 @@ export class AgentWorkspaceEditorPanel {
             break;
           }
 
+          case 'cockpitDeleteSubagent': {
+            const reg = AgentWorkspaceEditorPanel._registry;
+            const id = String(data.id || '').trim();
+            if (reg && id) {
+              reg.deleteSubagent(id);
+            }
+            await this.openCockpitModal('agents', 'Subagent deleted.');
+            break;
+          }
+
+          case 'cockpitResetSubagent': {
+            const reg = AgentWorkspaceEditorPanel._registry;
+            const id = String(data.id || '').trim();
+            if (reg && id) {
+              reg.removeSubagent(id);
+            }
+            await this.openCockpitModal('agents', 'Subagent reset to default.');
+            break;
+          }
+
+          case 'cockpitRestoreSubagents': {
+            const reg = AgentWorkspaceEditorPanel._registry;
+            if (reg) {
+              reg.restoreBuiltinSubagents();
+            }
+            await this.openCockpitModal('agents', 'Default subagents restored.');
+            break;
+          }
+
           case 'cockpitAddMcpServer': {
             const mcp = AgentWorkspaceEditorPanel._mcpHost;
             const name = String(data.name || '').trim();
@@ -1017,6 +1046,7 @@ export class AgentWorkspaceEditorPanel {
     this.changesManager.setWorkspace(targetRoot);
     this.permissionManager?.setWorkspace(targetRoot);
     AgentWorkspaceEditorPanel._mcpHost?.setWorkspace(targetRoot);
+    AgentWorkspaceEditorPanel._registry?.setWorkspaceRoot(targetRoot);
     TerminalSessionManager.getInstance().setDefaultCwd(targetRoot);
   }
 
@@ -1208,6 +1238,7 @@ export class AgentWorkspaceEditorPanel {
           subagents: customSubagents,
           builtinSubagents,
           manageableSubagents,
+          deletedBuiltinCount: reg?.getDeletedBuiltinCount() || 0,
           predefinedRoles: AgentRegistry.getPredefinedRoles(),
           availableModels,
           activeModelId,

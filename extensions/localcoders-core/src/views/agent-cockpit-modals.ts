@@ -290,6 +290,7 @@ export function getCockpitModalScript(): string {
 
     function renderCockpitModal(modalType, data) {
       if (!cockpitModalBackdrop || !cockpitModalTitle || !cockpitModalBody) return;
+      const prevScrollTop = cockpitModalBody.scrollTop;
       cockpitModalBackdrop.classList.add('open');
 
       if (modalType === 'models') {
@@ -307,6 +308,10 @@ export function getCockpitModalScript(): string {
       } else if (modalType === 'settings') {
         cockpitModalTitle.textContent = 'Settings';
         renderSettingsModal(data || {});
+      }
+
+      if (typeof prevScrollTop === 'number' && prevScrollTop > 0) {
+        cockpitModalBody.scrollTop = prevScrollTop;
       }
     }
 
@@ -430,16 +435,32 @@ export function getCockpitModalScript(): string {
       const activeModelLabel = data.activeModelId || 'active model';
 
       function renderModelOptionsHtml(selectedModel) {
-        const curr = selectedModel || '';
+        const curr = (selectedModel || '').trim();
         let optHtml = '<option value=""' + (!curr ? ' selected' : '') + '>Same as coding model (' + escapeHtml(activeModelLabel) + ')</option>';
         availableModels.forEach((m) => {
-          const mid = m.id || m.name || '';
+          const mid = m.id || m.modelIdentifier || m.displayName || '';
           if (!mid) return;
-          const selected = curr === mid ? ' selected' : '';
-          optHtml += '<option value="' + escapeHtml(mid) + '"' + selected + '>' + escapeHtml(mid) + '</option>';
+          const bareId = m.id && m.id.startsWith('ollama/') ? m.id.slice(7) : (m.id || '');
+          const isSelected =
+            Boolean(curr) &&
+            (curr === mid ||
+              curr === m.id ||
+              curr === m.modelIdentifier ||
+              curr === m.displayName ||
+              (bareId && (curr === bareId || m.id === 'ollama/' + curr)));
+          optHtml += '<option value="' + escapeHtml(m.id || mid) + '"' + (isSelected ? ' selected' : '') + '>' + escapeHtml(m.displayName || mid) + '</option>';
         });
-        if (curr && !availableModels.some((m) => (m.id || m.name) === curr)) {
-          optHtml += '<option value="' + escapeHtml(curr) + '" selected>' + escapeHtml(curr) + ' (unavailable)</option>';
+        const matchedExisting = !curr || availableModels.some((m) => {
+          const bareId = m.id && m.id.startsWith('ollama/') ? m.id.slice(7) : (m.id || '');
+          return (
+            curr === m.id ||
+            curr === m.modelIdentifier ||
+            curr === m.displayName ||
+            (bareId && (curr === bareId || m.id === 'ollama/' + curr))
+          );
+        });
+        if (curr && !matchedExisting) {
+          optHtml += '<option value="' + escapeHtml(curr) + '" selected>' + escapeHtml(curr) + ' (configured)</option>';
         }
         return optHtml;
       }
@@ -492,14 +513,16 @@ export function getCockpitModalScript(): string {
           const sid = s.id || '';
           const isEnabled = s.enabled !== false;
           const kindLabel = s.isBuiltin ? 'Built-in' : 'Custom';
+          const modelDisplay = (s.model || '').trim() || ('Inherit (' + activeModelLabel + ')');
           html += '<div class="cockpit-subagent-card" data-subagent-card="' + escapeHtml(sid) + '">';
           html += '<div class="cockpit-subagent-head">';
-          html += '<div class="cockpit-row-main"><div class="cockpit-row-title">' + escapeHtml(s.name || sid) + '</div><div class="cockpit-row-sub">' + escapeHtml(s.role || 'Subagent') + ' · ' + kindLabel + '</div></div>';
+          html += '<div class="cockpit-row-main"><div class="cockpit-row-title">' + escapeHtml(s.name || sid) + '</div><div class="cockpit-row-sub">' + escapeHtml(s.role || 'Subagent') + ' · ' + kindLabel + ' · <span style="color:#38bdf8;font-weight:600;">' + escapeHtml(modelDisplay) + '</span></div></div>';
           html += '<div class="cockpit-subagent-actions">';
           html += '<button class="cockpit-btn" type="button" data-toggle-subagent="' + escapeHtml(sid) + '">' + (isEnabled ? 'Enabled' : 'Disabled') + '</button>';
-          if (!s.isBuiltin || s.isCustomized) {
-            html += '<button class="cockpit-btn danger" type="button" data-remove-subagent="' + escapeHtml(sid) + '">' + (s.isBuiltin ? 'Reset' : 'Remove') + '</button>';
+          if (s.isBuiltin && s.isCustomized) {
+            html += '<button class="cockpit-btn" type="button" title="Reset customized model and instructions to default" data-reset-subagent="' + escapeHtml(sid) + '">Reset</button>';
           }
+          html += '<button class="cockpit-btn danger" type="button" title="Delete this subagent" data-delete-subagent="' + escapeHtml(sid) + '">Delete</button>';
           html += '</div></div>';
           html += '<div class="cockpit-input-row">';
           html += '<select class="cockpit-select" style="flex:1; min-width:180px;" title="Select Subagent Model" data-subagent-model="' + escapeHtml(sid) + '">';
@@ -511,6 +534,12 @@ export function getCockpitModalScript(): string {
           html += '<textarea class="cockpit-textarea compact" rows="2" placeholder="Write instructions for ' + escapeHtml(s.name || 'this subagent') + '..." data-subagent-prompt="' + escapeHtml(sid) + '">' + escapeHtml(s.systemPrompt || '') + '</textarea>';
           html += '</div>';
         });
+
+        if (typeof data.deletedBuiltinCount === 'number' && data.deletedBuiltinCount > 0) {
+          html += '<div style="margin-top:10px; display:flex; justify-content:flex-end;">';
+          html += '<button class="cockpit-btn secondary" type="button" id="cmRestoreSubagentsBtn">Restore Default Subagents (' + data.deletedBuiltinCount + ' deleted)</button>';
+          html += '</div>';
+        }
       }
       html += '</div>';
 
@@ -560,12 +589,33 @@ export function getCockpitModalScript(): string {
         });
       });
 
+      cockpitModalBody.querySelectorAll('[data-delete-subagent]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const id = btn.getAttribute('data-delete-subagent');
+          if (!id) return;
+          vscode.postMessage({ command: 'cockpitDeleteSubagent', id });
+        });
+      });
+
+      cockpitModalBody.querySelectorAll('[data-reset-subagent]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const id = btn.getAttribute('data-reset-subagent');
+          if (!id) return;
+          vscode.postMessage({ command: 'cockpitResetSubagent', id });
+        });
+      });
+
+      // Keep legacy data-remove-subagent compatibility if referenced
       cockpitModalBody.querySelectorAll('[data-remove-subagent]').forEach((btn) => {
         btn.addEventListener('click', () => {
           const id = btn.getAttribute('data-remove-subagent');
           if (!id) return;
           vscode.postMessage({ command: 'cockpitRemoveSubagent', id });
         });
+      });
+
+      document.getElementById('cmRestoreSubagentsBtn')?.addEventListener('click', () => {
+        vscode.postMessage({ command: 'cockpitRestoreSubagents' });
       });
 
       cockpitModalBody.querySelectorAll('[data-save-subagent]').forEach((btn) => {
@@ -575,6 +625,10 @@ export function getCockpitModalScript(): string {
           const card = btn.closest('[data-subagent-card]');
           const modelSel = card ? card.querySelector('[data-subagent-model]') : null;
           const promptEl = card ? card.querySelector('[data-subagent-prompt]') : null;
+          btn.textContent = 'Applied ✓';
+          btn.style.background = '#059669';
+          btn.style.borderColor = '#10b981';
+          btn.style.color = '#ffffff';
           vscode.postMessage({
             command: 'cockpitUpdateSubagent',
             id,

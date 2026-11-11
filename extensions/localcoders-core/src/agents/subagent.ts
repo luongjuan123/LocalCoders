@@ -160,6 +160,30 @@ ${targetFilePrompt}`;
           assistantThinking = '';
           toolCalls = undefined;
           phaseNotified = false;
+
+          const turnAbort = new AbortController();
+          const effectiveAbortSignal = abortSignal
+            ? (AbortSignal as any).any
+              ? (AbortSignal as any).any([abortSignal, turnAbort.signal])
+              : turnAbort.signal
+            : turnAbort.signal;
+          if (abortSignal) {
+            abortSignal.addEventListener('abort', () => turnAbort.abort(), { once: true });
+          }
+
+          let watchdogTimer: NodeJS.Timeout | null = null;
+          const turnDeadline = Date.now() + 120000;
+          const pingWatchdog = () => {
+            if (watchdogTimer) clearTimeout(watchdogTimer);
+            const remaining = Math.max(1000, turnDeadline - Date.now());
+            const delay = Math.min(45000, remaining);
+            watchdogTimer = setTimeout(() => {
+              console.warn(`[Subagent:${this.config.id}] Stream watchdog timed out after inactivity`);
+              turnAbort.abort();
+            }, delay);
+          };
+          pingWatchdog();
+
           try {
             await this.llmRouter.chatStream(
               {
@@ -167,12 +191,13 @@ ${targetFilePrompt}`;
                 messages,
                 tools,
                 temperature: runtimeOptions?.temperature ?? this.config.temperature ?? 0.2,
-                maxOutputTokens: runtimeOptions?.maxOutputTokens,
+                maxOutputTokens: runtimeOptions?.maxOutputTokens ?? 2048,
                 contextWindow: runtimeOptions?.contextLimit,
                 reasoningEffort: runtimeOptions?.reasoningEffort,
                 fastMode: runtimeOptions?.fastMode,
               },
               (chunk) => {
+                pingWatchdog();
                 assistantContent += chunk.content;
                 if (chunk.thinking) assistantThinking += chunk.thinking;
                 turnThought.updateFromStream(assistantContent, assistantThinking);
@@ -193,10 +218,20 @@ ${targetFilePrompt}`;
                   });
                 }
               },
-              abortSignal
+              effectiveAbortSignal
             );
+            if (watchdogTimer) clearTimeout(watchdogTimer);
             break;
           } catch (streamErr: any) {
+            if (watchdogTimer) clearTimeout(watchdogTimer);
+            if (turnAbort.signal.aborted && !abortSignal?.aborted) {
+              console.warn(
+                `[Subagent:${this.config.id}] Turn ${turns} hit watchdog limit. Processing partial stream (${assistantContent.length} chars).`
+              );
+              if (assistantContent.trim().length > 0 || (toolCalls && toolCalls.length > 0)) {
+                break;
+              }
+            }
             const msg = String(streamErr?.message || '');
             const transient =
               /llama-server process no longer running|unexpected EOF|ECONNRESET|socket hang up/i.test(msg);
@@ -244,7 +279,13 @@ ${targetFilePrompt}`;
 
         // 3. Fallback: Parse code blocks with filenames and automatically persist them via write_file
         if (activeCalls.length === 0) {
-          const extractedFiles = parseCodeBlocksFromContent(assistantContent, task.affectedFiles);
+          const candidateFiles = Array.from(
+            new Set([
+              ...(task.affectedFiles || []),
+              ...((`${task.title} ${task.description} ${assistantContent.slice(0, 500)}`).match(/[a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9_]+/g) || []),
+            ])
+          );
+          const extractedFiles = parseCodeBlocksFromContent(assistantContent, candidateFiles);
           if (extractedFiles.length > 0) {
             for (const ef of extractedFiles) {
               const { result: writeRes } = await executeTrackedTool({

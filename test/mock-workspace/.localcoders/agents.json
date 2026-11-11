@@ -109,6 +109,61 @@
       "maxConcurrency": 1,
       "temperature": 0.2,
       "contextWindow": 32768
+    },
+    {
+      "id": "sub_1794417066459_9qdm",
+      "name": "MyTester",
+      "role": "Test Engineer",
+      "model": "openai/gpt-4o",
+      "systemPrompt": "You are a Senior Test Engineer. You specialize in test-driven development, comprehensive unit tests, integration suites, edge case boundary validation, mocking external services, and regression testing.",
+      "enabled": true,
+      "maxConcurrency": 1,
+      "temperature": 0.2,
+      "contextWindow": 32768
+    },
+    {
+      "id": "sub_1794417502085_72ms",
+      "name": "MyTester",
+      "role": "Test Engineer",
+      "model": "ollama/qwen3:8b",
+      "systemPrompt": "You are a Senior Test Engineer. You specialize in test-driven development, comprehensive unit tests, integration suites, edge case boundary validation, mocking external services, and regression testing.",
+      "enabled": true,
+      "maxConcurrency": 1,
+      "temperature": 0.2,
+      "contextWindow": 32768
+    },
+    {
+      "id": "sub_1794417556975_a7qc",
+      "name": "MyTester",
+      "role": "Test Engineer",
+      "model": "ollama/llama3.1:8b",
+      "systemPrompt": "You are a Senior Test Engineer. You specialize in test-driven development, comprehensive unit tests, integration suites, edge case boundary validation, mocking external services, and regression testing.",
+      "enabled": true,
+      "maxConcurrency": 1,
+      "temperature": 0.2,
+      "contextWindow": 32768
+    },
+    {
+      "id": "sub_1794417628330_rur8",
+      "name": "MyTester",
+      "role": "Test Engineer",
+      "model": "ollama/llama3.1:8b",
+      "systemPrompt": "You are a Senior Test Engineer. You specialize in test-driven development, comprehensive unit tests, integration suites, edge case boundary validation, mocking external services, and regression testing.",
+      "enabled": true,
+      "maxConcurrency": 1,
+      "temperature": 0.2,
+      "contextWindow": 32768
+    },
+    {
+      "id": "sub_1794417746548_b32v",
+      "name": "MyTester",
+      "role": "Test Engineer",
+      "model": "ollama/llama3.1:8b",
+      "systemPrompt": "You are a Senior Test Engineer. You specialize in test-driven development, comprehensive unit tests, integration suites, edge case boundary validation, mocking external services, and regression testing.",
+      "enabled": true,
+      "maxConcurrency": 1,
+      "temperature": 0.2,
+      "contextWindow": 32768
     }
   ],
   "criticConfig": {
@@ -118,5 +173,6 @@
     "categories": [],
     "trigger": "on_diff",
     "reviewMode": "changed_files"
-  }
+  },
+  "deletedBuiltinIds": []
 }

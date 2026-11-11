@@ -6,6 +6,8 @@ import { AgentConfig, CriticConfig, PredefinedRole } from './types';
 export class AgentRegistry {
   private mainAgent: AgentConfig | null = null;
   private subagents: Map<string, AgentConfig> = new Map();
+  private deletedBuiltinIds: Set<string> = new Set();
+  private workspaceRoot: string = '';
   private criticConfig: CriticConfig = {
     enabled: true,
     model: '',
@@ -146,6 +148,38 @@ export class AgentRegistry {
     ];
   }
 
+  setWorkspaceRoot(root: string) {
+    if (!root) return;
+    const normalized = path.resolve(root);
+    if (this.workspaceRoot === normalized) return;
+    this.workspaceRoot = normalized;
+    this.loadState();
+  }
+
+  getWorkspaceRoot(): string {
+    return this.workspaceRoot;
+  }
+
+  deleteSubagent(id: string) {
+    const builtinIds = new Set(AgentRegistry.getDefaultBuiltinSubagents('').map((b) => b.id));
+    if (builtinIds.has(id)) {
+      this.deletedBuiltinIds.add(id);
+      this.subagents.delete(id);
+    } else {
+      this.subagents.delete(id);
+    }
+    this.saveState();
+  }
+
+  restoreBuiltinSubagents() {
+    this.deletedBuiltinIds.clear();
+    this.saveState();
+  }
+
+  getDeletedBuiltinCount(): number {
+    return this.deletedBuiltinIds.size;
+  }
+
   /**
    * Returns all manageable subagent entries for configuration UIs (built-ins merged
    * with any saved overrides, plus custom subagents), preserving empty model = inherit.
@@ -153,8 +187,11 @@ export class AgentRegistry {
   getManageableSubagents(
     includeBuiltinDefaults = true
   ): Array<AgentConfig & { isBuiltin: boolean; isCustomized: boolean }> {
-    const builtins = includeBuiltinDefaults ? AgentRegistry.getDefaultBuiltinSubagents('') : [];
-    const builtinIds = new Set(builtins.map((b) => b.id));
+    const rawBuiltins = AgentRegistry.getDefaultBuiltinSubagents('');
+    const builtinIds = new Set(rawBuiltins.map((b) => b.id));
+    const builtins = includeBuiltinDefaults
+      ? rawBuiltins.filter((b) => !this.deletedBuiltinIds.has(b.id))
+      : [];
     const result: Array<AgentConfig & { isBuiltin: boolean; isCustomized: boolean }> = [];
 
     for (const def of builtins) {
@@ -189,7 +226,7 @@ export class AgentRegistry {
     const seenIds = new Set<string>();
 
     if (includeBuiltinDefaults) {
-      for (const def of AgentRegistry.getDefaultBuiltinSubagents('')) {
+      for (const def of AgentRegistry.getDefaultBuiltinSubagents('').filter((b) => !this.deletedBuiltinIds.has(b.id))) {
         const override = this.subagents.get(def.id);
         merged.push(override ? { ...def, ...override } : def);
         seenIds.add(def.id);
@@ -214,6 +251,7 @@ export class AgentRegistry {
   }
 
   addSubagent(config: AgentConfig) {
+    this.deletedBuiltinIds.delete(config.id);
     this.subagents.set(config.id, config);
     this.saveState();
   }
@@ -224,6 +262,7 @@ export class AgentRegistry {
   }
 
   updateSubagent(id: string, updates: Partial<AgentConfig>) {
+    this.deletedBuiltinIds.delete(id);
     const existing = this.subagents.get(id);
     if (existing) {
       this.subagents.set(id, { ...existing, ...updates });
@@ -252,11 +291,23 @@ export class AgentRegistry {
     this.context.globalState.update('localcoders.mainAgent', this.mainAgent);
     this.context.globalState.update('localcoders.subagents', Array.from(this.subagents.values()));
     this.context.globalState.update('localcoders.criticConfig', this.criticConfig);
+    this.context.globalState.update('localcoders.deletedBuiltins', Array.from(this.deletedBuiltinIds));
 
     // Also persist to workspace .localcoders/agents.json if workspace is opened
+    const targetDirs: string[] = [];
+    if (this.workspaceRoot) {
+      targetDirs.push(this.workspaceRoot);
+    }
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (workspaceFolders && workspaceFolders.length > 0) {
-      const root = workspaceFolders[0].uri.fsPath;
+      for (const f of workspaceFolders) {
+        if (!targetDirs.includes(f.uri.fsPath)) {
+          targetDirs.push(f.uri.fsPath);
+        }
+      }
+    }
+
+    for (const root of targetDirs) {
       const dotDir = path.join(root, '.localcoders');
       try {
         if (!fs.existsSync(dotDir)) {
@@ -266,6 +317,7 @@ export class AgentRegistry {
           mainAgent: this.mainAgent,
           subagents: Array.from(this.subagents.values()),
           criticConfig: this.criticConfig,
+          deletedBuiltinIds: Array.from(this.deletedBuiltinIds),
         };
         fs.writeFileSync(path.join(dotDir, 'agents.json'), JSON.stringify(data, null, 2), 'utf-8');
       } catch (err) {
@@ -275,11 +327,19 @@ export class AgentRegistry {
   }
 
   private loadState() {
-    // 1. Try reading from workspace .localcoders/agents.json
+    // 1. Try reading from active workspace or workspace folders
     let loadedFromWorkspace = false;
+    const candidates: string[] = [];
+    if (this.workspaceRoot) candidates.push(this.workspaceRoot);
     const workspaceFolders = vscode.workspace.workspaceFolders;
     if (workspaceFolders && workspaceFolders.length > 0) {
-      const configPath = path.join(workspaceFolders[0].uri.fsPath, '.localcoders', 'agents.json');
+      for (const f of workspaceFolders) {
+        if (!candidates.includes(f.uri.fsPath)) candidates.push(f.uri.fsPath);
+      }
+    }
+
+    for (const root of candidates) {
+      const configPath = path.join(root, '.localcoders', 'agents.json');
       if (fs.existsSync(configPath)) {
         try {
           const raw = fs.readFileSync(configPath, 'utf-8');
@@ -291,8 +351,12 @@ export class AgentRegistry {
               this.subagents.set(sub.id, sub);
             }
           }
+          if (Array.isArray(data.deletedBuiltinIds)) {
+            this.deletedBuiltinIds = new Set(data.deletedBuiltinIds);
+          }
           if (data.criticConfig) this.criticConfig = data.criticConfig;
           loadedFromWorkspace = true;
+          break;
         } catch (e) {
           console.error('[AgentRegistry] Error parsing workspace agents.json:', e);
         }
@@ -310,6 +374,11 @@ export class AgentRegistry {
         for (const s of savedSubs) {
           this.subagents.set(s.id, s);
         }
+      }
+
+      const savedDeleted = this.context.globalState.get<string[]>('localcoders.deletedBuiltins');
+      if (savedDeleted && Array.isArray(savedDeleted)) {
+        this.deletedBuiltinIds = new Set(savedDeleted);
       }
 
       const savedCritic = this.context.globalState.get<CriticConfig>('localcoders.criticConfig');

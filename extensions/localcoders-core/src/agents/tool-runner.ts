@@ -7,6 +7,7 @@ import {
   extractAgentReasoningText,
   formatToolActivityTitle,
   getSafePhaseLabel,
+  sanitizeNarrativeContent,
 } from './events';
 
 export interface TrackedToolParams {
@@ -315,6 +316,113 @@ export function createTurnThoughtTracker(params: TurnThoughtTrackerParams) {
       if (finalBody) {
         emitThought(finalBody, 'completed');
       }
+    },
+  };
+}
+
+export interface TurnNarrativeStreamerParams {
+  runId: string;
+  agentId: string;
+  agentName: string;
+  senderRole?: 'assistant' | 'critic' | 'system';
+  stepKey: string;
+  taskId?: string;
+  onStreamEvent?: (ev: AgentStreamEvent) => void;
+}
+
+/**
+ * Streams the agent's user-visible narration prose (sanitized of tool-call payloads and
+ * internal reasoning) into the conversation as incremental `message_delta` events, then
+ * finalizes the turn as a persisted `message_complete` — matching the interleaved
+ * "narrate -> run tool -> narrate" conversation layout instead of a silent thinking phase.
+ */
+export function createTurnNarrativeStreamer(params: TurnNarrativeStreamerParams) {
+  const { runId, agentId, agentName, stepKey, taskId, onStreamEvent } = params;
+  const senderRole = params.senderRole || 'assistant';
+  const messageId = `narr_${runId}_${agentId}_${stepKey}`;
+  const startTimestamp = Date.now();
+  let lastEmitAt = 0;
+  let flushTimer: NodeJS.Timeout | null = null;
+  let pendingRaw = '';
+  let prevFull = '';
+  let done = false;
+
+  const emitDelta = (fullContent: string) => {
+    if (!onStreamEvent || !fullContent || fullContent === prevFull) return;
+    const now = Date.now();
+    const deltaContent = fullContent.startsWith(prevFull) ? fullContent.slice(prevFull.length) : fullContent;
+    prevFull = fullContent;
+    lastEmitAt = now;
+    onStreamEvent({
+      kind: 'message_delta',
+      id: `md_${messageId}_${now}`,
+      runId,
+      messageId,
+      agentId,
+      agentName,
+      senderRole,
+      deltaContent,
+      fullContent,
+      timestamp: now,
+    });
+  };
+
+  return {
+    messageId,
+    update(rawContent: string) {
+      if (!onStreamEvent || done) return;
+      pendingRaw = rawContent;
+      const clean = sanitizeNarrativeContent(pendingRaw);
+      if (!clean || clean === prevFull) return;
+      const now = Date.now();
+      if (!prevFull || now - lastEmitAt >= 120) {
+        if (flushTimer) {
+          clearTimeout(flushTimer);
+          flushTimer = null;
+        }
+        emitDelta(clean);
+      } else if (!flushTimer) {
+        flushTimer = setTimeout(() => {
+          flushTimer = null;
+          const next = sanitizeNarrativeContent(pendingRaw);
+          if (next && next !== prevFull) emitDelta(next);
+        }, 120);
+      }
+    },
+
+    finalize(rawContent: string) {
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      if (done) return;
+      done = true;
+      const clean = sanitizeNarrativeContent(rawContent !== undefined ? rawContent : pendingRaw);
+      if (!clean) return;
+      if (clean !== prevFull) emitDelta(clean);
+      onStreamEvent?.({
+        kind: 'message_complete',
+        id: `mc_${messageId}`,
+        runId,
+        message: {
+          id: messageId,
+          senderId: agentId,
+          senderName: agentName,
+          senderRole,
+          content: clean,
+          timestamp: startTimestamp,
+          taskId,
+        },
+        timestamp: Date.now(),
+      });
+    },
+
+    discard() {
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+      }
+      done = true;
     },
   };
 }
